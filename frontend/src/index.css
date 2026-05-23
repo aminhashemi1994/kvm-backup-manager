@@ -399,6 +399,14 @@ button:disabled {
   cursor: not-allowed !important;
 }
 
+/* Make dialog scroll behave consistently — no smooth scroll, no scroll
+   anchoring magic. Browsers can sometimes "rebalance" the scroll position
+   when content height changes (e.g., expanding a sub-section), and this
+   keeps the user's view stable. */
+.dialog-overlay {
+  scroll-behavior: auto !important;
+}
+
 /* ─── Dark mode color overrides ──────────────────────────────────────────
    Many components use hardcoded Tailwind classes like `bg-white`, `text-gray-900`,
    etc. without `dark:` variants. These rules patch those at the CSS level so

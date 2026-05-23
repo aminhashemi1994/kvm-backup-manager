@@ -50,26 +50,17 @@ const Dialog: React.FC<DialogProps> = ({ open, onOpenChange, children }) => {
 }
 
 /**
- * Internal scroll container that resets scroll to top ONLY when the dialog
- * first opens, not on every re-render. This prevents the scroll position
- * from jumping when state changes inside the dialog (e.g. clicking checkboxes).
+ * Internal scroll container for the dialog overlay.
+ * The container starts at scroll 0 naturally on mount (since it's a fresh
+ * DOM element from the portal). We do NOT manually reset scroll on any
+ * effect — that caused jumps on re-renders inside the dialog.
  */
 const DialogScrollContainer: React.FC<{
   children: React.ReactNode
   onClick?: () => void
 }> = ({ children, onClick }) => {
-  const containerRef = React.useRef<HTMLDivElement>(null)
-
-  React.useEffect(() => {
-    // Reset scroll only on mount (when the dialog first opens)
-    if (containerRef.current) {
-      containerRef.current.scrollTop = 0
-    }
-  }, [])
-
   return (
     <div
-      ref={containerRef}
       className="dialog-overlay"
       onClick={onClick}
       role="dialog"
