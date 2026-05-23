@@ -1,0 +1,862 @@
+const cron = require('node-cron');
+const { 
+  getBackupSchedules, 
+  getBackupHosts, 
+  getHypervisors, 
+  getVirtualMachines,
+  getBackupJobs,
+  saveBackupJobs,
+  appendLog 
+} = require('./fileStorage');
+const agentService = require('./agentService');
+const backupCycleService = require('./backupCycleService');
+const rocketChatService = require('./rocketChatService');
+const { v4: uuidv4 } = require('uuid');
+
+class SchedulerService {
+  constructor() {
+    this.tasks = new Map();
+    this.customDaysTasks = new Map(); // For custom-days schedules
+    this.io = null;
+    this.healthCheckInterval = null;
+  }
+
+  async initialize(io) {
+    this.io = io;
+    console.log('Initializing backup scheduler...');
+    await this.loadSchedules();
+    this.startHealthChecks();
+    console.log(`✓ Loaded ${this.tasks.size} scheduled tasks`);
+  }
+
+  startHealthChecks() {
+    this.healthCheckInterval = setInterval(async () => {
+      await this.checkHostsHealth();
+    }, 60000); // Check every minute
+  }
+
+  async checkHostsHealth() {
+    try {
+      // Read fresh data each time to avoid overwriting changes
+      const hosts = await getBackupHosts();
+      let hasChanges = false;
+      const hostsComingOnline = [];
+      
+      for (const host of hosts) {
+        try {
+          // Ensure URL has protocol
+          let url = host.url;
+          if (!url.startsWith('http://') && !url.startsWith('https://')) {
+            url = 'http://' + url;
+          }
+          
+          const result = await agentService.healthCheck(url);
+          const newStatus = result.success ? 'online' : 'offline';
+          
+          if (result.success) {
+            // Reset failure tracking on success
+            host._consecutiveFailures = 0;
+          }
+          
+          // Only update if status changed
+          if (host.status !== newStatus) {
+            if (newStatus === 'offline') {
+              // Item 4: Debounce — require 2 consecutive failures
+              host._consecutiveFailures = (host._consecutiveFailures || 0) + 1;
+              if (host._consecutiveFailures < 2) {
+                continue; // Don't mark offline yet
+              }
+            }
+            
+            const oldStatus = host.status;
+            host.status = newStatus;
+            host.lastHealthCheck = new Date().toISOString();
+            hasChanges = true;
+            
+            if (!result.success) {
+              console.log(`Backup host ${host.name} is offline: ${result.error}`);
+            } else if (oldStatus === 'offline' && newStatus === 'online') {
+              console.log(`Backup host ${host.name} came back online`);
+              hostsComingOnline.push(host);
+              
+              // Notify RocketChat
+              rocketChatService.notifyAgentConnected(host.name);
+            }
+          }
+        } catch (error) {
+          host._consecutiveFailures = (host._consecutiveFailures || 0) + 1;
+          if (host._consecutiveFailures >= 2) {
+            const newStatus = 'offline';
+            if (host.status !== newStatus) {
+              host.status = newStatus;
+              host.lastHealthCheck = new Date().toISOString();
+              hasChanges = true;
+              
+              // Notify RocketChat
+              rocketChatService.notifyAgentDisconnected(host.name);
+            }
+          }
+        }
+      }
+
+      // Only save if there were actual changes
+      if (hasChanges) {
+        const { saveBackupHosts } = require('./fileStorage');
+        await saveBackupHosts(hosts);
+      }
+
+      // Auto-retry skipped backups for hosts that came back online
+      if (hostsComingOnline.length > 0) {
+        await this.retrySkippedBackupsForHosts(hostsComingOnline);
+      }
+
+      if (this.io) {
+        this.io.emit('hosts-status-update', hosts);
+      }
+    } catch (error) {
+      console.error('Error checking hosts health:', error);
+    }
+  }
+
+  /**
+   * Auto-retry skipped backups when agent comes back online
+   */
+  async retrySkippedBackupsForHosts(hosts) {
+    try {
+      const jobs = await getBackupJobs();
+      const schedules = await getBackupSchedules();
+      
+      // Find skipped jobs from the last 24 hours for these hosts
+      const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      const skippedJobs = jobs.filter(job => 
+        job.status === 'skipped' && 
+        job.canRetry === true &&
+        new Date(job.startTime) > oneDayAgo &&
+        hosts.some(h => h.id === job.backupHostId)
+      );
+
+      if (skippedJobs.length === 0) {
+        return;
+      }
+
+      console.log(`Found ${skippedJobs.length} skipped backup(s) to retry for hosts that came back online`);
+
+      for (const skippedJob of skippedJobs) {
+        const host = hosts.find(h => h.id === skippedJob.backupHostId);
+        if (!host) continue;
+
+        console.log(`Auto-retrying skipped backup for VM: ${skippedJob.vmName} on host: ${host.name}`);
+
+        // Notify RocketChat
+        rocketChatService.notifyBackupRetry(skippedJob.vmName, host.name, skippedJob.id);
+
+        // Find the schedule for this job
+        const schedule = schedules.find(s => s.id === skippedJob.scheduleId);
+        if (!schedule) {
+          console.log(`Schedule not found for skipped job ${skippedJob.id}, skipping retry`);
+          continue;
+        }
+
+        // Create a new job for retry
+        const newJobId = uuidv4();
+        const retryJob = {
+          ...skippedJob,
+          id: newJobId,
+          status: 'queued',
+          startTime: new Date().toISOString(),
+          endTime: null,
+          exitCode: null,
+          error: null,
+          retryOf: skippedJob.id,
+          progress: 0,
+          progressText: 'Queued (auto-retry)...',
+          autoRetry: true,
+        };
+
+        jobs.push(retryJob);
+        await saveBackupJobs(jobs);
+
+        await appendLog(newJobId, `Auto-retry of skipped job ${skippedJob.id}`);
+        await appendLog(newJobId, `Original job was skipped because: ${skippedJob.error}`);
+        await appendLog(newJobId, `Agent ${host.name} came back online, retrying now`);
+
+        // Emit event
+        if (this.io) {
+          this.io.emit('backup-started', retryJob);
+        }
+
+        // Trigger backup on agent
+        try {
+          const vms = await getVirtualMachines();
+          const vm = vms.find(v => v.id === skippedJob.vmId);
+          if (!vm) {
+            console.error(`VM not found for retry: ${skippedJob.vmId}`);
+            continue;
+          }
+
+          const hypervisors = await getHypervisors();
+          const hypervisor = hypervisors.find(h => h.id === vm.hypervisorId);
+          if (!hypervisor) {
+            console.error(`Hypervisor not found for retry: ${vm.hypervisorId}`);
+            continue;
+          }
+
+          const backupData = {
+            jobId: newJobId,
+            vmName: skippedJob.vmName,
+            hypervisorId: hypervisor.id,
+            hypervisorIp: hypervisor.ip,
+            method: skippedJob.method,
+            noCompression: skippedJob.noCompression,
+            noVerify: skippedJob.noVerify,
+          };
+
+          // Check if this was a scheduled backup with cycle management
+          if (schedule && (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron')) {
+            await agentService.triggerScheduledBackup(host.url, {
+              ...backupData,
+              vmId: skippedJob.vmId,
+              incrementalCount: schedule.incrementalCount,
+            });
+          } else {
+            await agentService.triggerBackup(host.url, backupData);
+          }
+
+          // Update job status
+          retryJob.status = 'running';
+          await saveBackupJobs(jobs);
+
+          console.log(`Successfully triggered auto-retry for ${skippedJob.vmName}`);
+        } catch (error) {
+          console.error(`Failed to trigger auto-retry for ${skippedJob.vmName}:`, error.message);
+          retryJob.status = 'failed';
+          retryJob.error = `Auto-retry failed: ${error.message}`;
+          retryJob.endTime = new Date().toISOString();
+          await saveBackupJobs(jobs);
+          await appendLog(newJobId, `Error triggering auto-retry: ${error.message}`);
+          
+          if (this.io) {
+            this.io.emit('backup-error', retryJob);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error retrying skipped backups:', error);
+    }
+  }
+
+  async loadSchedules() {
+    this.tasks.forEach(task => task.stop());
+    this.tasks.clear();
+    this.customDaysTasks.forEach(task => task.stop());
+    this.customDaysTasks.clear();
+
+    const schedules = await getBackupSchedules();
+    
+    for (const schedule of schedules) {
+      if (schedule.enabled !== false) {
+        this.createTask(schedule);
+      }
+    }
+  }
+
+  createTask(schedule) {
+    try {
+      if (schedule.scheduleType === 'custom-days') {
+        this.createCustomDaysTasks(schedule);
+        return;
+      }
+
+      if (!schedule.cronExpression) {
+        console.error(`No cron expression for schedule ${schedule.id}`);
+        return;
+      }
+
+      if (!cron.validate(schedule.cronExpression)) {
+        console.error(`Invalid cron expression for schedule ${schedule.id}: ${schedule.cronExpression}`);
+        return;
+      }
+
+      const task = cron.schedule(schedule.cronExpression, async () => {
+        console.log(`Running scheduled backup: ${schedule.id} (${schedule.scheduleType})`);
+        await this.executeScheduledBackup(schedule);
+      });
+
+      this.tasks.set(schedule.id, task);
+      console.log(`Created ${schedule.scheduleType} task for schedule ${schedule.id}: ${schedule.cronExpression}`);
+    } catch (error) {
+      console.error(`Error creating task for schedule ${schedule.id}:`, error);
+    }
+  }
+
+  createCustomDaysTasks(schedule) {
+    // For custom-days, create a cron task for each custom date
+    const tasks = [];
+    
+    schedule.customDates.forEach((customDate, index) => {
+      try {
+        const [hour, minute] = customDate.time.split(':');
+        const date = new Date(customDate.date);
+        const dayOfMonth = date.getDate();
+        const month = date.getMonth() + 1;
+        
+        // Create cron for specific date and time
+        const cronExpression = `${minute} ${hour} ${dayOfMonth} ${month} *`;
+        
+        if (!cron.validate(cronExpression)) {
+          console.error(`Invalid cron for custom date ${index}: ${cronExpression}`);
+          return;
+        }
+
+        const task = cron.schedule(cronExpression, async () => {
+          console.log(`Running custom-days backup: ${schedule.id} - ${customDate.date}`);
+          await this.executeCustomDaysBackup(schedule, customDate);
+        });
+
+        tasks.push(task);
+        console.log(`Created custom-days task ${index} for schedule ${schedule.id}: ${cronExpression}`);
+      } catch (error) {
+        console.error(`Error creating custom-days task ${index}:`, error);
+      }
+    });
+
+    if (tasks.length > 0) {
+      this.customDaysTasks.set(schedule.id, tasks);
+    }
+  }
+
+  /**
+   * Programmatic entry point for replaying a missed scheduled run.
+   * Delegates to executeScheduledBackup with metadata so the resulting job
+   * is tagged as a missed-run replay. Returns true if a job was actually
+   * triggered, false otherwise (e.g. host offline + skipped).
+   */
+  async fireScheduleNow(schedule, opts = {}) {
+    try {
+      await this.executeScheduledBackup(schedule, {
+        replay: true,
+        scheduledAt: opts.scheduledAt || new Date(),
+        reason: opts.reason || 'manual replay',
+        method: opts.method,
+        actor: opts.actor || 'system:replay',
+        triggeredBy: opts.triggeredBy || 'system',
+      });
+      return true;
+    } catch (err) {
+      console.error('[Scheduler] fireScheduleNow failed:', err.message);
+      return false;
+    }
+  }
+
+  /**
+   * Update lastFiredAt on a schedule (used by interval anchor + missed-run calc)
+   */
+  async _markScheduleFired(scheduleId) {
+    try {
+      const { getBackupSchedules, saveBackupSchedules } = require('./fileStorage');
+      const schedules = await getBackupSchedules();
+      const idx = schedules.findIndex(s => s.id === scheduleId);
+      if (idx === -1) return;
+      schedules[idx].lastFiredAt = new Date().toISOString();
+      await saveBackupSchedules(schedules);
+    } catch (e) {
+      // non-fatal
+    }
+  }
+
+  async executeScheduledBackup(schedule, replayMeta = null) {
+    const jobId = uuidv4();
+    
+    try {
+      const hosts = await getBackupHosts();
+      const hypervisors = await getHypervisors();
+      const vms = await getVirtualMachines();
+
+      const vm = vms.find(v => v.id === schedule.vmId);
+      if (!vm) {
+        console.error(`VM not found: ${schedule.vmId}`);
+        return;
+      }
+
+      const hypervisor = hypervisors.find(h => h.id === vm.hypervisorId);
+      if (!hypervisor) {
+        console.error(`Hypervisor not found: ${vm.hypervisorId}`);
+        return;
+      }
+
+      const host = hosts.find(h => h.id === vm.backupHostId);
+      if (!host) {
+        console.error(`Backup host not found: ${vm.backupHostId}`);
+        return;
+      }
+
+      // Determine backup method based on schedule type
+      let method = 'full';
+      
+      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron') {
+        // Use backup cycle service to determine method
+        const cycleStatus = await backupCycleService.getVMCycleStatus(vm.id);
+        method = cycleStatus.nextBackupMethod;
+      } else if (schedule.scheduleType === 'weekly') {
+        // Check if today is the full backup day
+        const today = new Date().getDay();
+        method = (today === schedule.fullBackupDay) ? 'full' : 'inc';
+      }
+
+      if (host.status !== 'online') {
+        console.error(`Backup host ${host.name} is offline, skipping backup`);
+        
+        // Create a skipped job record for tracking
+        const skippedJob = {
+          id: jobId,
+          scheduleId: schedule.id,
+          vmId: vm.id,
+          vmName: vm.name,
+          hypervisorIp: hypervisor.ip,
+          backupHostId: host.id,
+          backupHostName: host.name,
+          method,
+          noCompression: schedule.noCompression || false,
+          noVerify: schedule.noVerify || false,
+          status: 'skipped',
+          startTime: new Date().toISOString(),
+          endTime: new Date().toISOString(),
+          exitCode: null,
+          error: `Backup host ${host.name} was offline or unreachable`,
+          scheduled: true,
+          skippedReason: 'agent_offline',
+          canRetry: true,
+        };
+
+        const jobs = await getBackupJobs();
+        jobs.push(skippedJob);
+        await saveBackupJobs(jobs);
+        
+        await appendLog(jobId, `Backup skipped: ${skippedJob.error}`);
+        
+        // Notify RocketChat
+        rocketChatService.notifyBackupSkipped(vm.name, host.name, skippedJob.error);
+        
+        if (this.io) {
+          this.io.emit('backup-skipped', skippedJob);
+        }
+        
+        return;
+      }
+
+      // Check concurrent backup limit
+      const jobs = await getBackupJobs();
+      const runningJobsOnHost = jobs.filter(j => 
+        j.backupHostId === host.id && 
+        (j.status === 'running' || j.status === 'queued')
+      );
+      
+      const maxConcurrent = host.maxConcurrentBackups || 2;
+      if (runningJobsOnHost.length >= maxConcurrent) {
+        console.error(`Maximum concurrent backups (${maxConcurrent}) reached for ${host.name}, skipping backup`);
+        
+        // Create a skipped job record
+        const skippedJob = {
+          id: jobId,
+          scheduleId: schedule.id,
+          vmId: vm.id,
+          vmName: vm.name,
+          hypervisorIp: hypervisor.ip,
+          backupHostId: host.id,
+          backupHostName: host.name,
+          method,
+          noCompression: schedule.noCompression || false,
+          noVerify: schedule.noVerify || false,
+          status: 'skipped',
+          startTime: new Date().toISOString(),
+          endTime: new Date().toISOString(),
+          exitCode: null,
+          error: `Maximum concurrent backups (${maxConcurrent}) reached. Currently running: ${runningJobsOnHost.length}`,
+          scheduled: true,
+          skippedReason: 'concurrent_limit',
+          canRetry: true,
+        };
+
+        jobs.push(skippedJob);
+        await saveBackupJobs(jobs);
+        
+        await appendLog(jobId, `Backup skipped: ${skippedJob.error}`);
+        
+        // Notify RocketChat
+        rocketChatService.notifyBackupSkipped(vm.name, host.name, skippedJob.error);
+        
+        if (this.io) {
+          this.io.emit('backup-skipped', skippedJob);
+        }
+        
+        return;
+      }
+      
+      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron') {
+        // Use backup cycle service to determine method
+        const cycleStatus = await backupCycleService.getVMCycleStatus(vm.id);
+        method = cycleStatus.nextBackupMethod;
+      } else if (schedule.scheduleType === 'weekly') {
+        // Check if today is the full backup day
+        const today = new Date().getDay();
+        method = (today === schedule.fullBackupDay) ? 'full' : 'inc';
+      }
+
+      const job = {
+        id: jobId,
+        scheduleId: schedule.id,
+        vmId: vm.id,
+        vmName: vm.name,
+        hypervisorIp: hypervisor.ip,
+        backupHostId: host.id,
+        backupHostName: host.name,
+        method,
+        noCompression: schedule.noCompression || false,
+        noVerify: schedule.noVerify || false,
+        status: 'running',
+        startTime: new Date().toISOString(),
+        endTime: null,
+        exitCode: null,
+        error: null,
+        scheduled: true,
+        ...(replayMeta ? {
+          replay: true,
+          originallyScheduledAt: replayMeta.scheduledAt
+            ? new Date(replayMeta.scheduledAt).toISOString()
+            : null,
+          replayReason: replayMeta.reason || 'replay',
+          actor: replayMeta.actor || 'system:replay',
+          triggeredBy: replayMeta.triggeredBy || 'system',
+        } : {
+          actor: 'system:scheduler',
+          triggeredBy: 'system',
+        }),
+      };
+
+      // jobs already loaded above for concurrent check
+      jobs.push(job);
+      await saveBackupJobs(jobs);
+
+      this.io.emit('backup-started', job);
+      const replayPrefix = replayMeta ? '[MISSED-REPLAY] ' : '';
+      const originalAt = replayMeta && replayMeta.scheduledAt
+        ? ` (originally scheduled at ${new Date(replayMeta.scheduledAt).toISOString()})`
+        : '';
+      await appendLog(
+        jobId,
+        `${replayPrefix}Scheduled backup started for VM: ${vm.name} ` +
+        `(${schedule.scheduleType}, method: ${method})${originalAt}`
+      );
+
+      // Ensure URL has protocol
+      let url = host.url;
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'http://' + url;
+      }
+
+      const backupData = {
+        jobId,
+        vmName: vm.name,
+        hypervisorId: hypervisor.id,
+        hypervisorIp: hypervisor.ip,
+        method,
+        noCompression: schedule.noCompression,
+        noVerify: schedule.noVerify,
+      };
+
+      // Use trigger-scheduled endpoint for cycle management
+      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron') {
+        await agentService.triggerScheduledBackup(url, {
+          ...backupData,
+          vmId: vm.id,
+          incrementalCount: schedule.incrementalCount,
+        });
+      } else {
+        await agentService.triggerBackup(url, backupData);
+      }
+
+      // Mark schedule as fired (anchor for interval missed-run computation)
+      await this._markScheduleFired(schedule.id);
+
+      // Auto-disable 'once' schedules after first successful trigger
+      if (schedule.scheduleType === 'once') {
+        try {
+          const { getBackupSchedules: getScheds, saveBackupSchedules: saveScheds } = require('./fileStorage');
+          const scheds = await getScheds();
+          const idx = scheds.findIndex(s => s.id === schedule.id);
+          if (idx !== -1) {
+            scheds[idx].enabled = false;
+            scheds[idx].updatedAt = new Date().toISOString();
+            await saveScheds(scheds);
+            // Stop the cron task
+            const task = this.tasks.get(schedule.id);
+            if (task) {
+              task.stop();
+              this.tasks.delete(schedule.id);
+            }
+            console.log(`[Scheduler] 'once' schedule ${schedule.id} auto-disabled after execution`);
+          }
+        } catch (e) {
+          console.error(`[Scheduler] Failed to auto-disable 'once' schedule:`, e.message);
+        }
+      }
+
+    } catch (error) {
+      console.error('Error executing scheduled backup:', error);
+      await appendLog(jobId, `Error: ${error.message}`);
+      
+      const jobs = await getBackupJobs();
+      const job = jobs.find(j => j.id === jobId);
+      if (job) {
+        job.status = 'failed';
+        job.error = error.message;
+        job.endTime = new Date().toISOString();
+        await saveBackupJobs(jobs);
+      }
+
+      // Notify RocketChat of scheduled backup failure
+      const vms = await getVirtualMachines();
+      const vm = vms.find(v => v.id === schedule.vmId);
+      if (vm) {
+        rocketChatService.notifyScheduledBackupFailed(
+          vm.name, 
+          schedule.scheduleType, 
+          error.message
+        );
+      }
+
+      this.io.emit('backup-error', { jobId, error: error.message });
+    }
+  }
+
+  async executeCustomDaysBackup(schedule, customDate) {
+    const jobId = uuidv4();
+    
+    try {
+      const hosts = await getBackupHosts();
+      const hypervisors = await getHypervisors();
+      const vms = await getVirtualMachines();
+
+      const vm = vms.find(v => v.id === schedule.vmId);
+      if (!vm) {
+        console.error(`VM not found: ${schedule.vmId}`);
+        return;
+      }
+
+      const hypervisor = hypervisors.find(h => h.id === vm.hypervisorId);
+      if (!hypervisor) {
+        console.error(`Hypervisor not found: ${vm.hypervisorId}`);
+        return;
+      }
+
+      const host = hosts.find(h => h.id === vm.backupHostId);
+      if (!host) {
+        console.error(`Backup host not found: ${vm.backupHostId}`);
+        return;
+      }
+
+      if (host.status !== 'online') {
+        console.error(`Backup host ${host.name} is offline, skipping backup`);
+        
+        // Create a skipped job record for tracking
+        const skippedJob = {
+          id: jobId,
+          scheduleId: schedule.id,
+          vmId: vm.id,
+          vmName: vm.name,
+          hypervisorIp: hypervisor.ip,
+          backupHostId: host.id,
+          backupHostName: host.name,
+          method: customDate.method,
+          noCompression: schedule.noCompression || false,
+          noVerify: schedule.noVerify || false,
+          status: 'skipped',
+          startTime: new Date().toISOString(),
+          endTime: new Date().toISOString(),
+          exitCode: null,
+          error: `Backup host ${host.name} was offline or unreachable`,
+          scheduled: true,
+          skippedReason: 'agent_offline',
+          canRetry: true,
+        };
+
+        const jobs = await getBackupJobs();
+        jobs.push(skippedJob);
+        await saveBackupJobs(jobs);
+        
+        await appendLog(jobId, `Backup skipped: ${skippedJob.error}`);
+        
+        // Notify RocketChat
+        rocketChatService.notifyBackupSkipped(vm.name, host.name, skippedJob.error);
+        
+        if (this.io) {
+          this.io.emit('backup-skipped', skippedJob);
+        }
+        
+        return;
+      }
+
+      const job = {
+        id: jobId,
+        scheduleId: schedule.id,
+        vmId: vm.id,
+        vmName: vm.name,
+        hypervisorIp: hypervisor.ip,
+        backupHostId: host.id,
+        backupHostName: host.name,
+        method: customDate.method,
+        noCompression: schedule.noCompression || false,
+        noVerify: schedule.noVerify || false,
+        status: 'running',
+        startTime: new Date().toISOString(),
+        endTime: null,
+        exitCode: null,
+        error: null,
+        scheduled: true,
+      };
+
+      const jobs = await getBackupJobs();
+      jobs.push(job);
+      await saveBackupJobs(jobs);
+
+      this.io.emit('backup-started', job);
+      await appendLog(jobId, `Custom-days backup started for VM: ${vm.name} (method: ${customDate.method})`);
+
+      // Ensure URL has protocol
+      let url = host.url;
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'http://' + url;
+      }
+
+      const backupData = {
+        jobId,
+        vmName: vm.name,
+        hypervisorId: hypervisor.id,
+        hypervisorIp: hypervisor.ip,
+        method: customDate.method,
+        noCompression: schedule.noCompression,
+        noVerify: schedule.noVerify,
+      };
+
+      await agentService.triggerBackup(url, backupData);
+      await this._markScheduleFired(schedule.id);
+
+    } catch (error) {
+      console.error('Error executing custom-days backup:', error);
+      await appendLog(jobId, `Error: ${error.message}`);
+      
+      const jobs = await getBackupJobs();
+      const job = jobs.find(j => j.id === jobId);
+      if (job) {
+        job.status = 'failed';
+        job.error = error.message;
+        job.endTime = new Date().toISOString();
+        await saveBackupJobs(jobs);
+      }
+
+      // Notify RocketChat of scheduled backup failure
+      const vms = await getVirtualMachines();
+      const vm = vms.find(v => v.id === schedule.vmId);
+      if (vm) {
+        rocketChatService.notifyScheduledBackupFailed(
+          vm.name, 
+          'custom-days', 
+          error.message
+        );
+      }
+
+      this.io.emit('backup-error', { jobId, error: error.message });
+    }
+  }
+
+  async addSchedule(schedule) {
+    if (schedule.enabled !== false) {
+      this.createTask(schedule);
+    }
+  }
+
+  async updateSchedule(schedule) {
+    // Remove old task
+    const task = this.tasks.get(schedule.id);
+    if (task) {
+      task.stop();
+      this.tasks.delete(schedule.id);
+    }
+
+    // Remove old custom-days tasks
+    const customTasks = this.customDaysTasks.get(schedule.id);
+    if (customTasks) {
+      customTasks.forEach(t => t.stop());
+      this.customDaysTasks.delete(schedule.id);
+    }
+
+    // Create new task if enabled
+    if (schedule.enabled !== false) {
+      this.createTask(schedule);
+    }
+  }
+
+  async removeSchedule(scheduleId) {
+    const task = this.tasks.get(scheduleId);
+    if (task) {
+      task.stop();
+      this.tasks.delete(scheduleId);
+    }
+
+    const customTasks = this.customDaysTasks.get(scheduleId);
+    if (customTasks) {
+      customTasks.forEach(t => t.stop());
+      this.customDaysTasks.delete(scheduleId);
+    }
+  }
+
+  /**
+   * Best-effort upcoming backups for the next 24h. Returns up to `limit`
+   * occurrences sorted by time. Used by the dashboard / schedules page.
+   */
+  async getUpcomingBackups(limit = 10) {
+    try {
+      const schedules = await getBackupSchedules();
+      const now = new Date();
+      const horizon = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+      const missedRunService = require('./missedRunService');
+      const all = [];
+
+      for (const s of schedules) {
+        if (s.enabled === false) continue;
+        // Reuse computeMissedRuns over (now, now+24h) to enumerate upcoming
+        const occs = missedRunService.computeMissedRuns(s, now, horizon);
+        for (const occ of occs) {
+          all.push({
+            scheduleId: s.id,
+            scheduleName: s.name,
+            vmId: s.vmId,
+            scheduleType: s.scheduleType,
+            scheduledAt: occ.scheduledAt.toISOString(),
+            method: occ.meta?.method || null,
+          });
+        }
+      }
+
+      all.sort((a, b) => new Date(a.scheduledAt) - new Date(b.scheduledAt));
+      return all.slice(0, limit);
+    } catch (err) {
+      console.error('[Scheduler] getUpcomingBackups failed:', err.message);
+      return [];
+    }
+  }
+
+  shutdown() {
+    console.log('Shutting down scheduler...');
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+    }
+    this.tasks.forEach(task => task.stop());
+    this.tasks.clear();
+    this.customDaysTasks.forEach(tasks => tasks.forEach(t => t.stop()));
+    this.customDaysTasks.clear();
+  }
+}
+
+const schedulerService = new SchedulerService();
+module.exports = schedulerService;

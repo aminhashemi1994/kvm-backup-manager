@@ -1,0 +1,63 @@
+{
+  "name": "kvm-backup-manager",
+  "version": "1.1.0",
+  "description": "Enterprise-grade backup and restore solution for KVM/QEMU virtual machines with incremental backups, centralized management, real-time monitoring, RBAC, audit trail, and automated recovery. Powered by virtnbdbackup.",
+  "keywords": [
+    "kvm",
+    "qemu",
+    "backup",
+    "restore",
+    "virtualization",
+    "libvirt",
+    "incremental-backup",
+    "vm-backup",
+    "disaster-recovery",
+    "virtnbdbackup",
+    "nbd",
+    "backup-manager",
+    "backup-automation",
+    "linux-virtualization",
+    "enterprise-backup",
+    "backup-scheduler",
+    "vm-restore",
+    "backup-retention",
+    "offsite-backup",
+    "centralized-management"
+  ],
+  "author": {
+    "name": "Mohammad Amin Hashemi",
+    "email": "aminhashemiwin10@gmail.com",
+    "url": "https://www.linkedin.com/in/amin-hashemi-2955061bb"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aminhashemi1994/kvm-backup-manager.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aminhashemi1994/kvm-backup-manager/issues",
+    "email": "aminhashemiwin10@gmail.com"
+  },
+  "homepage": "https://github.com/aminhashemi1994/kvm-backup-manager#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "install:all": "cd controller-backend && npm install && cd ../agent-backend && npm install && cd ../frontend && npm install",
+    "build:frontend": "cd frontend && npm run build",
+    "start:controller": "cd controller-backend && npm start",
+    "start:agent": "cd agent-backend && npm start"
+  },
+  "private": false,
+  "contributors": [
+    {
+      "name": "Mohammad Amin Hashemi",
+      "email": "aminhashemiwin10@gmail.com",
+      "url": "https://www.linkedin.com/in/amin-hashemi-2955061bb"
+    }
+  ],
+  "funding": {
+    "type": "individual",
+    "url": "https://github.com/aminhashemi1994/kvm-backup-manager"
+  }
+}

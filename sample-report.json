@@ -1,0 +1,1523 @@
+{
+  "generated_at": "2026-05-20T06:14:19Z",
+  "hostname": "hv238.domain.com",
+  "backup_path": "/opt/kvm_pool/local/hdd/1/backup",
+  "vm_count": 9,
+  "total_backup_size_bytes": 367648316063,
+  "total_backup_size_gb": "342.399 GB",
+  "summary": {
+    "healthy": 9,
+    "corrupted": 0,
+    "no_backups": 0,
+    "total_archived": 1,
+    "total_archived_corrupted": 0
+  },
+  "vms": [
+    {
+      "vm_name": "20250408-093357435377037-133_simorgh.front-dev-2-dev.example.local",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20250408-093357435377037-133_simorgh.front-dev-2-dev.example.local",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 18363342265,
+      "total_disk_usage_gb": "17.102 GB",
+      "available_schedule_count": 1,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 0,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20250408-093357435377037-133_simorgh.front-dev-2-dev.example.local/once",
+          "disk_usage_bytes": 18363295006,
+          "disk_usage_gb": "17.102 GB",
+          "inferred_methods": [
+            "copy"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Sat",
+              "date": "09/05/2026",
+              "method": "copy"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 32212254720,
+                "virtual_size_gb": "30 GB",
+                "total_data_bytes": 28827385856,
+                "total_data_gb": "26.848 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-09T17:08:53.014629",
+                "last_backup_date": "2026-05-09T17:08:53.014629",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-09T17:08:53.014629",
+                    "incremental": false,
+                    "data_bytes": 28827385856,
+                    "data_gb": "26.848 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              },
+              "vdb": {
+                "disk_name": "vdb",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 53687091200,
+                "virtual_size_gb": "50 GB",
+                "total_data_bytes": 53687091200,
+                "total_data_gb": "50 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-09T17:08:53.058946",
+                "last_backup_date": "2026-05-09T17:08:53.058946",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-09T17:08:53.058946",
+                    "incremental": false,
+                    "data_bytes": 53687091200,
+                    "data_gb": "50 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 2,
+            "total_virtual_bytes": 85899345920,
+            "total_virtual_gb": "80 GB",
+            "total_data_bytes": 82514477056,
+            "total_data_gb": "76.848 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-05-09T17:08:53.014629",
+            "last_backup_date": "2026-05-09T17:08:53.058946",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        }
+      ]
+    },
+    {
+      "vm_name": "20250907-182111277163446-141_test-mykakado",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20250907-182111277163446-141_test-mykakado",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 36688021830,
+      "total_disk_usage_gb": "34.168 GB",
+      "available_schedule_count": 2,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 0,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20250907-182111277163446-141_test-mykakado/daily",
+          "disk_usage_bytes": 10306588139,
+          "disk_usage_gb": "9.599 GB",
+          "inferred_methods": [
+            "full"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Sun",
+              "date": "10/05/2026",
+              "method": "full"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 53687091200,
+                "virtual_size_gb": "50 GB",
+                "total_data_bytes": 26352353280,
+                "total_data_gb": "24.543 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-10T08:20:39.422547",
+                "last_backup_date": "2026-05-10T08:20:39.422547",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-10T08:20:39.422547",
+                    "incremental": false,
+                    "data_bytes": 26352353280,
+                    "data_gb": "24.543 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 53687091200,
+            "total_virtual_gb": "50 GB",
+            "total_data_bytes": 26352353280,
+            "total_data_gb": "24.543 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-05-10T08:20:39.422547",
+            "last_backup_date": "2026-05-10T08:20:39.422547",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20250907-182111277163446-141_test-mykakado/once",
+          "disk_usage_bytes": 26381353606,
+          "disk_usage_gb": "24.570 GB",
+          "inferred_methods": [
+            "copy"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Tue",
+              "date": "12/05/2026",
+              "method": "copy"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 53687091200,
+                "virtual_size_gb": "50 GB",
+                "total_data_bytes": 26375815168,
+                "total_data_gb": "24.564 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-12T15:39:17.589479",
+                "last_backup_date": "2026-05-12T15:39:17.589479",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-12T15:39:17.589479",
+                    "incremental": false,
+                    "data_bytes": 26375815168,
+                    "data_gb": "24.564 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 53687091200,
+            "total_virtual_gb": "50 GB",
+            "total_data_bytes": 26375815168,
+            "total_data_gb": "24.564 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-05-12T15:39:17.589479",
+            "last_backup_date": "2026-05-12T15:39:17.589479",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        }
+      ]
+    },
+    {
+      "vm_name": "20251011-091415765552574-54_kakado-redissentinel-1-net.example.local",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20251011-091415765552574-54_kakado-redissentinel-1-net.example.local",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 3495844337,
+      "total_disk_usage_gb": "3.256 GB",
+      "available_schedule_count": 1,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 0,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20251011-091415765552574-54_kakado-redissentinel-1-net.example.local/once",
+          "disk_usage_bytes": 3495797069,
+          "disk_usage_gb": "3.256 GB",
+          "inferred_methods": [
+            "copy"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Sun",
+              "date": "26/04/2026",
+              "method": "copy"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 10737418240,
+                "virtual_size_gb": "10 GB",
+                "total_data_bytes": 10172039168,
+                "total_data_gb": "9.473 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-04-26T11:41:43.712933",
+                "last_backup_date": "2026-04-26T11:41:43.712933",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-04-26T11:41:43.712933",
+                    "incremental": false,
+                    "data_bytes": 10172039168,
+                    "data_gb": "9.473 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 10737418240,
+            "total_virtual_gb": "10 GB",
+            "total_data_bytes": 10172039168,
+            "total_data_gb": "9.473 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-04-26T11:41:43.712933",
+            "last_backup_date": "2026-04-26T11:41:43.712933",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        }
+      ]
+    },
+    {
+      "vm_name": "20251027-150134829373473-72_simorgh-1-test-part3.example.local",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20251027-150134829373473-72_simorgh-1-test-part3.example.local",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 80209218857,
+      "total_disk_usage_gb": "74.701 GB",
+      "available_schedule_count": 1,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 0,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20251027-150134829373473-72_simorgh-1-test-part3.example.local/once",
+          "disk_usage_bytes": 80209167529,
+          "disk_usage_gb": "74.701 GB",
+          "inferred_methods": [
+            "copy"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Sun",
+              "date": "26/04/2026",
+              "method": "copy"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 107374182400,
+                "virtual_size_gb": "100 GB",
+                "total_data_bytes": 80203350016,
+                "total_data_gb": "74.695 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-04-26T14:36:16.370299",
+                "last_backup_date": "2026-04-26T14:36:16.370299",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-04-26T14:36:16.370299",
+                    "incremental": false,
+                    "data_bytes": 80203350016,
+                    "data_gb": "74.695 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 107374182400,
+            "total_virtual_gb": "100 GB",
+            "total_data_bytes": 80203350016,
+            "total_data_gb": "74.695 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-04-26T14:36:16.370299",
+            "last_backup_date": "2026-04-26T14:36:16.370299",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        }
+      ]
+    },
+    {
+      "vm_name": "20251111-153546905717581-32_test-vm1",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20251111-153546905717581-32_test-vm1",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 10015857913,
+      "total_disk_usage_gb": "9.328 GB",
+      "available_schedule_count": 1,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 0,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20251111-153546905717581-32_test-vm1/once",
+          "disk_usage_bytes": 10015810753,
+          "disk_usage_gb": "9.328 GB",
+          "inferred_methods": [
+            "copy"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Sat",
+              "date": "09/05/2026",
+              "method": "copy"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 10737418240,
+                "virtual_size_gb": "10 GB",
+                "total_data_bytes": 10011344896,
+                "total_data_gb": "9.324 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-09T16:25:47.854147",
+                "last_backup_date": "2026-05-09T16:25:47.854147",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-09T16:25:47.854147",
+                    "incremental": false,
+                    "data_bytes": 10011344896,
+                    "data_gb": "9.324 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 10737418240,
+            "total_virtual_gb": "10 GB",
+            "total_data_bytes": 10011344896,
+            "total_data_gb": "9.324 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-05-09T16:25:47.854147",
+            "last_backup_date": "2026-05-09T16:25:47.854147",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        }
+      ]
+    },
+    {
+      "vm_name": "20251111-154411741931233-44_test-vm2",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20251111-154411741931233-44_test-vm2",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 2824401174,
+      "total_disk_usage_gb": "2.630 GB",
+      "available_schedule_count": 1,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 0,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20251111-154411741931233-44_test-vm2/daily",
+          "disk_usage_bytes": 2824321134,
+          "disk_usage_gb": "2.630 GB",
+          "inferred_methods": [
+            "full",
+            "inc"
+          ],
+          "recorded_run_count": 2,
+          "scheduler_log": [
+            {
+              "day": "Tue",
+              "date": "12/05/2026",
+              "method": "full"
+            },
+            {
+              "day": "Tue",
+              "date": "12/05/2026",
+              "method": "inc"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 10737418240,
+                "virtual_size_gb": "10 GB",
+                "total_data_bytes": 10111287296,
+                "total_data_gb": "9.417 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 1,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-12T15:51:12.920600",
+                "last_backup_date": "2026-05-12T15:53:33.758863",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-12T15:51:12.920600",
+                    "incremental": false,
+                    "data_bytes": 10097065984,
+                    "data_gb": "9.404 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  },
+                  {
+                    "checkpoint": "virtnbdbackup.1",
+                    "parent_checkpoint": "virtnbdbackup.0",
+                    "date": "2026-05-12T15:53:33.758863",
+                    "incremental": true,
+                    "data_bytes": 14221312,
+                    "data_gb": "0.013 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 10737418240,
+            "total_virtual_gb": "10 GB",
+            "total_data_bytes": 10111287296,
+            "total_data_gb": "9.417 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 2,
+            "has_incremental": true,
+            "first_backup_date": "2026-05-12T15:51:12.920600",
+            "last_backup_date": "2026-05-12T15:53:33.758863",
+            "unique_checkpoints": [
+              "virtnbdbackup.0",
+              "virtnbdbackup.1"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": false,
+          "reason": "directory_absent",
+          "corrupted": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        }
+      ]
+    },
+    {
+      "vm_name": "20251201-084842204304931-99_test-tartanak-edge2",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20251201-084842204304931-99_test-tartanak-edge2",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 107556052873,
+      "total_disk_usage_gb": "100.169 GB",
+      "available_schedule_count": 3,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 1,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20251201-084842204304931-99_test-tartanak-edge2/daily",
+          "disk_usage_bytes": 44945488246,
+          "disk_usage_gb": "41.859 GB",
+          "inferred_methods": [
+            "full"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "full"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 107374182400,
+                "virtual_size_gb": "100 GB",
+                "total_data_bytes": 44938625024,
+                "total_data_gb": "41.852 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-05T09:54:06.262170",
+                "last_backup_date": "2026-05-05T09:54:06.262170",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-05T09:54:06.262170",
+                    "incremental": false,
+                    "data_bytes": 44938625024,
+                    "data_gb": "41.852 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 107374182400,
+            "total_virtual_gb": "100 GB",
+            "total_data_bytes": 44938625024,
+            "total_data_gb": "41.852 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-05-05T09:54:06.262170",
+            "last_backup_date": "2026-05-05T09:54:06.262170",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20251201-084842204304931-99_test-tartanak-edge2/once",
+          "disk_usage_bytes": 17295173085,
+          "disk_usage_gb": "16.107 GB",
+          "inferred_methods": [
+            "copy"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "copy"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 107374182400,
+                "virtual_size_gb": "100 GB",
+                "total_data_bytes": 44938756096,
+                "total_data_gb": "41.852 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-05T11:09:06.136751",
+                "last_backup_date": "2026-05-05T11:09:06.136751",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-05T11:09:06.136751",
+                    "incremental": false,
+                    "data_bytes": 44938756096,
+                    "data_gb": "41.852 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 107374182400,
+            "total_virtual_gb": "100 GB",
+            "total_data_bytes": 44938756096,
+            "total_data_gb": "41.852 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-05-05T11:09:06.136751",
+            "last_backup_date": "2026-05-05T11:09:06.136751",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "archived",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20251201-084842204304931-99_test-tartanak-edge2/archived/2026-05-05_09-54-00_20251201-084842204304931-99_test-tartanak-edge2_daily",
+          "disk_usage_bytes": 45315340253,
+          "disk_usage_gb": "42.203 GB",
+          "inferred_methods": [
+            "full",
+            "inc"
+          ],
+          "recorded_run_count": 7,
+          "scheduler_log": [
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "full"
+            },
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "inc"
+            },
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "inc"
+            },
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "inc"
+            },
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "inc"
+            },
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "inc"
+            },
+            {
+              "day": "Tue",
+              "date": "05/05/2026",
+              "method": "inc"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 107374182400,
+                "virtual_size_gb": "100 GB",
+                "total_data_bytes": 45285310464,
+                "total_data_gb": "42.175 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 6,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-05T08:39:06.483002",
+                "last_backup_date": "2026-05-05T09:50:40.787124",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-05T08:39:06.483002",
+                    "incremental": false,
+                    "data_bytes": 44938362880,
+                    "data_gb": "41.852 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  },
+                  {
+                    "checkpoint": "virtnbdbackup.1",
+                    "parent_checkpoint": "virtnbdbackup.0",
+                    "date": "2026-05-05T09:09:27.837532",
+                    "incremental": true,
+                    "data_bytes": 82771968,
+                    "data_gb": "0.077 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  },
+                  {
+                    "checkpoint": "virtnbdbackup.2",
+                    "parent_checkpoint": "virtnbdbackup.1",
+                    "date": "2026-05-05T09:14:57.466077",
+                    "incremental": true,
+                    "data_bytes": 43188224,
+                    "data_gb": "0.04 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  },
+                  {
+                    "checkpoint": "virtnbdbackup.3",
+                    "parent_checkpoint": "virtnbdbackup.2",
+                    "date": "2026-05-05T09:22:41.652634",
+                    "incremental": true,
+                    "data_bytes": 52166656,
+                    "data_gb": "0.049 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  },
+                  {
+                    "checkpoint": "virtnbdbackup.4",
+                    "parent_checkpoint": "virtnbdbackup.3",
+                    "date": "2026-05-05T09:42:21.833797",
+                    "incremental": true,
+                    "data_bytes": 77660160,
+                    "data_gb": "0.072 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  },
+                  {
+                    "checkpoint": "virtnbdbackup.5",
+                    "parent_checkpoint": "virtnbdbackup.4",
+                    "date": "2026-05-05T09:47:42.932620",
+                    "incremental": true,
+                    "data_bytes": 52953088,
+                    "data_gb": "0.049 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  },
+                  {
+                    "checkpoint": "virtnbdbackup.6",
+                    "parent_checkpoint": "virtnbdbackup.5",
+                    "date": "2026-05-05T09:50:40.787124",
+                    "incremental": true,
+                    "data_bytes": 38207488,
+                    "data_gb": "0.036 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 1,
+            "total_virtual_bytes": 107374182400,
+            "total_virtual_gb": "100 GB",
+            "total_data_bytes": 45285310464,
+            "total_data_gb": "42.175 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 7,
+            "has_incremental": true,
+            "first_backup_date": "2026-05-05T08:39:06.483002",
+            "last_backup_date": "2026-05-05T09:50:40.787124",
+            "unique_checkpoints": [
+              "virtnbdbackup.0",
+              "virtnbdbackup.1",
+              "virtnbdbackup.2",
+              "virtnbdbackup.3",
+              "virtnbdbackup.4",
+              "virtnbdbackup.5",
+              "virtnbdbackup.6"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "archive_name": "2026-05-05_09-54-00_20251201-084842204304931-99_test-tartanak-edge2_daily",
+          "original_schedule": "daily",
+          "file_count": 65,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        }
+      ]
+    },
+    {
+      "vm_name": "20260104-104150357776634-55_cando-internship-8-dev.example.local",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20260104-104150357776634-55_cando-internship-8-dev.example.local",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 105371923362,
+      "total_disk_usage_gb": "98.135 GB",
+      "available_schedule_count": 1,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 0,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20260104-104150357776634-55_cando-internship-8-dev.example.local/once",
+          "disk_usage_bytes": 105371876106,
+          "disk_usage_gb": "98.135 GB",
+          "inferred_methods": [
+            "copy"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Sat",
+              "date": "09/05/2026",
+              "method": "copy"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 21474836480,
+                "virtual_size_gb": "20 GB",
+                "total_data_bytes": 19895156736,
+                "total_data_gb": "18.529 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-09T16:03:34.290570",
+                "last_backup_date": "2026-05-09T16:03:34.290570",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-09T16:03:34.290570",
+                    "incremental": false,
+                    "data_bytes": 19895156736,
+                    "data_gb": "18.529 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  }
+                ]
+              },
+              "vdb": {
+                "disk_name": "vdb",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 85899345920,
+                "virtual_size_gb": "80 GB",
+                "total_data_bytes": 85471133696,
+                "total_data_gb": "79.601 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-09T16:03:35.354054",
+                "last_backup_date": "2026-05-09T16:03:35.354054",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-09T16:03:35.354054",
+                    "incremental": false,
+                    "data_bytes": 85471133696,
+                    "data_gb": "79.601 GB",
+                    "compressed": false,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 2,
+            "total_virtual_bytes": 107374182400,
+            "total_virtual_gb": "100 GB",
+            "total_data_bytes": 105366290432,
+            "total_data_gb": "98.13 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-05-09T16:03:34.290570",
+            "last_backup_date": "2026-05-09T16:03:35.354054",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        }
+      ]
+    },
+    {
+      "vm_name": "20260315-084641117109395-178_test-new-backup",
+      "vm_path": "/opt/kvm_pool/local/hdd/1/backup/20260315-084641117109395-178_test-new-backup",
+      "storage_pool_path": "/opt/kvm_pool/local/hdd/1/backup",
+      "total_disk_usage_bytes": 3123653452,
+      "total_disk_usage_gb": "2.909 GB",
+      "available_schedule_count": 1,
+      "corrupted_schedule_count": 0,
+      "archived_backup_count": 0,
+      "archived_corrupted_count": 0,
+      "health": "healthy",
+      "schedules": [
+        {
+          "schedule": "daily",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "weekly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "monthly",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        },
+        {
+          "schedule": "once",
+          "available": true,
+          "path": "/opt/kvm_pool/local/hdd/1/backup/20260315-084641117109395-178_test-new-backup/once",
+          "disk_usage_bytes": 3123587756,
+          "disk_usage_gb": "2.909 GB",
+          "inferred_methods": [
+            "copy"
+          ],
+          "recorded_run_count": 1,
+          "scheduler_log": [
+            {
+              "day": "Tue",
+              "date": "12/05/2026",
+              "method": "copy"
+            }
+          ],
+          "corrupted": false,
+          "dump_analysis": {
+            "disks": {
+              "vda": {
+                "disk_name": "vda",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 21474836480,
+                "virtual_size_gb": "20 GB",
+                "total_data_bytes": 7518552064,
+                "total_data_gb": "7.002 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-12T16:04:17.591804",
+                "last_backup_date": "2026-05-12T16:04:17.591804",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-12T16:04:17.591804",
+                    "incremental": false,
+                    "data_bytes": 7518552064,
+                    "data_gb": "7.002 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              },
+              "vdb": {
+                "disk_name": "vdb",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 53687091200,
+                "virtual_size_gb": "50 GB",
+                "total_data_bytes": 53687091200,
+                "total_data_gb": "50 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-12T16:04:18.755248",
+                "last_backup_date": "2026-05-12T16:04:18.755248",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-12T16:04:18.755248",
+                    "incremental": false,
+                    "data_bytes": 53687091200,
+                    "data_gb": "50 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              },
+              "vdc": {
+                "disk_name": "vdc",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 53687091200,
+                "virtual_size_gb": "50 GB",
+                "total_data_bytes": 53687091200,
+                "total_data_gb": "50 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-12T16:04:18.640659",
+                "last_backup_date": "2026-05-12T16:04:18.640659",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-12T16:04:18.640659",
+                    "incremental": false,
+                    "data_bytes": 53687091200,
+                    "data_gb": "50 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              },
+              "vdd": {
+                "disk_name": "vdd",
+                "disk_format": "qcow2",
+                "virtual_size_bytes": 53687091200,
+                "virtual_size_gb": "50 GB",
+                "total_data_bytes": 53687091200,
+                "total_data_gb": "50 GB",
+                "full_checkpoint_count": 1,
+                "inc_checkpoint_count": 0,
+                "compression_methods": [
+                  "lz4"
+                ],
+                "first_backup_date": "2026-05-12T16:04:18.806672",
+                "last_backup_date": "2026-05-12T16:04:18.806672",
+                "checkpoints": [
+                  {
+                    "checkpoint": "virtnbdbackup.0",
+                    "parent_checkpoint": "",
+                    "date": "2026-05-12T16:04:18.806672",
+                    "incremental": false,
+                    "data_bytes": 53687091200,
+                    "data_gb": "50 GB",
+                    "compressed": 2,
+                    "compression_method": "lz4"
+                  }
+                ]
+              }
+            },
+            "disk_count": 4,
+            "total_virtual_bytes": 182536110080,
+            "total_virtual_gb": "170 GB",
+            "total_data_bytes": 168579825664,
+            "total_data_gb": "157.002 GB",
+            "compression_methods": [
+              "lz4"
+            ],
+            "chain_depth": 1,
+            "has_incremental": false,
+            "first_backup_date": "2026-05-12T16:04:17.591804",
+            "last_backup_date": "2026-05-12T16:04:18.806672",
+            "unique_checkpoints": [
+              "virtnbdbackup.0"
+            ]
+          },
+          "dump_error": null,
+          "dump_exit_code": 0,
+          "dump_stderr": null,
+          "partial_backup_info": {
+            "has_partial": false,
+            "partial_count": 0,
+            "partial_files": null,
+            "backup_running": false,
+            "interrupted": false,
+            "in_progress": false
+          },
+          "in_progress": false
+        },
+        {
+          "schedule": "custom",
+          "available": false,
+          "reason": "directory_empty",
+          "corrupted": false
+        }
+      ]
+    }
+  ]
+}
