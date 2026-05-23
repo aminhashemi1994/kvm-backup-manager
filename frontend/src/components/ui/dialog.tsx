@@ -34,18 +34,8 @@ const Dialog: React.FC<DialogProps> = ({ open, onOpenChange, children }) => {
   // RENDER VIA PORTAL TO document.body
   // This guarantees the dialog escapes ANY parent container (overflow, transform,
   // backdrop-filter, etc.) that would otherwise clip it.
-  // The overlay starts AFTER the sidebar (left-64 = 16rem = 256px) so the dialog
-  // centers over the main content area, not the full viewport.
   const dialogContent = (
-    <div
-      className="dialog-overlay"
-      onClick={() => onOpenChange?.(false)}
-      role="dialog"
-      aria-modal="true"
-      ref={(el) => {
-        if (el) el.scrollTop = 0
-      }}
-    >
+    <DialogScrollContainer onClick={() => onOpenChange?.(false)}>
       {/* Backdrop — only covers the main content area */}
       <div className="dialog-overlay-backdrop" aria-hidden="true" />
 
@@ -53,10 +43,41 @@ const Dialog: React.FC<DialogProps> = ({ open, onOpenChange, children }) => {
       <div className="flex min-h-full items-start justify-center py-[5vh] px-4">
         {children}
       </div>
-    </div>
+    </DialogScrollContainer>
   )
 
   return createPortal(dialogContent, document.body)
+}
+
+/**
+ * Internal scroll container that resets scroll to top ONLY when the dialog
+ * first opens, not on every re-render. This prevents the scroll position
+ * from jumping when state changes inside the dialog (e.g. clicking checkboxes).
+ */
+const DialogScrollContainer: React.FC<{
+  children: React.ReactNode
+  onClick?: () => void
+}> = ({ children, onClick }) => {
+  const containerRef = React.useRef<HTMLDivElement>(null)
+
+  React.useEffect(() => {
+    // Reset scroll only on mount (when the dialog first opens)
+    if (containerRef.current) {
+      containerRef.current.scrollTop = 0
+    }
+  }, [])
+
+  return (
+    <div
+      ref={containerRef}
+      className="dialog-overlay"
+      onClick={onClick}
+      role="dialog"
+      aria-modal="true"
+    >
+      {children}
+    </div>
+  )
 }
 
 const DialogContent = React.forwardRef<
