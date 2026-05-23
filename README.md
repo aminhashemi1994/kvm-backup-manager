@@ -11,9 +11,22 @@ A comprehensive, open-source backup management system designed for KVM virtualiz
 
 **Keywords**: KVM backup, QEMU backup, virtual machine backup, incremental backup, VM restore, libvirt backup, Linux virtualization backup, automated backup solution, disaster recovery, backup management system
 
+## 📸 Screenshots
+
+### Dashboard
+A clean overview of every backup host, hypervisor, and active job at a glance.
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+### Creating a Backup
+Trigger manual backups with full control over compression, verification, and target storage pool.
+
+![Creating a Backup](docs/screenshots/creating-backup.png)
+
 ## 📋 Table of Contents
 
 - [Features](#-features)
+- [Screenshots](#-screenshots)
 - [Architecture](#-architecture)
 - [Recommended Architecture](#-recommended-architecture)
 - [Prerequisites](#-prerequisites)
