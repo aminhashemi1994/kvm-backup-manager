@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "KVM Backup Manager"
+abstract: "Enterprise-grade backup and restore solution for KVM/QEMU virtual machines with incremental backups, centralized management, and real-time monitoring. Built on top of virtnbdbackup."
+authors:
+  - family-names: "Hashemi"
+    given-names: "Mohammad Amin"
+    email: "aminhashemiwin10@gmail.com"
+    orcid: ""
+repository-code: "https://github.com/aminhashemi1994/kvm-backup-manager"
+url: "https://github.com/aminhashemi1994/kvm-backup-manager"
+license: MIT
+keywords:
+  - KVM
+  - QEMU
+  - backup
+  - virtualization
+  - libvirt
+  - incremental-backup
+  - disaster-recovery
+  - virtnbdbackup
+  - NBD
+  - backup-automation
+version: 1.0.0
+date-released: "2024-01-01"
+references:
+  - type: software
+    title: "virtnbdbackup"
+    authors:
+      - name: "abbbi"
+    repository-code: "https://github.com/abbbi/virtnbdbackup"
+    abstract: "Backup utility for libvirt, using the latest changed block tracking features"

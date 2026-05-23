@@ -1,0 +1,36 @@
+{
+  "name": "kvm-backup-agent",
+  "version": "1.0.0",
+  "description": "KVM Backup Manager - Agent Backend (runs on backup hosts)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "keywords": ["kvm", "backup", "agent", "virtualization", "qemu", "libvirt", "virtnbdbackup"],
+  "author": {
+    "name": "Mohammad Amin Hashemi",
+    "email": "aminhashemiwin10@gmail.com",
+    "url": "https://www.linkedin.com/in/amin-hashemi-2955061bb"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aminhashemi1994/kvm-backup-manager.git"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.6.1",
+    "socket.io-client": "^4.6.1",
+    "ssh2": "^1.14.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.0",
+    "morgan": "^1.10.0",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}

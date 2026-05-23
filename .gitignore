@@ -1,0 +1,103 @@
+# ============================================================================
+# Dependencies
+# ============================================================================
+node_modules/
+**/node_modules/
+.npm
+.pnp
+.pnp.js
+
+# ============================================================================
+# Environment & secrets — NEVER commit these
+# ============================================================================
+.env
+.env.local
+.env.*.local
+**/.env
+**/.env.local
+*.pem
+*.key
+*.crt
+ssh-keys/
+
+# ============================================================================
+# Runtime data — agent and controller state should not be checked in
+# ============================================================================
+controller-backend/data/users.json
+controller-backend/data/heartbeat.json
+controller-backend/data/backup-jobs.json
+controller-backend/data/restore-jobs.json
+controller-backend/data/backup-schedules.json
+controller-backend/data/backup-hosts.json
+controller-backend/data/hypervisors.json
+controller-backend/data/virtual-machines.json
+controller-backend/data/offsite-hosts.json
+controller-backend/data/storage-pools.json
+controller-backend/data/restore-storage-pools.json
+controller-backend/data/agents.json
+controller-backend/data/enriched-report-cache.json
+controller-backend/data/audit/
+controller-backend/data/report-snapshots/
+controller-backend/data/logs/
+
+# Agent logs and runtime
+agent-backend/logs/*.log
+agent-backend/logs/*.json
+agent-backend/logs/job-state/
+agent-backend/logs/*.exitcode
+
+# Keep .gitkeep files so empty dirs are preserved
+!**/.gitkeep
+
+# ============================================================================
+# Build output
+# ============================================================================
+dist/
+build/
+out/
+**/dist/
+**/build/
+*.tsbuildinfo
+
+# ============================================================================
+# Bundled binaries / archives
+# ============================================================================
+agent-backend/virtnbdbackup/virtnbdbackup.tar
+*.tar
+*.tar.gz
+*.zip
+
+# ============================================================================
+# IDE / editor
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ============================================================================
+# Logs
+# ============================================================================
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ============================================================================
+# OS files
+# ============================================================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ============================================================================
+# Project-internal scratch / progress / drafts
+# ============================================================================
+improvement.txt
+IMPROVEMENT_PROGRESS.md
+*.draft.md
+.scratch/

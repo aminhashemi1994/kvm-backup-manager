@@ -1,0 +1,45 @@
+# Authors and Contributors
+
+## Project Creator and Maintainer
+
+**Mohammad Amin Hashemi** <aminhashemiwin10@gmail.com>
+- Project creator and lead developer
+- LinkedIn: https://www.linkedin.com/in/amin-hashemi-2955061bb
+- GitHub: @aminhashemi1994
+
+## Core Technologies
+
+This project is built upon several open-source technologies:
+
+### virtnbdbackup
+- **Author**: @abbbi
+- **Repository**: https://github.com/abbbi/virtnbdbackup
+- **Description**: Backup utility for libvirt, using the latest changed block tracking features
+- **License**: GPL-3.0
+- **Role**: Core backup engine that powers the backup and restore functionality
+
+The virtnbdbackup project provides the fundamental backup capabilities that make this
+management system possible. We are deeply grateful to @abbbi and the virtnbdbackup
+community for their excellent work.
+
+## Contributors
+
+This section will list all contributors who have helped improve this project through
+code contributions, bug reports, documentation, or other means.
+
+<!-- Contributors will be automatically listed here -->
+
+To contribute to this project, please see CONTRIBUTING.md
+
+## Acknowledgments
+
+Special thanks to:
+- The KVM/QEMU development community
+- The libvirt project team
+- All users who have provided feedback and bug reports
+- Everyone who has contributed to the open-source ecosystem
+
+---
+
+If you've contributed to this project and your name is missing, please open a PR
+to add yourself to this file!

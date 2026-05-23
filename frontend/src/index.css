@@ -1,0 +1,532 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --sidebar-width: 16rem; /* matches Tailwind w-64 */
+    --background: 220 20% 97%;
+    --foreground: 222.2 84% 4.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 84% 4.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+    --primary: 221.2 83.2% 53.3%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 221.2 83.2% 53.3%;
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --card: 222.2 84% 4.9%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222.2 84% 4.9%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 217.2 91.2% 59.8%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 217.2 32.6% 17.5%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --accent: 217.2 32.6% 17.5%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217.2 32.6% 17.5%;
+    --input: 217.2 32.6% 17.5%;
+    --ring: 224.3 76.3% 48%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+/* ─── Item 10: Glass & Modern Styles ─────────────────────────────────────── */
+
+@layer components {
+  /* Glass card effect (Windows 11 inspired) */
+  .glass-card {
+    @apply bg-white/70 dark:bg-gray-900/70 backdrop-blur-xl border border-white/20 dark:border-gray-700/30;
+    box-shadow: 
+      0 1px 3px rgba(0, 0, 0, 0.04),
+      0 4px 12px rgba(0, 0, 0, 0.03),
+      inset 0 1px 0 rgba(255, 255, 255, 0.6);
+    transition: box-shadow 0.3s ease, transform 0.2s ease;
+  }
+
+  .glass-card:hover {
+    box-shadow: 
+      0 4px 16px rgba(0, 0, 0, 0.08),
+      0 12px 40px rgba(0, 0, 0, 0.04),
+      inset 0 1px 0 rgba(255, 255, 255, 0.9);
+    transform: translateY(-1px);
+  }
+
+  /* Floating panel (sidebar, dialogs) */
+  .glass-panel {
+    @apply bg-white/85 dark:bg-gray-900/85 backdrop-blur-2xl border border-white/30 dark:border-gray-700/40;
+    box-shadow: 
+      0 8px 32px rgba(0, 0, 0, 0.08),
+      0 2px 8px rgba(0, 0, 0, 0.04),
+      inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  }
+
+  /* Gradient accent bar */
+  .gradient-accent {
+    background: linear-gradient(135deg, #3b82f6, #8b5cf6, #06b6d4);
+  }
+
+  /* Hover shine effect — glossy sweep */
+  .hover-shine {
+    position: relative;
+    overflow: hidden;
+  }
+  .hover-shine::after {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: linear-gradient(
+      60deg,
+      transparent 20%,
+      rgba(255, 255, 255, 0.05) 40%,
+      rgba(255, 255, 255, 0.12) 50%,
+      rgba(255, 255, 255, 0.05) 60%,
+      transparent 80%
+    );
+    transform: translateX(-100%) rotate(0deg);
+    transition: transform 0.7s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+  }
+  .hover-shine:hover::after {
+    transform: translateX(100%) rotate(0deg);
+  }
+
+  /* Glow on hover — subtle colored glow */
+  .hover-glow {
+    transition: box-shadow 0.3s ease, transform 0.2s ease;
+  }
+  .hover-glow:hover {
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.15), 0 4px 12px rgba(0, 0, 0, 0.05);
+    transform: translateY(-1px);
+  }
+
+  /* Scale bounce on hover */
+  .hover-scale {
+    transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .hover-scale:hover {
+    transform: scale(1.02);
+  }
+  .hover-scale:active {
+    transform: scale(0.98);
+  }
+
+  /* Glossy surface — top highlight */
+  .glossy {
+    position: relative;
+    overflow: hidden;
+  }
+  .glossy::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 50%;
+    background: linear-gradient(180deg, rgba(255,255,255,0.15) 0%, transparent 100%);
+    pointer-events: none;
+    border-radius: inherit;
+  }
+
+  /* Modern progress bar */
+  .progress-modern {
+    @apply h-3 rounded-full overflow-hidden;
+    background: linear-gradient(90deg, #e2e8f0, #f1f5f9);
+  }
+  .progress-modern .progress-fill {
+    @apply h-full rounded-full transition-all duration-500 ease-out;
+    background: linear-gradient(90deg, #3b82f6, #6366f1);
+    box-shadow: 0 0 12px rgba(59, 130, 246, 0.4);
+  }
+
+  /* Floating nav item */
+  .nav-item {
+    @apply relative px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-200;
+  }
+  .nav-item:hover {
+    @apply bg-white/70 dark:bg-gray-800/70;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+    transform: translateX(2px);
+  }
+  .nav-item.active {
+    @apply bg-white dark:bg-gray-800 text-primary;
+    box-shadow: 0 2px 12px rgba(59, 130, 246, 0.15), 0 1px 3px rgba(0,0,0,0.05);
+  }
+  .nav-item.active::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 25%;
+    bottom: 25%;
+    width: 3px;
+    border-radius: 0 3px 3px 0;
+    background: linear-gradient(180deg, #3b82f6, #8b5cf6);
+  }
+
+  /* Stat card with gradient border */
+  .stat-card {
+    @apply relative rounded-2xl p-[1px] overflow-hidden;
+    background: linear-gradient(135deg, rgba(59, 130, 246, 0.2), rgba(139, 92, 246, 0.2), rgba(6, 182, 212, 0.1));
+  }
+  .stat-card-inner {
+    @apply bg-white dark:bg-gray-900 rounded-2xl p-5 h-full;
+  }
+
+  /* Interactive row hover */
+  .row-hover {
+    @apply transition-all duration-150;
+  }
+  .row-hover:hover {
+    @apply bg-blue-50/50 dark:bg-blue-900/10;
+    transform: scale(1.001);
+  }
+
+  /* Pulse dot */
+  .pulse-dot {
+    @apply relative;
+  }
+  .pulse-dot::after {
+    content: '';
+    @apply absolute inset-0 rounded-full;
+    animation: pulse-ring 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  /* Command palette overlay */
+  .cmd-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99999;
+    animation: fadeIn 0.15s ease;
+  }
+  .cmd-overlay::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    left: var(--sidebar-width);
+    background-color: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(4px);
+  }
+  .cmd-dialog {
+    position: fixed;
+    top: 15%;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 100%;
+    max-width: 32rem;
+    z-index: 99999;
+    @apply bg-white/95 dark:bg-gray-900/95 backdrop-blur-xl rounded-2xl;
+    @apply border border-white/30 dark:border-gray-700/30;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.1);
+    animation: slideDown 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  /* Floating badge */
+  .badge-float {
+    @apply transition-all duration-200;
+  }
+  .badge-float:hover {
+    transform: translateY(-1px) scale(1.05);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  }
+
+  /* Dialog overlay — centers over full viewport, but backdrop only dims
+     the main content area so the sidebar stays visible and interactive.
+     The dialog itself is always at viewport center regardless of sidebar state. */
+  .dialog-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .dialog-overlay-backdrop {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    left: var(--sidebar-width);
+    background-color: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(2px);
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translate(-50%, -10px) scale(0.97); }
+  to { opacity: 1; transform: translate(-50%, 0) scale(1); }
+}
+
+@keyframes pulse-ring {
+  0% { box-shadow: 0 0 0 0 currentColor; opacity: 0.6; }
+  70% { box-shadow: 0 0 0 6px currentColor; opacity: 0; }
+  100% { box-shadow: 0 0 0 0 currentColor; opacity: 0; }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300/50 dark:bg-gray-600/30 rounded-full;
+  transition: background 0.2s;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-400/70 dark:bg-gray-500/50;
+}
+
+/* Smooth page transitions */
+.page-enter {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.page-enter-active {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.25s ease, transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Input focus glow */
+input:focus, select:focus, textarea:focus {
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  border-color: rgba(59, 130, 246, 0.5) !important;
+  transition: box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+/* Table row animations */
+tbody tr {
+  @apply transition-colors duration-150;
+}
+tbody tr:hover {
+  @apply bg-gray-50/80 dark:bg-gray-800/40;
+}
+
+/* ─── Responsive layout helpers ─────────────────────────────────────────── */
+
+/* Make all tables horizontally scrollable on mobile */
+table {
+  min-width: max-content;
+}
+
+/* Page headers — wrap on small screens */
+.page-header,
+h1.page-title {
+  word-break: break-word;
+}
+
+/* Cards should never overflow their container */
+.card-responsive {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* Smaller text on mobile for headings */
+@media (max-width: 640px) {
+  h1 {
+    font-size: 1.5rem !important;
+  }
+  h2 {
+    font-size: 1.25rem !important;
+  }
+  /* Tighten padding on cards on mobile */
+  .glass-card,
+  [class*="rounded-2xl"][class*="border"] {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+}
+
+/* Hide desktop-only elements on small screens */
+@media (max-width: 768px) {
+  .hide-mobile {
+    display: none !important;
+  }
+}
+
+/* Force pointer cursor on all clickable elements */
+button:not(:disabled),
+a,
+[role="button"],
+[role="menuitem"],
+[role="link"] {
+  cursor: pointer !important;
+}
+button:disabled {
+  cursor: not-allowed !important;
+}
+
+/* ─── Dark mode color overrides ──────────────────────────────────────────
+   Many components use hardcoded Tailwind classes like `bg-white`, `text-gray-900`,
+   etc. without `dark:` variants. These rules patch those at the CSS level so
+   dark mode works everywhere without rewriting every component.
+   
+   Higher specificity than Tailwind utilities ensures these win. */
+
+.dark .bg-white {
+  background-color: rgb(17 24 39) !important; /* gray-900 */
+}
+.dark .bg-gray-50 {
+  background-color: rgb(31 41 55) !important; /* gray-800 */
+}
+.dark .bg-gray-100 {
+  background-color: rgb(55 65 81) !important; /* gray-700 */
+}
+
+/* Text colors — invert dark text in dark mode */
+.dark .text-gray-900 {
+  color: rgb(243 244 246) !important; /* gray-100 */
+}
+.dark .text-gray-800 {
+  color: rgb(229 231 235) !important; /* gray-200 */
+}
+.dark .text-gray-700 {
+  color: rgb(209 213 219) !important; /* gray-300 */
+}
+.dark .text-gray-600 {
+  color: rgb(156 163 175) !important; /* gray-400 */
+}
+.dark .text-black {
+  color: rgb(243 244 246) !important;
+}
+
+/* Borders */
+.dark .border-gray-200 {
+  border-color: rgb(55 65 81) !important; /* gray-700 */
+}
+.dark .border-gray-300 {
+  border-color: rgb(75 85 99) !important; /* gray-600 */
+}
+
+/* Soft tinted backgrounds — keep tint but darken */
+.dark .bg-blue-50 {
+  background-color: rgba(30, 58, 138, 0.15) !important;
+}
+.dark .bg-yellow-50 {
+  background-color: rgba(120, 53, 15, 0.15) !important;
+}
+.dark .bg-green-50 {
+  background-color: rgba(20, 83, 45, 0.15) !important;
+}
+.dark .bg-red-50 {
+  background-color: rgba(127, 29, 29, 0.15) !important;
+}
+.dark .bg-amber-50 {
+  background-color: rgba(120, 53, 15, 0.15) !important;
+}
+.dark .bg-orange-50 {
+  background-color: rgba(124, 45, 18, 0.15) !important;
+}
+.dark .bg-purple-50 {
+  background-color: rgba(76, 29, 149, 0.15) !important;
+}
+
+/* Tinted borders */
+.dark .border-blue-200 { border-color: rgba(59, 130, 246, 0.3) !important; }
+.dark .border-yellow-200 { border-color: rgba(234, 179, 8, 0.3) !important; }
+.dark .border-green-200 { border-color: rgba(34, 197, 94, 0.3) !important; }
+.dark .border-red-200 { border-color: rgba(239, 68, 68, 0.3) !important; }
+.dark .border-amber-200 { border-color: rgba(245, 158, 11, 0.3) !important; }
+
+/* Text on tinted backgrounds — keep readable in dark */
+.dark .text-blue-900,
+.dark .text-blue-800,
+.dark .text-blue-700 { color: rgb(147 197 253) !important; } /* blue-300 */
+.dark .text-yellow-900,
+.dark .text-yellow-800,
+.dark .text-yellow-700 { color: rgb(253 224 71) !important; } /* yellow-300 */
+.dark .text-green-900,
+.dark .text-green-800,
+.dark .text-green-700 { color: rgb(134 239 172) !important; } /* green-300 */
+.dark .text-red-900,
+.dark .text-red-800,
+.dark .text-red-700,
+.dark .text-red-600 { color: rgb(252 165 165) !important; } /* red-300 */
+.dark .text-amber-900,
+.dark .text-amber-800,
+.dark .text-amber-700,
+.dark .text-amber-600 { color: rgb(252 211 77) !important; } /* amber-300 */
+.dark .text-orange-900,
+.dark .text-orange-800,
+.dark .text-orange-700,
+.dark .text-orange-600 { color: rgb(253 186 116) !important; } /* orange-300 */
+.dark .text-purple-900,
+.dark .text-purple-800,
+.dark .text-purple-700 { color: rgb(216 180 254) !important; } /* purple-300 */
+
+/* Tinted badges — bg-X-100 with text-X-700 pattern */
+.dark .bg-blue-100 { background-color: rgba(59, 130, 246, 0.2) !important; }
+.dark .bg-yellow-100 { background-color: rgba(234, 179, 8, 0.2) !important; }
+.dark .bg-green-100 { background-color: rgba(34, 197, 94, 0.2) !important; }
+.dark .bg-red-100 { background-color: rgba(239, 68, 68, 0.2) !important; }
+.dark .bg-amber-100 { background-color: rgba(245, 158, 11, 0.2) !important; }
+.dark .bg-orange-100 { background-color: rgba(249, 115, 22, 0.2) !important; }
+.dark .bg-purple-100 { background-color: rgba(168, 85, 247, 0.2) !important; }
+
+/* Inputs — make them visible in dark */
+.dark input,
+.dark select,
+.dark textarea {
+  background-color: rgb(31 41 55) !important;
+  color: rgb(243 244 246) !important;
+  border-color: rgb(55 65 81) !important;
+}
+.dark input::placeholder,
+.dark textarea::placeholder {
+  color: rgb(107 114 128) !important;
+}
+
+/* Hover backgrounds */
+.dark .hover\\:bg-gray-50:hover { background-color: rgb(31 41 55) !important; }
+.dark .hover\\:bg-gray-100:hover { background-color: rgb(55 65 81) !important; }
+
+/* Divides */
+.dark .divide-gray-100 > :not([hidden]) ~ :not([hidden]) {
+  border-color: rgb(31 41 55) !important;
+}
+.dark .divide-gray-200 > :not([hidden]) ~ :not([hidden]) {
+  border-color: rgb(55 65 81) !important;
+}

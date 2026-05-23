@@ -1,0 +1,35 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Source code
+*.js text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.sh text eol=lf
+
+# Documentation
+*.md text eol=lf
+*.txt text eol=lf
+
+# Configuration files
+*.yml text eol=lf
+*.yaml text eol=lf
+*.conf text eol=lf
+*.config text eol=lf
+
+# Exclude files from export
+.gitattributes export-ignore
+.gitignore export-ignore
+.github export-ignore
+
+# Language statistics
+*.sh linguist-language=Shell
+*.js linguist-language=JavaScript
+*.ts linguist-language=TypeScript
+*.tsx linguist-language=TypeScript
+agent-backend/virtnbdbackup/** linguist-vendored
+frontend/node_modules/** linguist-vendored
+controller-backend/node_modules/** linguist-vendored
+agent-backend/node_modules/** linguist-vendored
