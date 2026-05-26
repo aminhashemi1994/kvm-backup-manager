@@ -73,6 +73,9 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
   const [selectedBackupHostId, setSelectedBackupHostId] = useState('')
   const [selectedHypervisorId, setSelectedHypervisorId] = useState('')
   const [vmSearchQuery, setVmSearchQuery] = useState('')
+  // Multi-VM selection (only used when creating new schedules; edit mode uses single vmId)
+  const [selectedVmIds, setSelectedVmIds] = useState<Set<string>>(new Set())
+  const isEditing = !!schedule
 
   const [selectedCalendarDates, setSelectedCalendarDates] = useState<Date[]>([])
 
@@ -234,63 +237,87 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
       return
     }
 
-    const data: any = {
-      vmId: formData.vmId,
-      storagePoolId: formData.storagePoolId,
-      name: formData.name,
-      scheduleType: formData.scheduleType,
-      compression: formData.noCompression ? 0 : formData.compression,
-      noCompression: formData.noCompression,
-      noVerify: formData.noVerify,
-      enabled: formData.enabled,
-      missedRunPolicy: formData.missedRunPolicy,
-      missedRunGracePeriodMinutes: formData.missedRunGracePeriodMinutes,
-      syncToOffsite: formData.syncToOffsite,
-      offsiteHostIds: formData.syncToOffsite && formData.offsiteHostIds.length > 0 ? formData.offsiteHostIds : undefined,
+    // For new schedules, require at least one VM selected
+    if (!isEditing && selectedVmIds.size === 0) {
+      alert('Please select at least one VM')
+      return
     }
 
-    // Add type-specific fields
-    switch (formData.scheduleType) {
-      case 'daily':
-        data.time = formData.time
-        data.incrementalCount = formData.incrementalCount
-        break
-      
-      case 'weekly':
-        data.time = formData.time
-        data.daysOfWeek = formData.daysOfWeek
-        data.fullBackupDay = formData.fullBackupDay
-        break
-      
-      case 'custom-days':
-        data.customDates = formData.customDates
-        data.retentionCount = formData.retentionCount
-        break
-      
-      case 'interval':
-        data.intervalValue = formData.intervalValue
-        data.intervalUnit = formData.intervalUnit
-        data.incrementalCount = formData.incrementalCount
-        break
-      
-      case 'cron':
-        data.cronExpression = formData.cronExpression
-        data.incrementalCount = formData.incrementalCount
-        break
-      
-      case 'once':
-        data.time = formData.time
-        break
-      
-      case 'monthly':
-        data.time = formData.time
-        break
+    const buildData = (vmId: string, vmName?: string): any => {
+      const data: any = {
+        vmId,
+        storagePoolId: formData.storagePoolId,
+        name: vmName ? `${vmName} - ${formData.scheduleType} backup` : formData.name,
+        scheduleType: formData.scheduleType,
+        compression: formData.noCompression ? 0 : formData.compression,
+        noCompression: formData.noCompression,
+        noVerify: formData.noVerify,
+        enabled: formData.enabled,
+        missedRunPolicy: formData.missedRunPolicy,
+        missedRunGracePeriodMinutes: formData.missedRunGracePeriodMinutes,
+        syncToOffsite: formData.syncToOffsite,
+        offsiteHostIds: formData.syncToOffsite && formData.offsiteHostIds.length > 0 ? formData.offsiteHostIds : undefined,
+      }
+      switch (formData.scheduleType) {
+        case 'daily':
+          data.time = formData.time
+          data.incrementalCount = formData.incrementalCount
+          break
+        case 'weekly':
+          data.time = formData.time
+          data.daysOfWeek = formData.daysOfWeek
+          data.fullBackupDay = formData.fullBackupDay
+          break
+        case 'custom-days':
+          data.customDates = formData.customDates
+          data.retentionCount = formData.retentionCount
+          break
+        case 'interval':
+          data.intervalValue = formData.intervalValue
+          data.intervalUnit = formData.intervalUnit
+          data.incrementalCount = formData.incrementalCount
+          break
+        case 'cron':
+          data.cronExpression = formData.cronExpression
+          data.incrementalCount = formData.incrementalCount
+          break
+        case 'once':
+        case 'monthly':
+          data.time = formData.time
+          break
+      }
+      return data
     }
 
-    if (schedule) {
+    if (isEditing) {
+      // Edit mode — single schedule update
+      const data = buildData(formData.vmId)
+      data.name = formData.name
       await updateSchedule.mutateAsync({ id: schedule.id, data })
     } else {
-      await createSchedule.mutateAsync(data)
+      // Create mode — one schedule per selected VM
+      const vmList = Array.from(selectedVmIds)
+      let success = 0
+      let failed = 0
+      for (const vmId of vmList) {
+        const vm = vms?.find(v => v.id === vmId)
+        try {
+          await createSchedule.mutateAsync(buildData(vmId, vm?.name))
+          success++
+        } catch (err) {
+          failed++
+          console.error(`Failed to create schedule for ${vm?.name || vmId}:`, err)
+        }
+      }
+      // Toast feedback
+      try {
+        const { toast } = await import('sonner')
+        if (failed === 0) {
+          toast.success(`Created ${success} schedule${success === 1 ? '' : 's'}`)
+        } else {
+          toast.warning(`Created ${success} schedule${success === 1 ? '' : 's'}, ${failed} failed`)
+        }
+      } catch {}
     }
     
     onClose()
@@ -354,10 +381,17 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                 </div>
               )}
 
-              {/* Step 3: VM with Search */}
+              {/* Step 3: VM with Search — single (edit) or multi (create) */}
               {selectedHypervisorId && (
                 <div className="space-y-2">
-                  <Label htmlFor="vmId">3. Virtual Machine *</Label>
+                  <Label>
+                    3. Virtual Machine{!isEditing ? '(s)' : ''} *
+                    {!isEditing && selectedVmIds.size > 0 && (
+                      <span className="ml-2 text-xs font-normal text-primary">
+                        ({selectedVmIds.size} selected)
+                      </span>
+                    )}
+                  </Label>
                   
                   {/* Search Input */}
                   <div className="relative">
@@ -371,20 +405,79 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                     />
                   </div>
 
-                  {/* VM Dropdown */}
-                  <Select
-                    id="vmId"
-                    value={formData.vmId}
-                    onChange={(e) => setFormData({ ...formData, vmId: e.target.value })}
-                    required
-                  >
-                    <option value="">Select VM</option>
-                    {filteredVMs?.map((vm) => (
-                      <option key={vm.id} value={vm.id}>
-                        {vm.name} {vm.state ? `(${vm.state})` : ''}
-                      </option>
-                    ))}
-                  </Select>
+                  {isEditing ? (
+                    /* Edit mode — single VM dropdown */
+                    <Select
+                      id="vmId"
+                      value={formData.vmId}
+                      onChange={(e) => setFormData({ ...formData, vmId: e.target.value })}
+                      required
+                    >
+                      <option value="">Select VM</option>
+                      {filteredVMs?.map((vm) => (
+                        <option key={vm.id} value={vm.id}>
+                          {vm.name} {vm.state ? `(${vm.state})` : ''}
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    /* Create mode — multi-select checkbox list */
+                    <div className="border rounded-lg bg-white dark:bg-gray-800 max-h-64 overflow-y-auto">
+                      {/* Select all toggle */}
+                      {filteredVMs && filteredVMs.length > 0 && (
+                        <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
+                          <Checkbox
+                            id="select-all-vms"
+                            checked={
+                              filteredVMs.length > 0 &&
+                              filteredVMs.every((vm) => selectedVmIds.has(vm.id))
+                            }
+                            onChange={(e: any) => {
+                              const allChecked = e.target.checked
+                              setSelectedVmIds(prev => {
+                                const next = new Set(prev)
+                                if (allChecked) {
+                                  filteredVMs.forEach(vm => next.add(vm.id))
+                                } else {
+                                  filteredVMs.forEach(vm => next.delete(vm.id))
+                                }
+                                return next
+                              })
+                            }}
+                          />
+                          <Label htmlFor="select-all-vms" className="text-xs font-medium cursor-pointer">
+                            Select all visible ({filteredVMs.length})
+                          </Label>
+                        </div>
+                      )}
+                      
+                      {filteredVMs?.map((vm) => (
+                        <div
+                          key={vm.id}
+                          className="flex items-center gap-2 px-3 py-2 hover:bg-gray-50 dark:hover:bg-gray-800/50 border-b border-gray-50 dark:border-gray-800/50 last:border-b-0"
+                        >
+                          <Checkbox
+                            id={`vm-${vm.id}`}
+                            checked={selectedVmIds.has(vm.id)}
+                            onChange={() => {
+                              setSelectedVmIds(prev => {
+                                const next = new Set(prev)
+                                if (next.has(vm.id)) next.delete(vm.id)
+                                else next.add(vm.id)
+                                return next
+                              })
+                            }}
+                          />
+                          <Label htmlFor={`vm-${vm.id}`} className="font-normal cursor-pointer flex-1 text-sm">
+                            {vm.name}
+                            {vm.state && (
+                              <span className="ml-2 text-xs text-gray-400">({vm.state})</span>
+                            )}
+                          </Label>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   
                   {vms && vms.length === 0 && (
                     <p className="text-xs text-yellow-600">
@@ -401,23 +494,33 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                   {vms && vms.length > 0 && (
                     <p className="text-xs text-gray-500">
                       {filteredVMs.length} of {vms.length} VMs shown
+                      {!isEditing && ` • One schedule will be created per selected VM`}
                     </p>
                   )}
                 </div>
               )}
             </div>
 
-            {/* Schedule Name */}
-            <div className="space-y-2">
-              <Label htmlFor="name">Schedule Name *</Label>
-              <Input
-                id="name"
-                placeholder="Daily backup"
-                value={formData.name}
-                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                required
-              />
-            </div>
+            {/* Schedule Name — only shown when editing or for single VM creation */}
+            {isEditing && (
+              <div className="space-y-2">
+                <Label htmlFor="name">Schedule Name *</Label>
+                <Input
+                  id="name"
+                  placeholder="Daily backup"
+                  value={formData.name}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                  required
+                />
+              </div>
+            )}
+            {!isEditing && selectedVmIds.size > 0 && (
+              <div className="px-4 py-2 rounded-lg bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800/50">
+                <p className="text-xs text-blue-700 dark:text-blue-300">
+                  💡 Schedule names will be auto-generated as <code className="px-1 rounded bg-blue-100 dark:bg-blue-900/40">{`{vm_name} - ${formData.scheduleType} backup`}</code> for each of the {selectedVmIds.size} selected VM(s).
+                </p>
+              </div>
+            )}
 
             {/* Storage Pool Selection - REQUIRED */}
             {selectedBackupHostId && (
@@ -951,12 +1054,20 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
             </Button>
             <Button 
               type="submit" 
-              disabled={createSchedule.isPending || updateSchedule.isPending || !formData.storagePoolId}
+              disabled={
+                createSchedule.isPending || updateSchedule.isPending ||
+                !formData.storagePoolId ||
+                (!isEditing && selectedVmIds.size === 0)
+              }
             >
               {(createSchedule.isPending || updateSchedule.isPending) && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
-              {schedule ? 'Update' : 'Create'} Schedule
+              {isEditing
+                ? 'Update Schedule'
+                : selectedVmIds.size > 1
+                ? `Create ${selectedVmIds.size} Schedules`
+                : 'Create Schedule'}
             </Button>
           </DialogFooter>
         </form>

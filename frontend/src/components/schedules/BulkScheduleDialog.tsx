@@ -8,6 +8,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Calendar } from '@/components/ui/calendar'
 import { useCreateSchedule } from '@/hooks/useBackups'
 import { useVMsByHypervisor } from '@/hooks/useBackupHosts'
+import { useOffsiteHostsByBackupHost } from '@/hooks/useOffsiteHosts'
 import { Loader2, AlertCircle, CheckCircle, HardDrive } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -83,6 +84,18 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
     },
     enabled: !!backupHostId,
   })
+
+  // Load offsite hosts for selected backup host
+  const { data: offsiteHosts, isLoading: offsiteLoading } = useOffsiteHostsByBackupHost(backupHostId)
+
+  const handleOffsiteHostToggle = (hostId: string) => {
+    setFormData(prev => ({
+      ...prev,
+      offsiteHostIds: prev.offsiteHostIds.includes(hostId)
+        ? prev.offsiteHostIds.filter(id => id !== hostId)
+        : [...prev.offsiteHostIds, hostId]
+    }))
+  }
 
   // Get selected VMs
   const selectedVMs = vms?.filter(vm => vmIds.includes(vm.id)) || []
@@ -568,6 +581,71 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
                 />
                 <Label htmlFor="noVerify">Disable verification</Label>
               </div>
+            </div>
+
+            {/* Offsite Backup Options */}
+            <div className="space-y-4 p-4 border rounded-md bg-blue-50 dark:bg-blue-900/10">
+              <h3 className="font-medium text-sm flex items-center">
+                <span className="mr-2">📤</span>
+                Offsite Backup (Optional)
+              </h3>
+              
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="syncToOffsite"
+                  checked={formData.syncToOffsite}
+                  onChange={(e: any) => setFormData({ ...formData, syncToOffsite: e.target.checked })}
+                />
+                <Label htmlFor="syncToOffsite">Sync backups to offsite location(s)</Label>
+              </div>
+
+              {formData.syncToOffsite && (
+                <div className="space-y-2 pt-2">
+                  <Label>Offsite Hosts</Label>
+                  {offsiteLoading ? (
+                    <div className="border rounded-lg p-3 bg-white dark:bg-gray-800 flex items-center space-x-2">
+                      <Loader2 className="h-4 w-4 animate-spin text-gray-500" />
+                      <p className="text-sm text-gray-500">Loading offsite hosts...</p>
+                    </div>
+                  ) : !offsiteHosts || offsiteHosts.length === 0 ? (
+                    <div className="border rounded-lg p-3 bg-white dark:bg-gray-800">
+                      <p className="text-sm text-gray-500">
+                        No offsite hosts configured yet
+                      </p>
+                      <p className="text-xs text-gray-400 mt-1">
+                        Add offsite hosts in the Backup Hosts page to enable offsite backup.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="border rounded-lg p-3 space-y-2 max-h-40 overflow-y-auto bg-white dark:bg-gray-800">
+                      {offsiteHosts.map((host: any) => (
+                        <div key={host.id} className="flex items-center space-x-2">
+                          <Checkbox
+                            id={`bulk-offsite-${host.id}`}
+                            checked={formData.offsiteHostIds.includes(host.id)}
+                            onChange={() => handleOffsiteHostToggle(host.id)}
+                          />
+                          <Label htmlFor={`bulk-offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
+                            {host.name} ({host.ip})
+                          </Label>
+                          {host.status === 'online' ? (
+                            <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
+                              Connected
+                            </Badge>
+                          ) : (
+                            <Badge variant="outline" className="text-xs bg-red-50 text-red-700 border-red-200">
+                              Disconnected
+                            </Badge>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-600 dark:text-gray-400">
+                    Select one or more offsite hosts. Backups for all {selectedVMs.length} VM(s) will be synced after completion.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Progress Indicator */}
