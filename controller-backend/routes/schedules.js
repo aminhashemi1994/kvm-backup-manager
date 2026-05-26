@@ -11,15 +11,38 @@ const { requireUser } = require('../middleware/rbac');
 // GET /api/schedules - List all schedules
 router.get('/', async (req, res, next) => {
   try {
+    const { getBackupHosts, getHypervisors, getOffsiteHosts, getStoragePools } = require('../services/fileStorage');
     const schedules = await getBackupSchedules();
     const vms = await getVirtualMachines();
+    const hosts = await getBackupHosts();
+    const hypervisors = await getHypervisors();
+    const offsiteHosts = await getOffsiteHosts();
+    const pools = await getStoragePools();
     
-    // Add VM info and human-readable cron
+    // Add VM info, hypervisor, backup host, and human-readable cron — enables
+    // frontend filtering by any of these dimensions.
     const enrichedSchedules = schedules.map(s => {
       const vm = vms.find(v => v.id === s.vmId);
+      const hypervisor = vm ? hypervisors.find(h => h.id === vm.hypervisorId) : null;
+      const host = vm ? hosts.find(h => h.id === vm.backupHostId) : null;
+      const pool = pools.find(p => p.id === s.storagePoolId);
+      const offsiteIds = Array.isArray(s.offsiteHostIds) ? s.offsiteHostIds : (s.offsiteHostId ? [s.offsiteHostId] : []);
+      const offsiteNames = offsiteIds
+        .map(id => offsiteHosts.find(o => o.id === id))
+        .filter(Boolean)
+        .map(o => o.name);
+
       return {
         ...s,
         vmName: vm ? vm.name : 'Unknown',
+        hypervisorId: hypervisor ? hypervisor.id : null,
+        hypervisorName: hypervisor ? hypervisor.name : null,
+        hypervisorIp: hypervisor ? hypervisor.ip : null,
+        backupHostId: host ? host.id : null,
+        backupHostName: host ? host.name : null,
+        storagePoolName: pool ? pool.name : null,
+        offsiteHostIds: offsiteIds,
+        offsiteHostNames: offsiteNames,
         cronHuman: parseCronToHuman(s.cronExpression),
       };
     });
