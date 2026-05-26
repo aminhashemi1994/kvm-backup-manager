@@ -9,6 +9,8 @@ const {
   getHypervisors, 
   getVirtualMachines,
   getBackupSchedules,
+  getRestoreJobs,
+  saveRestoreJobs,
   appendLog, 
   readLog 
 } = require('../services/fileStorage');
@@ -954,55 +956,93 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
 // DELETE /api/backups/jobs/:jobId/force - Force remove a job from history
 router.delete('/jobs/:jobId/force', requireAdmin, async (req, res, next) => {
   try {
+    const { jobId } = req.params;
     const jobs = await getBackupJobs();
-    const jobIndex = jobs.findIndex(j => j.id === req.params.jobId);
-    
-    // If job doesn't exist in controller, consider it already deleted (success)
-    if (jobIndex === -1) {
-      console.log(`Job ${req.params.jobId} not found in controller database - considering it already deleted`);
-      
+    const jobIndex = jobs.findIndex(j => j.id === jobId);
+
+    // First try backup jobs
+    if (jobIndex !== -1) {
+      const job = jobs[jobIndex];
+
+      // Try to kill the job on the agent if it's running
+      if (job.status === 'running' || job.status === 'queued') {
+        const hosts = await getBackupHosts();
+        const host = hosts.find(h => h.id === job.backupHostId);
+
+        if (host) {
+          try {
+            const client = agentService.createAgentClient(host.url, host.id, host.name);
+            await client.post(`/api/backup/kill/${jobId}`, {}, { timeout: 5000 });
+            console.log(`Killed backup job ${jobId} on agent`);
+          } catch (error) {
+            console.log(`Could not kill backup job on agent: ${error.message}`);
+            // Continue with removal even if kill fails
+          }
+        }
+      }
+
+      jobs.splice(jobIndex, 1);
+      await saveBackupJobs(jobs);
+
+      await appendLog(jobId, 'Job force removed from history');
+
       const io = req.app.get('io');
-      io.emit('job-removed', { jobId: req.params.jobId });
-      
-      return res.json({ 
-        success: true, 
-        message: 'Job not found in database (already deleted or never existed)',
-        data: { id: req.params.jobId, alreadyDeleted: true }
+      io.emit('job-removed', { jobId });
+
+      return res.json({
+        success: true,
+        message: 'Backup job removed from history',
+        data: { id: jobId, jobType: 'backup' }
       });
     }
 
-    const job = jobs[jobIndex];
-    
-    // Try to kill the job on the agent if it's running
-    if (job.status === 'running' || job.status === 'queued') {
-      const hosts = await getBackupHosts();
-      const host = hosts.find(h => h.id === job.backupHostId);
-      
-      if (host) {
-        try {
-          const client = agentService.createAgentClient(host.url, host.id, host.name);
-          await client.post(`/api/backup/kill/${req.params.jobId}`, {}, { timeout: 5000 });
-          console.log(`Killed job ${req.params.jobId} on agent`);
-        } catch (error) {
-          console.log(`Could not kill job on agent: ${error.message}`);
-          // Continue with removal even if kill fails
+    // Not a backup job — check restore jobs (the unified /jobs endpoint
+    // exposes both, so the same force-remove route must handle both).
+    const restoreJobs = await getRestoreJobs();
+    const restoreIndex = restoreJobs.findIndex(j => j.id === jobId);
+
+    if (restoreIndex !== -1) {
+      const restoreJob = restoreJobs[restoreIndex];
+
+      // Try to kill on the agent if still active
+      if (restoreJob.status === 'running' || restoreJob.status === 'queued') {
+        const hosts = await getBackupHosts();
+        const host = hosts.find(h => h.id === restoreJob.backupHostId);
+
+        if (host) {
+          try {
+            const client = agentService.createAgentClient(host.url, host.id, host.name);
+            await client.post(`/api/restore/kill/${jobId}`, {}, { timeout: 5000 });
+            console.log(`Killed restore job ${jobId} on agent`);
+          } catch (error) {
+            console.log(`Could not kill restore job on agent: ${error.message}`);
+            // Continue with removal even if kill fails
+          }
         }
       }
+
+      restoreJobs.splice(restoreIndex, 1);
+      await saveRestoreJobs(restoreJobs);
+
+      const io = req.app.get('io');
+      io.emit('job-removed', { jobId });
+
+      return res.json({
+        success: true,
+        message: 'Restore job removed from history',
+        data: { id: jobId, jobType: 'restore' }
+      });
     }
 
-    // Remove job from controller
-    jobs.splice(jobIndex, 1);
-    await saveBackupJobs(jobs);
-    
-    await appendLog(req.params.jobId, 'Job force removed from history');
-    
+    // Neither store has it — treat as already deleted (idempotent)
+    console.log(`Job ${jobId} not found in backup or restore stores - considering it already deleted`);
     const io = req.app.get('io');
-    io.emit('job-removed', { jobId: req.params.jobId });
-    
-    res.json({ 
-      success: true, 
-      message: 'Job removed from history',
-      data: { id: req.params.jobId }
+    io.emit('job-removed', { jobId });
+
+    return res.json({
+      success: true,
+      message: 'Job not found in database (already deleted or never existed)',
+      data: { id: jobId, alreadyDeleted: true }
     });
   } catch (error) {
     next(error);
