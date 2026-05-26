@@ -239,6 +239,19 @@ class StoragePoolSyncService {
           console.log(`[StoragePoolSync] Old pools:`, this.storagePools.map(p => `${p.name}: ${p.path}`));
           console.log(`[StoragePoolSync] New pools:`, storagePools.map(p => `${p.name}: ${p.path}`));
           this.saveStoragePools(storagePools);
+
+          // Notify report service so it can trigger an immediate generation
+          // if the agent has just received its first set of storage pools.
+          // Lazy-require to avoid any circular load issues at module init.
+          try {
+            const reportService = require('./reportService');
+            if (typeof reportService.onStoragePoolsSynced === 'function') {
+              reportService.onStoragePoolsSynced().catch(() => {});
+            }
+          } catch (notifyErr) {
+            // Non-fatal — the report service will still run on its periodic interval.
+            console.error('[StoragePoolSync] Failed to notify report service:', notifyErr.message);
+          }
         } else {
           console.log(`[StoragePoolSync] Storage pools unchanged (${storagePools.length} pools)`);
         }

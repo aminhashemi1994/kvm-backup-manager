@@ -1,154 +1,186 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Plus, Trash2, Edit, Power, Loader2, CheckSquare, Search, XCircle } from 'lucide-react'
+import {
+  Plus, Trash2, Edit, Power, Loader2, CheckSquare, Search, XCircle,
+  Filter, ChevronDown, ChevronUp,
+} from 'lucide-react'
 import ScheduleForm from './ScheduleForm'
 import BulkEditScheduleDialog from './BulkEditScheduleDialog'
 import { useSchedules, useDeleteSchedule, useToggleSchedule } from '@/hooks/useBackups'
 import { getStatusColor } from '@/lib/utils'
 import { toast } from 'sonner'
 
+type FilterState = {
+  search: string
+  scheduleType: string  // 'all' | 'daily' | 'weekly' | ...
+  enabled: string       // 'all' | 'enabled' | 'disabled'
+  backupHostId: string  // 'all' | id
+  hypervisorId: string  // 'all' | id
+  vmId: string          // 'all' | id
+  offsite: string       // 'all' | 'with-offsite' | 'without-offsite' | <offsite-host-id>
+  timeRange: string     // 'all' | 'morning' | 'afternoon' | 'evening' | 'night'
+}
+
+const initialFilters: FilterState = {
+  search: '',
+  scheduleType: 'all',
+  enabled: 'all',
+  backupHostId: 'all',
+  hypervisorId: 'all',
+  vmId: 'all',
+  offsite: 'all',
+  timeRange: 'all',
+}
+
 export default function ScheduleList() {
   const [showForm, setShowForm] = useState(false)
   const [editingSchedule, setEditingSchedule] = useState<any>(null)
   const [selectedScheduleIds, setSelectedScheduleIds] = useState<Set<string>>(new Set())
   const [showBulkEditDialog, setShowBulkEditDialog] = useState(false)
-  const [searchQuery, setSearchQuery] = useState<string>('')
-  
+  const [filters, setFilters] = useState<FilterState>(initialFilters)
+  const [filtersExpanded, setFiltersExpanded] = useState(false)
+
   const { data: schedules, isLoading } = useSchedules()
   const deleteSchedule = useDeleteSchedule()
   const toggleSchedule = useToggleSchedule()
 
-  // Filter schedules by search query
-  const filteredSchedules = schedules?.filter(schedule => {
-    if (!searchQuery.trim()) return true
-    const query = searchQuery.toLowerCase().trim()
-    return (
-      schedule.name.toLowerCase().includes(query) ||
-      schedule.vmName?.toLowerCase().includes(query)
-    )
-  }) || []
+  // Build filter options from current schedules
+  const filterOptions = useMemo(() => {
+    const backupHosts = new Map<string, string>()
+    const hypervisors = new Map<string, string>()
+    const vms = new Map<string, string>()
+    const offsiteHosts = new Map<string, string>()
+    for (const s of schedules || []) {
+      if (s.backupHostId && s.backupHostName) backupHosts.set(s.backupHostId, s.backupHostName)
+      if (s.hypervisorId && s.hypervisorName) hypervisors.set(s.hypervisorId, s.hypervisorName)
+      if (s.vmId && s.vmName) vms.set(s.vmId, s.vmName)
+      const offsiteIds = (s as any).offsiteHostIds || []
+      const offsiteNames = (s as any).offsiteHostNames || []
+      offsiteIds.forEach((id: string, idx: number) => {
+        if (id && offsiteNames[idx]) offsiteHosts.set(id, offsiteNames[idx])
+      })
+    }
+    return {
+      backupHosts: Array.from(backupHosts.entries()).sort((a, b) => a[1].localeCompare(b[1])),
+      hypervisors: Array.from(hypervisors.entries()).sort((a, b) => a[1].localeCompare(b[1])),
+      vms: Array.from(vms.entries()).sort((a, b) => a[1].localeCompare(b[1])),
+      offsiteHosts: Array.from(offsiteHosts.entries()).sort((a, b) => a[1].localeCompare(b[1])),
+    }
+  }, [schedules])
+
+  // Apply filters
+  const filteredSchedules = useMemo(() => {
+    if (!schedules) return []
+    const q = filters.search.trim().toLowerCase()
+    return schedules.filter((s: any) => {
+      // Free-text search across all relevant fields
+      if (q) {
+        const searchable = [
+          s.name, s.vmName, s.hypervisorName, s.hypervisorIp,
+          s.backupHostName, s.scheduleType, s.cronHuman, s.cronExpression,
+          s.storagePoolName, ...(s.offsiteHostNames || []),
+        ].filter(Boolean).join(' ').toLowerCase()
+        if (!searchable.includes(q)) return false
+      }
+      if (filters.scheduleType !== 'all' && s.scheduleType !== filters.scheduleType) return false
+      if (filters.enabled === 'enabled' && !s.enabled) return false
+      if (filters.enabled === 'disabled' && s.enabled) return false
+      if (filters.backupHostId !== 'all' && s.backupHostId !== filters.backupHostId) return false
+      if (filters.hypervisorId !== 'all' && s.hypervisorId !== filters.hypervisorId) return false
+      if (filters.vmId !== 'all' && s.vmId !== filters.vmId) return false
+      if (filters.offsite === 'with-offsite' && !(s.offsiteHostIds && s.offsiteHostIds.length > 0)) return false
+      if (filters.offsite === 'without-offsite' && s.offsiteHostIds && s.offsiteHostIds.length > 0) return false
+      if (
+        filters.offsite !== 'all' &&
+        filters.offsite !== 'with-offsite' &&
+        filters.offsite !== 'without-offsite'
+      ) {
+        if (!s.offsiteHostIds || !s.offsiteHostIds.includes(filters.offsite)) return false
+      }
+      if (filters.timeRange !== 'all' && s.time) {
+        const [hh] = (s.time || '00:00').split(':').map(Number)
+        const inRange = (
+          (filters.timeRange === 'morning' && hh >= 6 && hh < 12) ||
+          (filters.timeRange === 'afternoon' && hh >= 12 && hh < 18) ||
+          (filters.timeRange === 'evening' && hh >= 18 && hh < 22) ||
+          (filters.timeRange === 'night' && (hh >= 22 || hh < 6))
+        )
+        if (!inRange) return false
+      }
+      return true
+    })
+  }, [schedules, filters])
+
+  const activeFilterCount = useMemo(() => {
+    let n = 0
+    if (filters.search.trim()) n++
+    if (filters.scheduleType !== 'all') n++
+    if (filters.enabled !== 'all') n++
+    if (filters.backupHostId !== 'all') n++
+    if (filters.hypervisorId !== 'all') n++
+    if (filters.vmId !== 'all') n++
+    if (filters.offsite !== 'all') n++
+    if (filters.timeRange !== 'all') n++
+    return n
+  }, [filters])
+
+  const resetFilters = () => setFilters(initialFilters)
 
   const handleDelete = async (id: string, name: string) => {
     if (confirm(`Are you sure you want to delete schedule "${name}"?`)) {
       await deleteSchedule.mutateAsync(id)
     }
   }
-
-  const handleToggle = async (id: string) => {
-    await toggleSchedule.mutateAsync(id)
-  }
-
-  const handleEdit = (schedule: any) => {
-    setEditingSchedule(schedule)
-    setShowForm(true)
-  }
-
-  const handleCloseForm = () => {
-    setShowForm(false)
-    setEditingSchedule(null)
-  }
-
+  const handleToggle = async (id: string) => { await toggleSchedule.mutateAsync(id) }
+  const handleEdit = (schedule: any) => { setEditingSchedule(schedule); setShowForm(true) }
+  const handleCloseForm = () => { setShowForm(false); setEditingSchedule(null) }
   const handleToggleScheduleSelection = (scheduleId: string) => {
     setSelectedScheduleIds(prev => {
       const newSet = new Set(prev)
-      if (newSet.has(scheduleId)) {
-        newSet.delete(scheduleId)
-      } else {
-        newSet.add(scheduleId)
-      }
+      if (newSet.has(scheduleId)) newSet.delete(scheduleId)
+      else newSet.add(scheduleId)
       return newSet
     })
   }
-
   const handleSelectAll = () => {
-    if (selectedScheduleIds.size === filteredSchedules.length) {
-      setSelectedScheduleIds(new Set())
-    } else {
-      setSelectedScheduleIds(new Set(filteredSchedules.map(s => s.id)))
-    }
+    if (selectedScheduleIds.size === filteredSchedules.length) setSelectedScheduleIds(new Set())
+    else setSelectedScheduleIds(new Set(filteredSchedules.map(s => s.id)))
   }
-
   const handleBulkDelete = async () => {
     if (selectedScheduleIds.size === 0) return
-    
-    if (confirm(`Are you sure you want to delete ${selectedScheduleIds.size} schedule(s)?`)) {
-      let successCount = 0
-      let failCount = 0
-      
-      for (const id of selectedScheduleIds) {
-        try {
-          await deleteSchedule.mutateAsync(id)
-          successCount++
-        } catch (error) {
-          failCount++
-        }
-      }
-      
-      setSelectedScheduleIds(new Set())
-      
-      if (failCount === 0) {
-        toast.success(`Successfully deleted ${successCount} schedule(s)`)
-      } else {
-        toast.warning(`Deleted ${successCount} schedule(s), ${failCount} failed`)
-      }
-    }
-  }
-
-  const handleBulkEdit = () => {
-    if (selectedScheduleIds.size === 0) return
-    setShowBulkEditDialog(true)
-  }
-
-  const handleBulkToggle = async (enable: boolean) => {
-    if (selectedScheduleIds.size === 0) return
-    
-    let successCount = 0
-    let failCount = 0
-    
+    if (!confirm(`Delete ${selectedScheduleIds.size} schedule(s)?`)) return
+    let success = 0, failed = 0
     for (const id of selectedScheduleIds) {
-      try {
-        await toggleSchedule.mutateAsync(id)
-        successCount++
-      } catch (error) {
-        failCount++
-      }
+      try { await deleteSchedule.mutateAsync(id); success++ } catch { failed++ }
     }
-    
     setSelectedScheduleIds(new Set())
-    
-    if (failCount === 0) {
-      toast.success(`Successfully ${enable ? 'enabled' : 'disabled'} ${successCount} schedule(s)`)
-    } else {
-      toast.warning(`Updated ${successCount} schedule(s), ${failCount} failed`)
-    }
+    if (failed === 0) toast.success(`Deleted ${success} schedule(s)`)
+    else toast.warning(`Deleted ${success}, ${failed} failed`)
   }
+  const handleBulkEdit = () => { if (selectedScheduleIds.size > 0) setShowBulkEditDialog(true) }
+
+  // ─── render ──────────────────────────────────────────────────────────────
+
+  const filterDropdownClass = "border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-1.5 text-sm bg-white dark:bg-gray-800 min-w-[140px]"
 
   return (
     <>
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between flex-wrap gap-2">
             <CardTitle>Backup Schedules</CardTitle>
             <div className="flex items-center gap-2">
               {selectedScheduleIds.size > 0 && (
                 <>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleBulkEdit}
-                  >
+                  <Button variant="outline" size="sm" onClick={handleBulkEdit}>
                     <Edit className="h-4 w-4 mr-2" />
                     Edit ({selectedScheduleIds.size})
                   </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleBulkDelete}
-                  >
+                  <Button variant="outline" size="sm" onClick={handleBulkDelete}>
                     <Trash2 className="h-4 w-4 mr-2 text-red-600" />
                     Delete ({selectedScheduleIds.size})
                   </Button>
@@ -169,53 +201,193 @@ export default function ScheduleList() {
           ) : schedules && schedules.length > 0 ? (
             <>
               {/* Search Bar */}
-              <div className="mb-4">
-                <div className="relative max-w-md">
+              <div className="flex items-center gap-2 mb-3 flex-wrap">
+                <div className="relative flex-1 min-w-[260px] max-w-md">
                   <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
                   <input
                     type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search schedules by name or VM..."
-                    className="w-full pl-10 pr-10 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    value={filters.search}
+                    onChange={(e) => setFilters(f => ({ ...f, search: e.target.value }))}
+                    placeholder="Search by name, VM, host, hypervisor..."
+                    className="w-full pl-10 pr-10 py-2 text-sm border border-gray-300 dark:border-gray-700 rounded-md bg-white dark:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
-                  {searchQuery && (
+                  {filters.search && (
                     <button
-                      onClick={() => setSearchQuery('')}
+                      onClick={() => setFilters(f => ({ ...f, search: '' }))}
                       className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
                     >
                       <XCircle className="h-4 w-4" />
                     </button>
                   )}
                 </div>
-                {searchQuery && (
-                  <p className="text-xs text-gray-500 mt-1">
-                    Showing {filteredSchedules.length} of {schedules.length} schedules
-                  </p>
+
+                <Button
+                  variant={filtersExpanded ? 'default' : 'outline'}
+                  size="sm"
+                  onClick={() => setFiltersExpanded(v => !v)}
+                >
+                  <Filter className="h-4 w-4 mr-2" />
+                  Filters
+                  {activeFilterCount > 0 && (
+                    <Badge variant="secondary" className="ml-2 px-1.5 py-0 text-[10px]">
+                      {activeFilterCount}
+                    </Badge>
+                  )}
+                  {filtersExpanded ? (
+                    <ChevronUp className="h-4 w-4 ml-1" />
+                  ) : (
+                    <ChevronDown className="h-4 w-4 ml-1" />
+                  )}
+                </Button>
+
+                {activeFilterCount > 0 && (
+                  <Button variant="ghost" size="sm" onClick={resetFilters}>
+                    Reset
+                  </Button>
                 )}
               </div>
 
+              {/* Expanded filters */}
+              {filtersExpanded && (
+                <div className="mb-4 p-4 border border-gray-200 dark:border-gray-700 rounded-xl bg-gray-50 dark:bg-gray-800/40 space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    {/* Schedule Type */}
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Schedule Type</label>
+                      <select
+                        className={filterDropdownClass + ' w-full'}
+                        value={filters.scheduleType}
+                        onChange={(e) => setFilters(f => ({ ...f, scheduleType: e.target.value }))}
+                      >
+                        <option value="all">All Types</option>
+                        <option value="daily">Daily</option>
+                        <option value="weekly">Weekly</option>
+                        <option value="monthly">Monthly</option>
+                        <option value="custom-days">Custom Days</option>
+                        <option value="interval">Interval</option>
+                        <option value="cron">Cron</option>
+                        <option value="once">Once</option>
+                      </select>
+                    </div>
+
+                    {/* Status */}
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Status</label>
+                      <select
+                        className={filterDropdownClass + ' w-full'}
+                        value={filters.enabled}
+                        onChange={(e) => setFilters(f => ({ ...f, enabled: e.target.value }))}
+                      >
+                        <option value="all">All Statuses</option>
+                        <option value="enabled">Enabled only</option>
+                        <option value="disabled">Disabled only</option>
+                      </select>
+                    </div>
+
+                    {/* Backup Host */}
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Backup Host</label>
+                      <select
+                        className={filterDropdownClass + ' w-full'}
+                        value={filters.backupHostId}
+                        onChange={(e) => setFilters(f => ({ ...f, backupHostId: e.target.value, hypervisorId: 'all', vmId: 'all' }))}
+                      >
+                        <option value="all">All Hosts ({filterOptions.backupHosts.length})</option>
+                        {filterOptions.backupHosts.map(([id, name]) => (
+                          <option key={id} value={id}>{name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Hypervisor */}
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Hypervisor</label>
+                      <select
+                        className={filterDropdownClass + ' w-full'}
+                        value={filters.hypervisorId}
+                        onChange={(e) => setFilters(f => ({ ...f, hypervisorId: e.target.value, vmId: 'all' }))}
+                      >
+                        <option value="all">All Hypervisors ({filterOptions.hypervisors.length})</option>
+                        {filterOptions.hypervisors.map(([id, name]) => (
+                          <option key={id} value={id}>{name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* VM */}
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Virtual Machine</label>
+                      <select
+                        className={filterDropdownClass + ' w-full'}
+                        value={filters.vmId}
+                        onChange={(e) => setFilters(f => ({ ...f, vmId: e.target.value }))}
+                      >
+                        <option value="all">All VMs ({filterOptions.vms.length})</option>
+                        {filterOptions.vms.map(([id, name]) => (
+                          <option key={id} value={id}>{name}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* Offsite */}
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Offsite</label>
+                      <select
+                        className={filterDropdownClass + ' w-full'}
+                        value={filters.offsite}
+                        onChange={(e) => setFilters(f => ({ ...f, offsite: e.target.value }))}
+                      >
+                        <option value="all">All Schedules</option>
+                        <option value="with-offsite">With offsite sync</option>
+                        <option value="without-offsite">Without offsite sync</option>
+                        {filterOptions.offsiteHosts.length > 0 && (
+                          <optgroup label="Specific offsite host">
+                            {filterOptions.offsiteHosts.map(([id, name]) => (
+                              <option key={id} value={id}>{name}</option>
+                            ))}
+                          </optgroup>
+                        )}
+                      </select>
+                    </div>
+
+                    {/* Time of day */}
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Time of day</label>
+                      <select
+                        className={filterDropdownClass + ' w-full'}
+                        value={filters.timeRange}
+                        onChange={(e) => setFilters(f => ({ ...f, timeRange: e.target.value }))}
+                      >
+                        <option value="all">Any time</option>
+                        <option value="morning">Morning (06:00–12:00)</option>
+                        <option value="afternoon">Afternoon (12:00–18:00)</option>
+                        <option value="evening">Evening (18:00–22:00)</option>
+                        <option value="night">Night (22:00–06:00)</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Results count */}
+              <p className="text-xs text-gray-500 mb-3">
+                Showing {filteredSchedules.length} of {schedules.length} schedules
+                {activeFilterCount > 0 && ` (${activeFilterCount} filter${activeFilterCount === 1 ? '' : 's'} active)`}
+              </p>
+
               {filteredSchedules.length === 0 ? (
-                <div className="text-center py-8">
-                  <p className="text-gray-500">No schedules found matching "{searchQuery}"</p>
-                  <Button
-                    variant="link"
-                    size="sm"
-                    onClick={() => setSearchQuery('')}
-                    className="mt-2"
-                  >
-                    Clear search
+                <div className="text-center py-12 border border-dashed border-gray-200 dark:border-gray-700 rounded-xl">
+                  <Filter className="h-10 w-10 text-gray-300 mx-auto mb-3" />
+                  <p className="text-gray-500">No schedules match the current filters</p>
+                  <Button variant="link" size="sm" onClick={resetFilters} className="mt-2">
+                    Clear filters
                   </Button>
                 </div>
               ) : (
                 <>
                   {/* Bulk Actions Bar */}
                   <div className="mb-4 flex items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={handleSelectAll}
-                    >
+                    <Button variant="outline" size="sm" onClick={handleSelectAll}>
                       <CheckSquare className="h-4 w-4 mr-2" />
                       {selectedScheduleIds.size === filteredSchedules.length && filteredSchedules.length > 0
                         ? 'Deselect All'
@@ -233,141 +405,124 @@ export default function ScheduleList() {
                       <TableRow>
                         <TableHead className="w-12">
                           <Checkbox
-                            checked={
-                              selectedScheduleIds.size === filteredSchedules.length &&
-                              filteredSchedules.length > 0
-                            }
+                            checked={selectedScheduleIds.size === filteredSchedules.length && filteredSchedules.length > 0}
                             onChange={handleSelectAll}
                           />
                         </TableHead>
                         <TableHead>Name</TableHead>
                         <TableHead>VM</TableHead>
+                        <TableHead>Backup Host</TableHead>
                         <TableHead>Type</TableHead>
                         <TableHead>Schedule</TableHead>
-                    <TableHead>Retention</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                {filteredSchedules.map((schedule) => {
-                  const getScheduleInfo = () => {
-                    switch (schedule.scheduleType) {
-                      case 'daily':
-                        return `Daily at ${schedule.time || '00:00'}`
-                      case 'weekly':
-                        const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-                        const selectedDays = schedule.daysOfWeek?.map((d: number) => days[d]).join(', ') || 'Not set'
-                        return `${selectedDays} at ${schedule.time || '00:00'}`
-                      case 'custom-days':
-                        return `${schedule.customDates?.length || 0} custom dates`
-                      case 'interval':
-                        return `Every ${schedule.intervalValue} ${schedule.intervalUnit}`
-                      case 'cron':
-                        return schedule.cronHuman || schedule.cronExpression
-                      default:
-                        return schedule.cronHuman || schedule.cronExpression || 'Unknown'
-                    }
-                  }
+                        <TableHead>Offsite</TableHead>
+                        <TableHead>Status</TableHead>
+                        <TableHead>Actions</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {filteredSchedules.map((schedule: any) => {
+                        const getScheduleInfo = () => {
+                          switch (schedule.scheduleType) {
+                            case 'daily': return `Daily at ${schedule.time || '00:00'}`
+                            case 'weekly': {
+                              const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+                              const sel = schedule.daysOfWeek?.map((d: number) => days[d]).join(', ') || 'Not set'
+                              return `${sel} at ${schedule.time || '00:00'}`
+                            }
+                            case 'custom-days': return `${schedule.customDates?.length || 0} custom dates`
+                            case 'interval': return `Every ${schedule.intervalValue} ${schedule.intervalUnit}`
+                            case 'cron': return schedule.cronHuman || schedule.cronExpression
+                            case 'monthly': return `Monthly on day 1 at ${schedule.time || '00:00'}`
+                            case 'once': return `Once at ${schedule.time || '00:00'}`
+                            default: return schedule.cronHuman || schedule.cronExpression || 'Unknown'
+                          }
+                        }
 
-                  const getRetentionInfo = () => {
-                    switch (schedule.scheduleType) {
-                      case 'daily':
-                      case 'interval':
-                      case 'cron':
-                        return `1 full + ${schedule.incrementalCount || 0} inc`
-                      case 'weekly':
-                        return '7 backups (1 full + 6 inc)'
-                      case 'custom-days':
-                        return `Keep ${schedule.retentionCount || 0} sets`
-                      default:
-                        return 'N/A'
-                    }
-                  }
+                        const getTypeLabel = () => {
+                          switch (schedule.scheduleType) {
+                            case 'daily': return 'Daily'
+                            case 'weekly': return 'Weekly'
+                            case 'monthly': return 'Monthly'
+                            case 'custom-days': return 'Custom'
+                            case 'interval': return 'Interval'
+                            case 'cron': return 'Cron'
+                            case 'once': return 'Once'
+                            default: return 'Unknown'
+                          }
+                        }
 
-                  const getTypeLabel = () => {
-                    switch (schedule.scheduleType) {
-                      case 'daily': return 'Daily'
-                      case 'weekly': return 'Weekly'
-                      case 'custom-days': return 'Custom'
-                      case 'interval': return 'Interval'
-                      case 'cron': return 'Cron'
-                      default: return 'Unknown'
-                    }
-                  }
+                        const offsiteCount = schedule.offsiteHostIds?.length || 0
 
-                  return (
-                    <TableRow key={schedule.id}>
-                      <TableCell>
-                        <Checkbox
-                          checked={selectedScheduleIds.has(schedule.id)}
-                          onChange={() => handleToggleScheduleSelection(schedule.id)}
-                        />
-                      </TableCell>
-                      <TableCell className="font-medium">{schedule.name}</TableCell>
-                      <TableCell>{schedule.vmName}</TableCell>
-                      <TableCell>
-                        <Badge variant="outline">{getTypeLabel()}</Badge>
-                      </TableCell>
-                      <TableCell>
-                        <div>
-                          <p className="text-sm">{getScheduleInfo()}</p>
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <p className="text-sm text-gray-600">{getRetentionInfo()}</p>
-                      </TableCell>
-                      <TableCell>
-                        <Badge className={schedule.enabled ? getStatusColor('online') : getStatusColor('offline')}>
-                          {schedule.enabled ? 'Enabled' : 'Disabled'}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex items-center space-x-2">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleToggle(schedule.id)}
-                            disabled={toggleSchedule.isPending}
-                            title={schedule.enabled ? 'Disable schedule' : 'Enable schedule'}
-                          >
-                            <Power className={`h-4 w-4 ${schedule.enabled ? 'text-green-600' : 'text-gray-400'}`} />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleEdit(schedule)}
-                            title="Edit schedule"
-                          >
-                            <Edit className="h-4 w-4" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={() => handleDelete(schedule.id, schedule.name)}
-                            disabled={deleteSchedule.isPending}
-                            title="Delete schedule"
-                          >
-                            <Trash2 className="h-4 w-4 text-red-600" />
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
+                        return (
+                          <TableRow key={schedule.id}>
+                            <TableCell>
+                              <Checkbox
+                                checked={selectedScheduleIds.has(schedule.id)}
+                                onChange={() => handleToggleScheduleSelection(schedule.id)}
+                              />
+                            </TableCell>
+                            <TableCell className="font-medium">{schedule.name}</TableCell>
+                            <TableCell>
+                              <div className="text-sm">{schedule.vmName}</div>
+                              {schedule.hypervisorName && (
+                                <div className="text-xs text-gray-400">{schedule.hypervisorName}</div>
+                              )}
+                            </TableCell>
+                            <TableCell className="text-sm text-gray-600">
+                              {schedule.backupHostName || '—'}
+                            </TableCell>
+                            <TableCell>
+                              <Badge variant="outline">{getTypeLabel()}</Badge>
+                            </TableCell>
+                            <TableCell>
+                              <p className="text-sm">{getScheduleInfo()}</p>
+                            </TableCell>
+                            <TableCell>
+                              {offsiteCount > 0 ? (
+                                <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
+                                  {offsiteCount} {offsiteCount === 1 ? 'host' : 'hosts'}
+                                </Badge>
+                              ) : (
+                                <span className="text-xs text-gray-400">—</span>
+                              )}
+                            </TableCell>
+                            <TableCell>
+                              <Badge className={schedule.enabled ? getStatusColor('online') : getStatusColor('offline')}>
+                                {schedule.enabled ? 'Enabled' : 'Disabled'}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex items-center space-x-1">
+                                <Button variant="ghost" size="sm"
+                                  onClick={() => handleToggle(schedule.id)}
+                                  disabled={toggleSchedule.isPending}
+                                  title={schedule.enabled ? 'Disable' : 'Enable'}
+                                >
+                                  <Power className={`h-4 w-4 ${schedule.enabled ? 'text-green-600' : 'text-gray-400'}`} />
+                                </Button>
+                                <Button variant="ghost" size="sm" onClick={() => handleEdit(schedule)} title="Edit">
+                                  <Edit className="h-4 w-4" />
+                                </Button>
+                                <Button variant="ghost" size="sm"
+                                  onClick={() => handleDelete(schedule.id, schedule.name)}
+                                  disabled={deleteSchedule.isPending} title="Delete"
+                                >
+                                  <Trash2 className="h-4 w-4 text-red-600" />
+                                </Button>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        )
+                      })}
+                    </TableBody>
+                  </Table>
                 </>
               )}
             </>
           ) : (
             <div className="text-center py-8">
               <p className="text-gray-500">No schedules configured</p>
-              <Button
-                variant="outline"
-                className="mt-4"
-                onClick={() => setShowForm(true)}
-              >
+              <Button variant="outline" className="mt-4" onClick={() => setShowForm(true)}>
                 <Plus className="h-4 w-4 mr-2" />
                 Create Your First Schedule
               </Button>
@@ -377,20 +532,14 @@ export default function ScheduleList() {
       </Card>
 
       {showForm && (
-        <ScheduleForm
-          schedule={editingSchedule}
-          onClose={handleCloseForm}
-        />
+        <ScheduleForm schedule={editingSchedule} onClose={handleCloseForm} />
       )}
 
       {showBulkEditDialog && (
         <BulkEditScheduleDialog
           scheduleIds={Array.from(selectedScheduleIds)}
           schedules={schedules?.filter(s => selectedScheduleIds.has(s.id)) || []}
-          onClose={() => {
-            setShowBulkEditDialog(false)
-            setSelectedScheduleIds(new Set())
-          }}
+          onClose={() => { setShowBulkEditDialog(false); setSelectedScheduleIds(new Set()) }}
         />
       )}
     </>

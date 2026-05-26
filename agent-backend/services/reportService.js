@@ -22,11 +22,6 @@ class ReportService {
     console.log(`  Report file: ${this.reportFile}`);
     console.log(`  Update interval: ${this.INTERVAL_MS / 60000} minutes`);
 
-    // Generate initial report
-    this.generateReport().catch(err => {
-      console.error('[Report] Initial generation failed:', err);
-    });
-
     // Schedule periodic generation
     this.generationInterval = setInterval(() => {
       console.log('[Report] Auto-generation triggered (scheduled)');
@@ -34,8 +29,69 @@ class ReportService {
         console.error('[Report] Scheduled generation failed:', err);
       });
     }, this.INTERVAL_MS);
-    
+
+    // Try initial generation; if storage pools aren't ready yet, retry until
+    // they are (storage-pool-sync runs after the controller calls /sync,
+    // which happens on its next health check cycle).
+    this._attemptInitialGeneration();
+
     console.log(`  Next auto-generation in ${this.INTERVAL_MS / 60000} minutes`);
+  }
+
+  /**
+   * Attempt the initial report generation. If no storage pools are available
+   * yet (controller hasn't synced them to this agent), schedule a retry. Stops
+   * retrying once a report is successfully generated or the agent shuts down.
+   */
+  async _attemptInitialGeneration() {
+    const storagePoolSyncService = require('./storagePoolSyncService');
+    const pools = storagePoolSyncService.getStoragePools();
+
+    // Also check if config has a fallback backup path
+    const hasFallback = !!(this.config && this.config.backupPath);
+
+    if (pools.length === 0 && !hasFallback) {
+      console.log('[Report] Initial generation deferred: no storage pools available yet (controller has not synced). Will retry in 60s...');
+      this._initialRetryTimer = setTimeout(() => {
+        this._attemptInitialGeneration().catch(() => {});
+      }, 60 * 1000);
+      return;
+    }
+
+    console.log(`[Report] Triggering initial report generation (${pools.length} pool(s) ready)`);
+    try {
+      const result = await this.generateReport();
+      if (!result.success) {
+        // Retry once more after a brief delay if it failed
+        console.log(`[Report] Initial generation failed (${result.error}), will retry in 60s...`);
+        this._initialRetryTimer = setTimeout(() => {
+          this._attemptInitialGeneration().catch(() => {});
+        }, 60 * 1000);
+      } else {
+        console.log('[Report] ✓ Initial report generated successfully');
+      }
+    } catch (err) {
+      console.error('[Report] Initial generation error:', err.message);
+      this._initialRetryTimer = setTimeout(() => {
+        this._attemptInitialGeneration().catch(() => {});
+      }, 60 * 1000);
+    }
+  }
+
+  /**
+   * Called by storagePoolSyncService when storage pools are first synced
+   * from the controller. Triggers immediate generation if we don't have a
+   * report yet.
+   */
+  async onStoragePoolsSynced() {
+    if (!this.lastGenerated && !this.isGenerating) {
+      console.log('[Report] Storage pools synced — triggering immediate report generation');
+      try {
+        await this.generateReport();
+      } catch (err) {
+        console.error('[Report] Sync-triggered generation failed:', err.message);
+      }
+    }
   }
 
   /**
@@ -314,6 +370,10 @@ class ReportService {
     if (this.generationInterval) {
       clearInterval(this.generationInterval);
       this.generationInterval = null;
+    }
+    if (this._initialRetryTimer) {
+      clearTimeout(this._initialRetryTimer);
+      this._initialRetryTimer = null;
     }
     console.log('✓ Report service shutdown');
   }
