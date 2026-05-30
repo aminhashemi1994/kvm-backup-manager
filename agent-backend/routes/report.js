@@ -115,4 +115,51 @@ router.post('/generate', async (req, res, next) => {
   }
 });
 
+/**
+ * POST /api/report/generate-now
+ *
+ * Internal: same as /generate but bypasses the manual-rate-limit. Used by
+ * the controller's "download report" flow so the user can refresh data
+ * on demand without being blocked by the 2-minute cooldown. The
+ * "already generating" check is preserved so concurrent requests don't
+ * spawn duplicate generations — the second caller gets a 202 and can
+ * poll status if needed.
+ */
+router.post('/generate-now', async (req, res, next) => {
+  try {
+    console.log('[Report Route] /generate-now invoked (rate-limit bypass)');
+
+    const statusBefore = reportService.getStatus();
+    if (statusBefore.isGenerating) {
+      console.log('[Report Route] /generate-now: another generation already running');
+      return res.status(202).json({
+        success: true,
+        message: 'Report generation already in progress',
+        isGenerating: true,
+      });
+    }
+
+    // isManual=false skips the 2-minute cooldown
+    const result = await reportService.generateReport(false);
+    if (!result.success) {
+      return res.status(500).json({
+        success: false,
+        error: result.error || 'Report generation failed',
+      });
+    }
+    return res.status(200).json({
+      success: true,
+      message: 'Report regenerated',
+      data: {
+        generatedAt: result.generatedAt,
+        fileSizeBytes: result.fileSizeBytes,
+        durationSeconds: result.durationSeconds,
+      },
+    });
+  } catch (error) {
+    console.error('[Report Route] /generate-now error:', error);
+    next(error);
+  }
+});
+
 module.exports = router;

@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const fs = require('fs').promises;
 const path = require('path');
+const { writeJSON } = require('./fileStorage');
 
 const USERS_FILE = path.join(__dirname, '../data/users.json');
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
@@ -39,7 +40,7 @@ async function ensureUsersFile() {
         if (user.disabled === undefined) user.disabled = false;
       }
       if (migrated) {
-        await fs.writeFile(USERS_FILE, JSON.stringify(usersData, null, 2));
+        await writeJSON(USERS_FILE, usersData);
         console.log('[Auth] Migrated users to RBAC schema');
       }
     }
@@ -61,7 +62,7 @@ async function ensureUsersFile() {
           createdAt: new Date().toISOString()
         }
       ];
-      await fs.writeFile(USERS_FILE, JSON.stringify(usersData, null, 2));
+      await writeJSON(USERS_FILE, usersData);
       console.log('[Auth] Default admin user created (username: admin, password: admin123)');
     }
   } catch (error) {
@@ -84,7 +85,7 @@ async function ensureUsersFile() {
       ]
     };
     
-    await fs.writeFile(USERS_FILE, JSON.stringify(defaultUsers, null, 2));
+    await writeJSON(USERS_FILE, defaultUsers);
     console.log('[Auth] Default admin user created (username: admin, password: admin123)');
   }
 }
@@ -102,7 +103,7 @@ async function readUsers() {
  * Write users to file
  */
 async function writeUsers(data) {
-  await fs.writeFile(USERS_FILE, JSON.stringify(data, null, 2));
+  await writeJSON(USERS_FILE, data);
 }
 
 /**

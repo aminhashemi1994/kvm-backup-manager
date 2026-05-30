@@ -44,7 +44,16 @@ export default function JobProgressBar({
     }
   }
 
-  const isIndeterminate = status === 'queued' || (status === 'running' && progress === 0 && phase === 'starting')
+  // Show the indeterminate (shimmering) state whenever we're in a phase
+  // that hasn't started reporting real progress yet. Large VMs can sit at
+  // 0% for many minutes during the initial scan / checkpoint creation
+  // phase before nbdcopy starts emitting bytes-transferred numbers — a
+  // flat empty bar in that window makes operators think the backup is
+  // stuck. Showing the shimmer signals that work is happening.
+  const isIndeterminate =
+    status === 'queued' ||
+    status === 'initializing' ||
+    (status === 'running' && (!progress || progress <= 0))
 
   return (
     <div className="w-full min-w-[220px]">
@@ -59,7 +68,7 @@ export default function JobProgressBar({
             </div>
           ) : (
             <div
-              className={`h-full rounded-full transition-all duration-500 ease-out ${getBarColor()} ${
+              className={`h-full rounded-full transition-all duration-300 ease-out ${getBarColor()} ${
                 status === 'running' ? 'shadow-sm' : ''
               }`}
               style={{ width: `${Math.min(100, Math.max(0, progress))}%` }}

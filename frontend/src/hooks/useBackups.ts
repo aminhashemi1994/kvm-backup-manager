@@ -11,7 +11,14 @@ export function useActiveBackups() {
       const response = await backupsApi.getActive()
       return response.data.data as BackupJob[]
     },
+    // 5s background refetch as a safety net. Live updates come from
+    // socket events (backup-started/progress/complete/error) which
+    // invalidate this query, so most state changes appear instantly
+    // without waiting for this interval.
     refetchInterval: 5000,
+    // Keep showing the previous table while the next refetch runs so
+    // rows don't blink to "loading" state every 5 seconds.
+    placeholderData: (previousData) => previousData,
   })
 }
 

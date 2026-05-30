@@ -28,65 +28,103 @@ export default function ActiveBackups() {
     ...(activeRestores || []).map(job => ({ ...job, jobType: 'restore' as const }))
   ].sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
 
-  const isLoading = isLoadingBackups || isLoadingRestores
-
-  // Poll for updates every second
+  // Show the spinner only on the very first render, before any data has
+  // arrived. After that — including during background refetches and after
+  // socket-driven invalidations — render the table even if temporarily
+  // empty. Otherwise React-Query's `isLoading` flag (which can briefly
+  // flip on errors / refetches) would replace the table with a spinner
+  // every few seconds and make the section feel like it's constantly
+  // reloading.
+  const [hasLoadedOnce, setHasLoadedOnce] = useState(false)
   useEffect(() => {
-    const interval = setInterval(() => {
-      queryClient.invalidateQueries({ queryKey: ['backups', 'active'] })
-      queryClient.invalidateQueries({ queryKey: ['restores', 'active'] })
-    }, 1000)
+    if (activeBackups !== undefined || activeRestores !== undefined) {
+      setHasLoadedOnce(true)
+    }
+  }, [activeBackups, activeRestores])
+  const isLoading = !hasLoadedOnce && (isLoadingBackups || isLoadingRestores)
 
-    return () => clearInterval(interval)
-  }, [queryClient])
+  // Real-time updates come from socket events below. The hook's built-in
+  // 5-second refetch acts as a safety net. The previous 1-second
+  // setInterval was hammering /backups/active (which itself does a
+  // multi-second agent-status sync) and causing the table to flash
+  // constantly — making it impossible to read the rows.
 
-  // Listen for real-time backup updates
+  // Listen for real-time backup updates. We deliberately patch the cached
+  // list with setQueryData rather than invalidating on each event — every
+  // invalidation triggers a /backups/active fetch which itself does a
+  // multi-second agent-status sync, and the resulting "progress jumps
+  // backward then forward" pattern is what made the bar feel laggy.
+  // The hook's 5-second refetchInterval reconciles authoritative state.
   useEffect(() => {
     const cleanupBackupProgress = socketService.on('backup-progress', (data: any) => {
       queryClient.setQueryData(['backups', 'active'], (old: any) => {
         if (!old) return old
-        return old.map((job: any) => 
-          job.id === data.jobId 
+        return old.map((job: any) =>
+          job.id === data.jobId
             ? { ...job, status: data.status, progress: data.progress, progressText: data.progressText }
             : job
         )
       })
     })
 
-    const cleanupBackupComplete = socketService.on('backup-complete', () => {
-      queryClient.invalidateQueries({ queryKey: ['backups', 'active'] })
+    const cleanupBackupComplete = socketService.on('backup-complete', (data: any) => {
+      // Remove the completed job from the active list optimistically. The
+      // next refetch will confirm it's gone.
+      queryClient.setQueryData(['backups', 'active'], (old: any) => {
+        if (!old) return old
+        return old.filter((job: any) => job.id !== data.id)
+      })
     })
 
-    const cleanupBackupError = socketService.on('backup-error', () => {
-      queryClient.invalidateQueries({ queryKey: ['backups', 'active'] })
+    const cleanupBackupError = socketService.on('backup-error', (data: any) => {
+      queryClient.setQueryData(['backups', 'active'], (old: any) => {
+        if (!old) return old
+        return old.filter((job: any) => job.id !== (data.id || data.jobId))
+      })
     })
 
-    const cleanupBackupStarted = socketService.on('backup-started', () => {
-      queryClient.invalidateQueries({ queryKey: ['backups', 'active'] })
+    const cleanupBackupStarted = socketService.on('backup-started', (data: any) => {
+      // A new job appeared — the optimistic insert keeps the UI snappy
+      // even before the next refetch lands.
+      queryClient.setQueryData(['backups', 'active'], (old: any) => {
+        const list = old || []
+        if (list.some((job: any) => job.id === data.id)) return list
+        return [data, ...list]
+      })
     })
 
     // Listen for real-time restore updates
     const cleanupRestoreProgress = socketService.on('restore-progress', (data: any) => {
       queryClient.setQueryData(['restores', 'active'], (old: any) => {
         if (!old) return old
-        return old.map((job: any) => 
-          job.id === data.jobId 
+        return old.map((job: any) =>
+          job.id === data.jobId
             ? { ...job, status: data.status, progress: data.progress, progressText: data.progressText }
             : job
         )
       })
     })
 
-    const cleanupRestoreComplete = socketService.on('restore-complete', () => {
-      queryClient.invalidateQueries({ queryKey: ['restores', 'active'] })
+    const cleanupRestoreComplete = socketService.on('restore-complete', (data: any) => {
+      queryClient.setQueryData(['restores', 'active'], (old: any) => {
+        if (!old) return old
+        return old.filter((job: any) => job.id !== (data.id || data.jobId))
+      })
     })
 
-    const cleanupRestoreError = socketService.on('restore-error', () => {
-      queryClient.invalidateQueries({ queryKey: ['restores', 'active'] })
+    const cleanupRestoreError = socketService.on('restore-error', (data: any) => {
+      queryClient.setQueryData(['restores', 'active'], (old: any) => {
+        if (!old) return old
+        return old.filter((job: any) => job.id !== (data.id || data.jobId))
+      })
     })
 
-    const cleanupRestoreStarted = socketService.on('restore-started', () => {
-      queryClient.invalidateQueries({ queryKey: ['restores', 'active'] })
+    const cleanupRestoreStarted = socketService.on('restore-started', (data: any) => {
+      queryClient.setQueryData(['restores', 'active'], (old: any) => {
+        const list = old || []
+        if (list.some((job: any) => job.id === data.id)) return list
+        return [data, ...list]
+      })
     })
 
     return () => {

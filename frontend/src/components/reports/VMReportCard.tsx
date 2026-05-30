@@ -4,6 +4,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ChevronDown, ChevronRight, HardDrive, CheckCircle, XCircle, AlertTriangle } from 'lucide-react'
 import ScheduleDetails from '@/components/reports/ScheduleDetails'
+import ReportDownloadMenu from '@/components/reports/ReportDownloadMenu'
+import { useAllVMs } from '@/hooks/useBackupHosts'
 
 interface VMReportCardProps {
   vm: any
@@ -11,6 +13,10 @@ interface VMReportCardProps {
 
 export default function VMReportCard({ vm }: VMReportCardProps) {
   const [expanded, setExpanded] = useState(false)
+  const { data: allVMs } = useAllVMs()
+  // The report record only has vm_name. Look up the controller-side VM id
+  // so the download endpoint (which keys on id) can find the right entry.
+  const vmId = allVMs?.find(v => v.name === vm.vm_name)?.id
 
   const getHealthColor = (health: string) => {
     switch (health) {
@@ -76,6 +82,18 @@ export default function VMReportCard({ vm }: VMReportCardProps) {
                 {vm.available_schedule_count} schedules
                 {vm.archived_backup_count > 0 && ` • ${vm.archived_backup_count} archived`}
               </p>
+            </div>
+            {/* Per-VM report download. Always rendered so it's visible even
+                while the VM lookup is loading; the menu component itself
+                disables the trigger if scopeId is missing. */}
+            <div onClick={(e) => e.stopPropagation()} className="ml-2">
+              <ReportDownloadMenu
+                scope="vm"
+                scopeId={vmId || ''}
+                label="Download"
+                size="sm"
+                variant="outline"
+              />
             </div>
           </div>
         </div>

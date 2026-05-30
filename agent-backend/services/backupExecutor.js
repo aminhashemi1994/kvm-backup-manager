@@ -788,6 +788,7 @@ class BackupExecutor {
       vmName, 
       hypervisorIp, 
       scheduleType = 'once',
+      method = null,
       retention = 7,
       keepArchive = 2,
       compression = 2,
@@ -838,17 +839,43 @@ class BackupExecutor {
     log(`Retention: ${retention}`);
     log(`Keep Archive: ${keepArchive}`);
 
+    // Map any legacy "method-style" scheduleType values (full / inc / copy)
+    // onto a script-recognized schedule. The Backup_Manager.sh script only
+    // accepts: once, monthly, daily, weekly, custom. The legacy values
+    // existed in older controller payloads where method and scheduleType
+    // were conflated; we keep accepting them here so older flows don't
+    // break, while the underlying script gets a value it understands.
+    const SCRIPT_SCHEDULES = ['once', 'monthly', 'daily', 'weekly', 'custom'];
+    let scriptSchedule = scheduleType;
+    if (!SCRIPT_SCHEDULES.includes(scriptSchedule)) {
+      const fallback = scriptSchedule === 'inc' ? 'daily' : 'once';
+      log(`Note: scheduleType "${scriptSchedule}" is not a valid script schedule; mapping to "${fallback}".`);
+      scriptSchedule = fallback;
+    }
+
     // Build command for backup_manager.sh
     const scriptPath = path.join(__dirname, '../scripts/Backup_Manager.sh');
     const args = [
       '--domain', vmName,
       '--ip', hypervisorIp,
-      '--schedule', scheduleType,
+      '--schedule', scriptSchedule,
       '--backup-path', storagePoolPath
     ];
 
+    // Pass through the user-selected method when one was chosen. The
+    // Backup_Manager.sh script accepts --method full | inc | copy. For
+    // daily/weekly chains, omitting --method lets the script auto-detect
+    // full vs inc based on existing checkpoints — that's intentional and
+    // matches what the form provides (no top-level method picker for
+    // daily/weekly). For custom-days schedules the form collects a method
+    // per date and the controller forwards it here.
+    if (method && ['full', 'inc', 'copy'].includes(method)) {
+      args.push('--method', method);
+      log(`Method: ${method}`);
+    }
+
     // Add retention for daily/weekly chains
-    if (['daily', 'weekly'].includes(scheduleType)) {
+    if (['daily', 'weekly'].includes(scriptSchedule)) {
       args.push('--retention', String(retention));
       args.push('--keep-archive', String(keepArchive));
     }

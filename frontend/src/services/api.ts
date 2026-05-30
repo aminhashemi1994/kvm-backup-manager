@@ -136,6 +136,25 @@ export const reportsApi = {
   getReport: (backupHostId: string) => api.get(`/reports/${backupHostId}`),
   getStatus: (backupHostId: string) => api.get(`/reports/${backupHostId}/status`),
   generate: (backupHostId: string) => api.post(`/reports/${backupHostId}/generate`),
+  getEnriched: (backupHostId: string) => api.get(`/reports/enriched/${backupHostId}`),
+  getGlobal: () => api.get('/reports/global'),
+  // Force fresh generation across the relevant agents (bypasses per-agent
+  // 2-minute manual cooldown). Returns when all targeted agents have
+  // finished or errored.
+  regenerate: (scope: 'global' | 'host' | 'vm' | 'hypervisor', scopeId?: string) =>
+    api.post('/reports/regenerate', { scope, scopeId }),
+  // Download a report. For json/csv/txt/md the server returns the file
+  // body directly; for xlsx and pdf it returns a JSON envelope that the
+  // frontend uses to assemble the binary.
+  download: (
+    format: 'json' | 'csv' | 'txt' | 'md' | 'xlsx' | 'pdf',
+    scope: 'global' | 'host' | 'vm' | 'hypervisor',
+    scopeId?: string,
+  ) =>
+    api.get(`/reports/download/${format}`, {
+      params: { scope, scopeId },
+      responseType: format === 'xlsx' || format === 'pdf' ? 'json' : 'blob',
+    }),
 }
 
 // Metrics
@@ -217,6 +236,13 @@ export const cleanupApi = {
   execute: (agentId: string, files: string[]) => api.post('/cleanup/execute', { agentId, files }),
   cleanupControllerJobs: (olderThanHours: number = 24) => api.post('/cleanup/controller-jobs', { olderThanHours }),
   getStats: () => api.get('/cleanup/stats'),
+}
+
+// Notifications
+export const notificationsApi = {
+  getSettings: () => api.get('/notifications/settings'),
+  saveSettings: (settings: any) => api.put('/notifications/settings', settings),
+  sendTest: () => api.post('/notifications/test'),
 }
 
 export default api

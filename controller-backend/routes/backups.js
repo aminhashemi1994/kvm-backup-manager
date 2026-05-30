@@ -72,16 +72,23 @@ router.get('/active', async (req, res, next) => {
   try {
     const jobs = await getBackupJobs();
     const hosts = await getBackupHosts();
-    
+
     let activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued');
     let statusUpdated = false;
-    
-    // Sync status with agents for running jobs
-    for (const job of activeJobs) {
-      const updated = await syncJobStatusWithAgent(job, hosts);
-      if (updated) statusUpdated = true;
+
+    if (activeJobs.length > 0) {
+      const SYNC_BUDGET_MS = 6000;
+      const results = await Promise.race([
+        Promise.allSettled(activeJobs.map(j => syncJobStatusWithAgent(j, hosts))),
+        new Promise(resolve => setTimeout(() => resolve(null), SYNC_BUDGET_MS)),
+      ]);
+      if (Array.isArray(results)) {
+        statusUpdated = results.some(r => r.status === 'fulfilled' && r.value);
+      } else {
+        console.warn('[Active] Agent status sync exceeded budget; serving stale data');
+      }
     }
-    
+
     // Save if any status was updated
     if (statusUpdated) {
       await saveBackupJobs(jobs);
@@ -102,14 +109,28 @@ router.get('/history', async (req, res, next) => {
     const { limit = 100, status, vmId } = req.query;
     let backupJobs = await getBackupJobs();
     const hosts = await getBackupHosts();
-    
-    // Sync status for backup jobs marked as running/queued
+
+    // Sync status for backup jobs marked as running/queued — but in parallel
+    // and with a hard overall budget so unreachable agents can't block the
+    // dashboard. Previously this loop ran serially with a 5s timeout per job;
+    // a handful of hung jobs would freeze /history (and the dashboard's
+    // Recent Activity card would spin forever).
     const runningBackupJobs = backupJobs.filter(j => j.status === 'running' || j.status === 'queued');
     let statusUpdated = false;
-    
-    for (const job of runningBackupJobs) {
-      const updated = await syncJobStatusWithAgent(job, hosts);
-      if (updated) statusUpdated = true;
+
+    if (runningBackupJobs.length > 0) {
+      const SYNC_BUDGET_MS = 6000;
+      const results = await Promise.race([
+        Promise.allSettled(runningBackupJobs.map(j => syncJobStatusWithAgent(j, hosts))),
+        new Promise(resolve => setTimeout(() => resolve(null), SYNC_BUDGET_MS)),
+      ]);
+      if (Array.isArray(results)) {
+        statusUpdated = results.some(r => r.status === 'fulfilled' && r.value);
+      } else {
+        // Budget exceeded — skip the save and return what we already have on
+        // disk. The next call (or background reconciler) can finish the job.
+        console.warn('[History] Agent status sync exceeded budget; serving stale data');
+      }
     }
     
     // Save updated backup jobs
