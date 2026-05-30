@@ -6,6 +6,8 @@ const {
   getVirtualMachines,
   getBackupJobs,
   saveBackupJobs,
+  getStoragePools,
+  getOffsiteHosts,
   appendLog 
 } = require('./fileStorage');
 const agentService = require('./agentService');
@@ -395,8 +397,8 @@ class SchedulerService {
       
       if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron') {
         // Use backup cycle service to determine method
-        const cycleStatus = await backupCycleService.getVMCycleStatus(vm.id);
-        method = cycleStatus.nextBackupMethod;
+        const cycleStatus = await backupCycleService.getBackupCycleStatus(vm.id);
+        method = cycleStatus.nextMethod;
       } else if (schedule.scheduleType === 'weekly') {
         // Check if today is the full backup day
         const today = new Date().getDay();
@@ -494,8 +496,8 @@ class SchedulerService {
       
       if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron') {
         // Use backup cycle service to determine method
-        const cycleStatus = await backupCycleService.getVMCycleStatus(vm.id);
-        method = cycleStatus.nextBackupMethod;
+        const cycleStatus = await backupCycleService.getBackupCycleStatus(vm.id);
+        method = cycleStatus.nextMethod;
       } else if (schedule.scheduleType === 'weekly') {
         // Check if today is the full backup day
         const today = new Date().getDay();
@@ -554,26 +556,88 @@ class SchedulerService {
         url = 'http://' + url;
       }
 
+      // Resolve the storage pool the user picked when they created this
+      // schedule. The agent's /api/backup/trigger requires storagePoolPath;
+      // without it the request is rejected with 400.
+      const pools = await getStoragePools();
+      const pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
+      if (!pool) {
+        throw new Error(
+          schedule.storagePoolId
+            ? `Storage pool ${schedule.storagePoolId} not found on backup host ${host.name}`
+            : 'Schedule has no storage pool configured'
+        );
+      }
+
+      // Resolve offsite host IPs (optional)
+      let offsiteHostIps = [];
+      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
+        ? schedule.offsiteHostIds
+        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
+      if (offsiteIds.length > 0) {
+        const allOffsiteHosts = await getOffsiteHosts();
+        offsiteHostIps = offsiteIds
+          .map(id => allOffsiteHosts.find(h => h.id === id))
+          .filter(Boolean)
+          .map(h => h.ip);
+      }
+
+      // Map controller schedule types to the agent script's accepted values.
+      // The Backup_Manager.sh script accepts only: once | monthly | daily |
+      // weekly | custom. The controller has additional logical types
+      // (interval, cron, custom-days) that all behave like daily chains
+      // for the script's purposes. The cycle service still controls the
+      // full/inc rotation via incrementalCount.
+      const agentScheduleType = (() => {
+        switch (schedule.scheduleType) {
+          case 'once':
+          case 'monthly':
+          case 'daily':
+          case 'weekly':
+            return schedule.scheduleType;
+          case 'interval':
+          case 'cron':
+            return 'daily';
+          case 'custom-days':
+            return 'custom';
+          default:
+            return 'once';
+        }
+      })();
+
       const backupData = {
         jobId,
         vmName: vm.name,
         hypervisorId: hypervisor.id,
         hypervisorIp: hypervisor.ip,
-        method,
-        noCompression: schedule.noCompression,
-        noVerify: schedule.noVerify,
+        // scheduleType drives the script's behaviour (chain vs single).
+        // We deliberately do NOT send `method` here. The form has no
+        // top-level method picker for daily/weekly/interval/cron
+        // schedules, and the Backup_Manager.sh script auto-detects
+        // full vs inc based on existing checkpoints when --method is
+        // omitted. The cycleStatus.nextMethod we computed above is
+        // used only as informational metadata on the controller-side
+        // job record.
+        scheduleType: agentScheduleType,
+        storagePoolId: pool.id,
+        storagePoolPath: pool.path,
+        retention: schedule.retention || 7,
+        keepArchive: schedule.keepArchive || 2,
+        compression: schedule.compression || 2,
+        noCompression: schedule.noCompression || false,
+        noVerify: schedule.noVerify || false,
+        offsiteHosts: offsiteHostIps,
+        verbose: schedule.verbose || false,
+        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron'
+          ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
+          : {}),
       };
 
-      // Use trigger-scheduled endpoint for cycle management
-      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron') {
-        await agentService.triggerScheduledBackup(url, {
-          ...backupData,
-          vmId: vm.id,
-          incrementalCount: schedule.incrementalCount,
-        });
-      } else {
-        await agentService.triggerBackup(url, backupData);
-      }
+      // The agent only exposes /api/backup/trigger. The previous
+      // triggerScheduledBackup helper called /api/backup/trigger-scheduled
+      // which does not exist — that's the source of the 404 errors that
+      // the user was seeing on every scheduled run.
+      await agentService.triggerBackup(url, backupData);
 
       // Mark schedule as fired (anchor for interval missed-run computation)
       await this._markScheduleFired(schedule.id);
@@ -733,10 +797,45 @@ class SchedulerService {
         vmName: vm.name,
         hypervisorId: hypervisor.id,
         hypervisorIp: hypervisor.ip,
+        // custom-days entries pick their own method (full/inc/copy) per
+        // date. The agent script's --schedule must be one of its
+        // recognized types — 'custom' is the right one for hand-picked
+        // dates with retentionCount-based pruning.
+        scheduleType: 'custom',
         method: customDate.method,
-        noCompression: schedule.noCompression,
-        noVerify: schedule.noVerify,
+        noCompression: schedule.noCompression || false,
+        noVerify: schedule.noVerify || false,
       };
+
+      // Resolve storage pool — agent rejects without storagePoolPath.
+      const pools = await getStoragePools();
+      const pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
+      if (!pool) {
+        throw new Error(
+          schedule.storagePoolId
+            ? `Storage pool ${schedule.storagePoolId} not found on backup host ${host.name}`
+            : 'Custom-days schedule has no storage pool configured'
+        );
+      }
+      backupData.storagePoolId = pool.id;
+      backupData.storagePoolPath = pool.path;
+      backupData.retention = schedule.retention || schedule.retentionCount || 7;
+      backupData.keepArchive = schedule.keepArchive || 2;
+      backupData.compression = schedule.compression || 2;
+
+      // Resolve offsite host IPs (optional)
+      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
+        ? schedule.offsiteHostIds
+        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
+      if (offsiteIds.length > 0) {
+        const allOffsiteHosts = await getOffsiteHosts();
+        backupData.offsiteHosts = offsiteIds
+          .map(id => allOffsiteHosts.find(h => h.id === id))
+          .filter(Boolean)
+          .map(h => h.ip);
+      } else {
+        backupData.offsiteHosts = [];
+      }
 
       await agentService.triggerBackup(url, backupData);
       await this._markScheduleFired(schedule.id);

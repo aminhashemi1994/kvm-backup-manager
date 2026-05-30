@@ -11,6 +11,7 @@ import { useBackupHosts } from '@/hooks/useBackupHosts'
 import { toast } from 'sonner'
 import { useNavigate } from 'react-router-dom'
 import VMReportCard from '@/components/reports/VMReportCard'
+import ReportDownloadMenu from '@/components/reports/ReportDownloadMenu'
 
 export default function Reports() {
   const navigate = useNavigate()
@@ -200,6 +201,12 @@ export default function Reports() {
           <h1 className="text-3xl font-bold">Backup Reports</h1>
           <p className="text-gray-600 mt-1">Comprehensive backup analysis and health status</p>
         </div>
+        <ReportDownloadMenu
+          scope="global"
+          label="Download All Hosts"
+          variant="default"
+          size="default"
+        />
       </div>
 
       {/* Host Selection */}
@@ -230,20 +237,27 @@ export default function Reports() {
               </div>
 
               {selectedHostId && (
-                <Button
-                  variant="outline"
-                  onClick={handleRefresh}
-                  disabled={isFetching || isGenerating || isRefreshing || (rateLimitInfo?.isLimited ?? false)}
-                >
-                  <RefreshCw className={`h-4 w-4 mr-2 ${(isFetching || isGenerating || isRefreshing) ? 'animate-spin' : ''}`} />
-                  {isRefreshing || isGenerating
-                    ? 'Generating...'
-                    : isFetching
-                      ? 'Loading...'
-                      : rateLimitInfo?.isLimited 
-                        ? `Wait ${rateLimitInfo.remainingSeconds}s` 
-                        : 'Refresh Report'}
-                </Button>
+                <>
+                  <Button
+                    variant="outline"
+                    onClick={handleRefresh}
+                    disabled={isFetching || isGenerating || isRefreshing || (rateLimitInfo?.isLimited ?? false)}
+                  >
+                    <RefreshCw className={`h-4 w-4 mr-2 ${(isFetching || isGenerating || isRefreshing) ? 'animate-spin' : ''}`} />
+                    {isRefreshing || isGenerating
+                      ? 'Generating...'
+                      : isFetching
+                        ? 'Loading...'
+                        : rateLimitInfo?.isLimited 
+                          ? `Wait ${rateLimitInfo.remainingSeconds}s` 
+                          : 'Refresh Report'}
+                  </Button>
+                  <ReportDownloadMenu
+                    scope="host"
+                    scopeId={selectedHostId}
+                    label="Download Host Report"
+                  />
+                </>
               )}
             </div>
 

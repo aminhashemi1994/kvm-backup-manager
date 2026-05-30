@@ -1,30 +1,16 @@
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
-const path = require('path');
-const fs = require('fs').promises;
 const agentService = require('../services/agentService');
-const { getBackupHosts } = require('../services/fileStorage');
+const {
+  getBackupHosts,
+  getRestoreStoragePools,
+  saveRestoreStoragePools,
+} = require('../services/fileStorage');
 
-const DATA_DIR = path.join(__dirname, '../data');
-const RESTORE_POOLS_FILE = path.join(DATA_DIR, 'restore-storage-pools.json');
-
-// Helper functions
-async function getRestoreStoragePools() {
-  try {
-    const data = await fs.readFile(RESTORE_POOLS_FILE, 'utf8');
-    return JSON.parse(data);
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      return [];
-    }
-    throw error;
-  }
-}
-
-async function saveRestoreStoragePools(pools) {
-  await fs.writeFile(RESTORE_POOLS_FILE, JSON.stringify(pools, null, 2));
-}
+// All persistence routed through fileStorage's atomic write helpers.
+// The previous local helpers used fs.writeFile, which could leave the
+// JSON truncated under crash conditions.
 
 // GET /api/restore-storage-pools - Get all restore storage pools
 router.get('/', async (req, res, next) => {

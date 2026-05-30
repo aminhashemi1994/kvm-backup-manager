@@ -41,11 +41,15 @@ router.post('/trigger', async (req, res, next) => {
       });
     }
 
-    // Validate scheduleType
-    if (!['once', 'daily', 'weekly', 'monthly', 'full', 'inc', 'copy'].includes(finalScheduleType)) {
+    // Validate scheduleType. The values accepted here must match what
+    // Backup_Manager.sh accepts for its --schedule flag (once, monthly,
+    // daily, weekly, custom). The legacy method-style values (full / inc
+    // / copy) are kept for backwards compatibility with older controller
+    // payloads; the executor maps them to a sensible script schedule.
+    if (!['once', 'daily', 'weekly', 'monthly', 'custom', 'full', 'inc', 'copy'].includes(finalScheduleType)) {
       return res.status(400).json({
         success: false,
-        error: 'Invalid scheduleType/method. Must be: once, daily, weekly, monthly, full, inc, or copy',
+        error: 'Invalid scheduleType/method. Must be: once, daily, weekly, monthly, custom, full, inc, or copy',
       });
     }
 

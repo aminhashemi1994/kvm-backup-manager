@@ -64,8 +64,14 @@ class AgentService {
   }
 
   async triggerScheduledBackup(agentUrl, backupData) {
+    // The agent only exposes /api/backup/trigger. This helper used to call
+    // /api/backup/trigger-scheduled which never existed — every scheduled
+    // backup, retry-from-skipped, and manual retry through this path 404'd.
+    // Now it routes to the same /trigger endpoint as triggerBackup; the
+    // payload differs only by carrying vmId + incrementalCount which the
+    // agent-side cycle bookkeeping can use safely.
     const client = this.createAgentClient(agentUrl);
-    const response = await client.post('/api/backup/trigger-scheduled', backupData);
+    const response = await client.post('/api/backup/trigger', backupData);
     return response.data;
   }
 
@@ -114,6 +120,18 @@ class AgentService {
   async generateBackupReport(agentUrl) {
     const client = this.createAgentClient(agentUrl);
     const response = await client.post('/api/report/generate');
+    return response.data;
+  }
+
+  /**
+   * Trigger report generation bypassing the manual rate-limit. Used by
+   * the controller's download flow so the user can grab a fresh report
+   * on demand without hitting the 2-minute cooldown.
+   */
+  async generateBackupReportNow(agentUrl) {
+    const client = this.createAgentClient(agentUrl);
+    // Long timeout — full report generation can take several minutes.
+    const response = await client.post('/api/report/generate-now', {}, { timeout: 10 * 60 * 1000 });
     return response.data;
   }
 

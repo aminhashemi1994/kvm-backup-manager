@@ -42,7 +42,10 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!socket) return
 
-    // Listen for agent status changes
+    // Listen for agent status changes only. Backup-related events are
+    // handled exclusively by NotificationCenter (the bell dropdown UI) so
+    // we don't double up. Previously this provider also subscribed to
+    // backup-started/complete/error which produced 2-3 toasts per event.
     socket.on('hosts-status-update', (hosts: any[]) => {
       hosts.forEach(host => {
         const wasOnline = notifications.some(
@@ -67,39 +70,8 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
       })
     })
 
-    // Listen for backup events
-    socket.on('backup-started', (job: any) => {
-      addNotification({
-        type: 'backup',
-        severity: 'info',
-        title: 'Backup Started',
-        message: `Backup started for VM "${job.vmName}" (${job.method})`,
-      })
-    })
-
-    socket.on('backup-complete', (job: any) => {
-      addNotification({
-        type: 'backup',
-        severity: 'success',
-        title: 'Backup Completed',
-        message: `Backup completed successfully for VM "${job.vmName}"`,
-      })
-    })
-
-    socket.on('backup-error', (job: any) => {
-      addNotification({
-        type: 'backup',
-        severity: 'error',
-        title: 'Backup Failed',
-        message: `Backup failed for VM "${job.vmName}": ${job.error || 'Unknown error'}`,
-      })
-    })
-
     return () => {
       socket.off('hosts-status-update')
-      socket.off('backup-started')
-      socket.off('backup-complete')
-      socket.off('backup-error')
     }
   }, [socket])
 

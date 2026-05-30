@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
-import { Settings, Users, Shield, Bell, MessageSquare, Sun, Moon } from 'lucide-react'
+import { Settings, Users, Shield, Bell, MessageSquare, Sun, Moon, Save, Send, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTheme } from '@/contexts/ThemeContext'
+import { notificationsApi } from '@/services/api'
+import { toast } from 'sonner'
 
 const settingsTabs = [
   { name: 'General', to: '/settings', icon: Settings, end: true },
@@ -656,50 +658,322 @@ function AuditSettings() {
 }
 
 function NotificationSettings() {
+  type RcMode = 'webhook' | 'api'
+  type RcSettings = {
+    enabled: boolean
+    mode: RcMode
+    webhookUrl: string
+    url: string
+    authToken: string
+    authTokenSet?: boolean
+    userId: string
+    channel: string
+    entity: string
+    version: string
+  }
+
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [rc, setRc] = useState<RcSettings>({
+    enabled: false,
+    mode: 'api',
+    webhookUrl: '',
+    url: '',
+    authToken: '',
+    authTokenSet: false,
+    userId: '',
+    channel: 'backup-notifications',
+    entity: 'Backup Manager',
+    version: '',
+  })
+
+  useEffect(() => {
+    let mounted = true
+    notificationsApi.getSettings()
+      .then(res => {
+        if (!mounted) return
+        const data = res.data?.data?.rocketChat
+        if (data) {
+          setRc(prev => ({
+            ...prev,
+            ...data,
+            authToken: '', // never echoed by the server
+          }))
+        }
+      })
+      .catch(err => toast.error(`Failed to load settings: ${err.message}`))
+      .finally(() => mounted && setLoading(false))
+    return () => { mounted = false }
+  }, [])
+
+  const updateField = <K extends keyof RcSettings>(key: K, value: RcSettings[K]) =>
+    setRc(prev => ({ ...prev, [key]: value }))
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      // Only send authToken if the user typed a new one; an empty string
+      // tells the server to keep what it already has.
+      const payload = {
+        rocketChat: {
+          enabled: rc.enabled,
+          mode: rc.mode,
+          webhookUrl: rc.webhookUrl,
+          url: rc.url,
+          userId: rc.userId,
+          channel: rc.channel,
+          entity: rc.entity,
+          version: rc.version,
+          ...(rc.authToken ? { authToken: rc.authToken } : {}),
+        },
+      }
+      const res = await notificationsApi.saveSettings(payload)
+      const fresh = res.data?.data?.rocketChat
+      if (fresh) {
+        setRc(prev => ({ ...prev, ...fresh, authToken: '' }))
+      }
+      toast.success('Notification settings saved')
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || err.message || 'Save failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleTest = async () => {
+    setTesting(true)
+    try {
+      // Save first — the backend test endpoint reads from the persisted file.
+      // This way users don't have to remember to hit Save before Test.
+      const payload = {
+        rocketChat: {
+          enabled: rc.enabled,
+          mode: rc.mode,
+          webhookUrl: rc.webhookUrl,
+          url: rc.url,
+          userId: rc.userId,
+          channel: rc.channel,
+          entity: rc.entity,
+          version: rc.version,
+          ...(rc.authToken ? { authToken: rc.authToken } : {}),
+        },
+      }
+      // For the test, treat enabled=true so the backend will actually send
+      // even if the user hasn't flipped the toggle yet. We restore their
+      // chosen value when they click Save.
+      const testPayload = { rocketChat: { ...payload.rocketChat, enabled: true } }
+      await notificationsApi.saveSettings(testPayload)
+      const res = await notificationsApi.sendTest()
+      // Now restore the user's actual enabled choice if it differs
+      if (!rc.enabled) {
+        await notificationsApi.saveSettings(payload)
+      }
+      if (res.data?.success) {
+        toast.success('Test message sent — check your RocketChat channel')
+      } else {
+        toast.error(res.data?.error || 'Test failed (no error returned)')
+      }
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || err.message || 'Test failed')
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-gray-500 p-4">
+        <Loader2 className="h-4 w-4 animate-spin" /> Loading settings...
+      </div>
+    )
+  }
+
+  const inputCls = 'w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500'
+
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-lg font-semibold">Notification Settings</h2>
         <p className="text-sm text-gray-500">Configure RocketChat, SMS, and in-app notification preferences.</p>
       </div>
-      
+
       {/* RocketChat */}
-      <div className="space-y-3 p-4 border border-gray-200 dark:border-gray-700 rounded-xl">
+      <div className="space-y-4 p-4 border border-gray-200 dark:border-gray-700 rounded-xl">
         <h3 className="text-sm font-semibold flex items-center gap-2">
           <MessageSquare className="h-4 w-4" /> RocketChat
         </h3>
+
+        {/* Enable toggle: prominent so it's never missed */}
+        <label className="flex items-start gap-3 p-3 rounded-lg bg-gray-50 dark:bg-gray-800/40 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={rc.enabled}
+            onChange={(e) => updateField('enabled', e.target.checked)}
+            className="h-4 w-4 mt-0.5"
+          />
+          <div className="flex-1">
+            <div className="text-sm font-medium">Enable RocketChat notifications</div>
+            <div className="text-xs text-gray-500">
+              {rc.enabled
+                ? 'On — backup events will be posted to RocketChat.'
+                : 'Off — settings can be saved but no messages will be sent.'}
+            </div>
+          </div>
+          <span
+            className={cn(
+              'text-xs font-medium px-2 py-0.5 rounded-full',
+              rc.enabled
+                ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                : 'bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
+            )}
+          >
+            {rc.enabled ? 'Enabled' : 'Disabled'}
+          </span>
+        </label>
+
+        <div className="space-y-1 max-w-lg">
+          <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Mode</label>
+          <div className="flex gap-4 text-sm">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="rc-mode"
+                value="api"
+                checked={rc.mode === 'api'}
+                onChange={() => updateField('mode', 'api')}
+              />
+              API (supports message updates)
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="rc-mode"
+                value="webhook"
+                checked={rc.mode === 'webhook'}
+                onChange={() => updateField('mode', 'webhook')}
+              />
+              Webhook (simple)
+            </label>
+          </div>
+        </div>
+
         <div className="grid gap-3 max-w-lg">
+          {rc.mode === 'webhook' ? (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Webhook URL</label>
+              <input
+                type="url"
+                placeholder="https://your-rocketchat.com/hooks/..."
+                value={rc.webhookUrl}
+                onChange={(e) => updateField('webhookUrl', e.target.value)}
+                className={inputCls}
+              />
+            </div>
+          ) : (
+            <>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">RocketChat URL</label>
+                <input
+                  type="url"
+                  placeholder="https://chat.example.com"
+                  value={rc.url}
+                  onChange={(e) => updateField('url', e.target.value)}
+                  className={inputCls}
+                />
+                <p className="text-xs text-gray-500">Base URL — the route appends <code>/api/v1/chat.postMessage</code>.</p>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Auth Token (X-Auth-Token)</label>
+                <input
+                  type="password"
+                  placeholder={rc.authTokenSet ? '•••••••• (leave blank to keep current)' : 'tSrhyUc8qOG7_...'}
+                  value={rc.authToken}
+                  onChange={(e) => updateField('authToken', e.target.value)}
+                  className={inputCls}
+                  autoComplete="new-password"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">User ID (X-User-Id)</label>
+                <input
+                  type="text"
+                  placeholder="ZyDJx8fGTXaN2JGse"
+                  value={rc.userId}
+                  onChange={(e) => updateField('userId', e.target.value)}
+                  className={inputCls}
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Channel</label>
+                <input
+                  type="text"
+                  placeholder="event-cando-automation"
+                  value={rc.channel}
+                  onChange={(e) => updateField('channel', e.target.value)}
+                  className={inputCls}
+                />
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="grid gap-3 max-w-lg pt-2 border-t border-gray-200 dark:border-gray-700">
+          <p className="text-xs text-gray-500">
+            Message template fields. Used for the headline and the
+            <code className="mx-1">🏷️ Version</code> line of every notification.
+          </p>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-gray-600">Webhook URL</label>
-            <input type="url" placeholder="https://your-rocketchat.com/hooks/..." className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm" />
+            <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Default Entity</label>
+            <input
+              type="text"
+              placeholder="Backup Manager"
+              value={rc.entity}
+              onChange={(e) => updateField('entity', e.target.value)}
+              className={inputCls}
+            />
           </div>
           <div className="space-y-1">
-            <label className="text-xs font-medium text-gray-600">Channel</label>
-            <input type="text" placeholder="backup-notifications" className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm" />
+            <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Version</label>
+            <input
+              type="text"
+              placeholder="1.0.0"
+              value={rc.version}
+              onChange={(e) => updateField('version', e.target.value)}
+              className={inputCls}
+            />
           </div>
+        </div>
+
+        <div className="flex flex-wrap gap-2 pt-2">
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving}
+            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+          >
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            {saving ? 'Saving...' : 'Save Settings'}
+          </button>
+          <button
+            type="button"
+            onClick={handleTest}
+            disabled={testing}
+            title="Sends a test message using the values currently in the form"
+            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
+          >
+            {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+            {testing ? 'Sending...' : 'Send Test Message'}
+          </button>
         </div>
       </div>
 
-      {/* SMS */}
-      <div className="space-y-3 p-4 border border-gray-200 dark:border-gray-700 rounded-xl">
+      {/* SMS — placeholder, kept as-is until a provider is wired up */}
+      <div className="space-y-3 p-4 border border-gray-200 dark:border-gray-700 rounded-xl opacity-70">
         <h3 className="text-sm font-semibold flex items-center gap-2">
           <Bell className="h-4 w-4" /> SMS Notifications
         </h3>
-        <p className="text-xs text-gray-500">Configure an SMS gateway for critical alerts.</p>
-        <div className="grid gap-3 max-w-lg">
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-gray-600">SMS API URL</label>
-            <input type="url" placeholder="https://sms-provider.com/api/send" className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm" />
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-gray-600">API Key</label>
-            <input type="password" placeholder="••••••••" className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm" />
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs font-medium text-gray-600">Phone Numbers (comma-separated)</label>
-            <input type="text" placeholder="+1234567890, +0987654321" className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm" />
-          </div>
-        </div>
+        <p className="text-xs text-gray-500">SMS gateway integration is not enabled in this build.</p>
       </div>
     </div>
   )

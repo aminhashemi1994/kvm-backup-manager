@@ -1,19 +1,82 @@
 const axios = require('axios');
+const https = require('https');
 const config = require('../config/config');
+
+// Allow self-signed / internal-CA RocketChat servers — same effect as
+// curl's `-k` flag. Toggleable per call so we can turn strict TLS back on
+// later if the user wants it.
+const insecureHttpsAgent = new https.Agent({ rejectUnauthorized: false });
+
+/** Extract the most useful error message we can from an axios failure. */
+function describeAxiosError(err) {
+  if (!err) return 'Unknown error';
+  if (err.response) {
+    // Server responded with non-2xx
+    const status = err.response.status;
+    const body = err.response.data;
+    let detail = '';
+    if (body) {
+      if (typeof body === 'string') {
+        detail = body.slice(0, 300);
+      } else {
+        try { detail = JSON.stringify(body).slice(0, 300); } catch (_) { /* ignore */ }
+      }
+    }
+    return `HTTP ${status}${detail ? ` — ${detail}` : ''}`;
+  }
+  if (err.code) {
+    // Network-level error: ECONNREFUSED, ETIMEDOUT, ENOTFOUND, ECONNABORTED, etc.
+    return `${err.code}: ${err.message}`;
+  }
+  return err.message || String(err);
+}
 
 class RocketChatService {
   constructor() {
-    this.enabled = config.rocketChat?.enabled || false;
-    this.webhookUrl = config.rocketChat?.webhookUrl;
-    this.url = config.rocketChat?.url;
-    this.authToken = config.rocketChat?.authToken;
-    this.userId = config.rocketChat?.userId;
-    this.channel = config.rocketChat?.channel || 'backup-notifications';
+    // Initial config is taken from env. The notifications route calls
+    // reloadConfig() with the persisted JSON settings as soon as the server
+    // boots, so by the time anything sends a message the user-managed
+    // values are in effect.
+    this.applyConfig({
+      enabled: config.rocketChat?.enabled || false,
+      mode: config.rocketChat?.webhookUrl ? 'webhook' : 'api',
+      webhookUrl: config.rocketChat?.webhookUrl || '',
+      url: config.rocketChat?.url || '',
+      authToken: config.rocketChat?.authToken || '',
+      userId: config.rocketChat?.userId || '',
+      channel: config.rocketChat?.channel || 'backup-notifications',
+      entity: '',
+      version: '',
+    });
+
     this.lastMessageId = null;
     this.lastRoomId = null;
-    
-    // Determine which method to use
-    this.useWebhook = !!this.webhookUrl;
+  }
+
+  applyConfig(rc) {
+    this.enabled = !!rc.enabled;
+    this.webhookUrl = rc.webhookUrl || '';
+    this.url = rc.url || '';
+    this.authToken = rc.authToken || '';
+    this.userId = rc.userId || '';
+    this.channel = rc.channel || 'backup-notifications';
+    this.entity = rc.entity || '';
+    this.version = rc.version || '';
+
+    // Mode preference: explicit > webhook URL > API
+    this.useWebhook = rc.mode
+      ? rc.mode === 'webhook'
+      : !!this.webhookUrl;
+  }
+
+  /**
+   * Hot-reload config from the persisted notification-settings file.
+   * Called by the notifications route after a successful PUT.
+   */
+  reloadConfig(rc) {
+    if (!rc) return;
+    this.applyConfig(rc);
+    console.log('[RocketChat] Config reloaded (enabled=%s, mode=%s)', this.enabled, this.useWebhook ? 'webhook' : 'api');
   }
 
   isConfigured() {
@@ -49,6 +112,7 @@ class RocketChatService {
             'X-User-Id': this.userId,
           },
           timeout: 10000,
+          httpsAgent: insecureHttpsAgent,
         }
       );
 
@@ -59,16 +123,19 @@ class RocketChatService {
         return { success: true, messageId: this.lastMessageId };
       }
 
-      return { success: false, error: 'Failed to send message' };
+      const reason = response.data?.error || JSON.stringify(response.data).slice(0, 300);
+      console.error('[RocketChat] postMessage returned success=false:', reason);
+      return { success: false, error: `RocketChat rejected message: ${reason}` };
     } catch (error) {
-      console.error('[RocketChat] Error sending message:', error.message);
-      return { success: false, error: error.message };
+      const detail = describeAxiosError(error);
+      console.error('[RocketChat] Error sending message:', detail);
+      return { success: false, error: detail };
     }
   }
 
   async sendWebhookMessage(text) {
     try {
-      const response = await axios.post(
+      await axios.post(
         this.webhookUrl,
         {
           bot: true,
@@ -78,15 +145,21 @@ class RocketChatService {
           headers: {
             'Content-Type': 'application/json',
           },
-          timeout: 2000,
+          // 2s was too tight for RocketChat behind reverse proxies; the
+          // working bash example also uses 2s but `curl -k` succeeds in
+          // ms because it skips TLS handshake validation. With axios we
+          // were timing out before the response came back.
+          timeout: 10000,
+          httpsAgent: insecureHttpsAgent,
         }
       );
 
       console.log('[RocketChat] Webhook message sent');
       return { success: true };
     } catch (error) {
-      console.error('[RocketChat] Error sending webhook message:', error.message);
-      return { success: false, error: error.message };
+      const detail = describeAxiosError(error);
+      console.error('[RocketChat] Error sending webhook message:', detail);
+      return { success: false, error: detail };
     }
   }
 
@@ -122,6 +195,7 @@ class RocketChatService {
             'X-User-Id': this.userId,
           },
           timeout: 10000,
+          httpsAgent: insecureHttpsAgent,
         }
       );
 
@@ -130,228 +204,322 @@ class RocketChatService {
         return { success: true, messageId: this.lastMessageId };
       }
 
-      return { success: false, error: 'Failed to update message' };
+      const reason = response.data?.error || JSON.stringify(response.data).slice(0, 300);
+      return { success: false, error: `RocketChat rejected update: ${reason}` };
     } catch (error) {
-      console.error('[RocketChat] Error updating message:', error.message);
-      return { success: false, error: error.message };
+      const detail = describeAxiosError(error);
+      console.error('[RocketChat] Error updating message:', detail);
+      return { success: false, error: detail };
     }
+  }
+
+  // ============================================================================
+  // Message templates
+  //
+  // All notifications now share a single formatter modelled on the user's
+  // bash script ("Image_Automation Update"). The formatter produces a
+  // RocketChat-compatible message of the form:
+  //
+  //   ✨ *<Entity> Update* ✨
+  //   *🧩 Entity:* <entity>
+  //   *⚙️ State:* <state>
+  //   *📊 Status:* <status>
+  //   *💾 Image:* <name>
+  //   *🏷️ Version:* <version>
+  //   *📘 Details:* <details>
+  //
+  // For non-image domains (backup, restore, agent, …) the "Image" line
+  // uses the relevant entity (VM name, agent name, …) so the layout
+  // remains consistent everywhere.
+  // ============================================================================
+
+  /**
+   * Build the standard message body. Any field can be omitted by passing
+   * an empty string; that line is dropped so the message stays readable.
+   */
+  formatUpdate({ entity, state, status, name, version, details }) {
+    const ent = entity || this.entity || 'Backup Manager';
+    const ver = version || this.version || '';
+
+    const lines = [];
+    lines.push(`✨ *${ent} Update* ✨`);
+    lines.push('');
+    lines.push(`*🧩 Entity:* ${ent}`);
+    if (state)   lines.push(`*⚙️ State:* ${state}`);
+    if (status)  lines.push(`*📊 Status:* ${status}`);
+    if (name)    lines.push(`*💾 Image:* ${name}`);
+    if (ver)     lines.push(`*🏷️ Version:* ${ver}`);
+    if (details) lines.push(`*📘 Details:* ${details}`);
+    lines.push(`*🕒 Time:* ${new Date().toISOString()}`);
+    return lines.join('\n');
+  }
+
+  /** Generic notify shortcut used by callers that want full control. */
+  notify({ entity, state, status, name, version, details }) {
+    return this.sendMessage(this.formatUpdate({ entity, state, status, name, version, details }));
+  }
+
+  /** Used by /api/notifications/test */
+  notifyTest({ entity, version }) {
+    return this.sendMessage(this.formatUpdate({
+      entity,
+      state: 'Configuration',
+      status: 'Test',
+      name: 'Backup Manager',
+      version,
+      details: 'This is a test notification from the Backup Manager panel.',
+    }));
   }
 
   // Notification templates
   notifyAgentConnected(agentName) {
-    const text = `✅ *Agent Connected*\n*Agent:* ${agentName}\n*Status:* Online\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Agent',
+      state: 'Connectivity',
+      status: 'Online',
+      name: agentName,
+      details: 'Backup host is reachable and accepting requests',
+    });
   }
 
   notifyAgentDisconnected(agentName) {
-    const text = `❌ *Agent Disconnected*\n*Agent:* ${agentName}\n*Status:* Offline\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Agent',
+      state: 'Connectivity',
+      status: 'Offline',
+      name: agentName,
+      details: 'Backup host did not respond to recent health checks',
+    });
   }
 
   notifyBackupStarted(vmName, method, backupHost) {
-    const text = `🚀 *Backup Started*\n*VM:* ${vmName}\n*Method:* ${method.toUpperCase()}\n*Host:* ${backupHost}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: (method || '').toUpperCase() || 'BACKUP',
+      status: 'Started',
+      name: vmName,
+      details: `Host: ${backupHost}`,
+    });
   }
 
   notifyBackupCompleted(vmName, method, duration) {
-    const text = `✅ *Backup Completed*\n*VM:* ${vmName}\n*Method:* ${method.toUpperCase()}\n*Duration:* ${duration}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: (method || '').toUpperCase() || 'BACKUP',
+      status: 'Completed',
+      name: vmName,
+      details: `Duration: ${duration}`,
+    });
   }
 
   notifyBackupFailed(vmName, method, error) {
-    const text = `❌ *Backup Failed*\n*VM:* ${vmName}\n*Method:* ${method.toUpperCase()}\n*Error:* ${error}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: (method || '').toUpperCase() || 'BACKUP',
+      status: 'Failed',
+      name: vmName,
+      details: `Error: ${error}`,
+    });
   }
 
   notifyOffsiteSyncStarted(vmName, offsiteHost) {
-    const text = `📤 *Offsite Sync Started*\n*VM:* ${vmName}\n*Destination:* ${offsiteHost}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Offsite Sync',
+      state: 'Transfer',
+      status: 'Started',
+      name: vmName,
+      details: `Destination: ${offsiteHost}`,
+    });
   }
 
   notifyOffsiteSyncCompleted(vmName, offsiteHost, size) {
-    const text = `✅ *Offsite Sync Completed*\n*VM:* ${vmName}\n*Destination:* ${offsiteHost}\n*Size:* ${size}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Offsite Sync',
+      state: 'Transfer',
+      status: 'Completed',
+      name: vmName,
+      details: `Destination: ${offsiteHost}, Size: ${size}`,
+    });
   }
 
   notifyOffsiteSyncFailed(vmName, offsiteHost, error) {
-    const text = `❌ *Offsite Sync Failed*\n*VM:* ${vmName}\n*Destination:* ${offsiteHost}\n*Error:* ${error}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Offsite Sync',
+      state: 'Transfer',
+      status: 'Failed',
+      name: vmName,
+      details: `Destination: ${offsiteHost}, Error: ${error}`,
+    });
   }
 
-  /**
-   * Generic notification method matching bash script format
-   * @param {string} entity - Entity name (e.g., 'remote_backup', 'local_backup', 'restore')
-   * @param {string} state - State (e.g., 'ssh', 'backup', 'restore')
-   * @param {string} status - Status (e.g., 'started', 'completed', 'failed')
-   * @param {string} message - Detailed message
-   */
-  notify(entity, state, status, message) {
-    const statusEmoji = {
-      started: '🚀',
-      running: '⏳',
-      completed: '✅',
-      success: '✅',
-      failed: '❌',
-      error: '❌',
-      warning: '⚠️',
-      skipped: '⏭️',
-    };
-
-    const emoji = statusEmoji[status.toLowerCase()] || '📢';
-    
-    const text = `\`\`\`
-${emoji} Entity: ${entity}
-State: ${state}
-Status: ${status}
-Message: ${message}
-Time: ${new Date().toISOString()}
-\`\`\``;
-    
-    return this.sendMessage(text);
-  }
-
-  /**
-   * Notify backup skipped due to agent offline
-   */
   notifyBackupSkipped(vmName, backupHost, reason) {
-    const text = `⏭️ *Backup Skipped*\n*VM:* ${vmName}\n*Host:* ${backupHost}\n*Reason:* ${reason}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: 'Schedule',
+      status: 'Skipped',
+      name: vmName,
+      details: `Host: ${backupHost}, Reason: ${reason}`,
+    });
   }
 
-  /**
-   * Notify backup auto-retry
-   */
   notifyBackupRetry(vmName, backupHost, originalJobId) {
-    const text = `🔄 *Backup Auto-Retry*\n*VM:* ${vmName}\n*Host:* ${backupHost}\n*Original Job:* ${originalJobId}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: 'Auto-Retry',
+      status: 'Started',
+      name: vmName,
+      details: `Host: ${backupHost}, Original Job: ${originalJobId}`,
+    });
   }
 
-  /**
-   * Notify restore started
-   */
   notifyRestoreStarted(vmName, backupHost, restoreHost) {
-    const text = `🔄 *Restore Started*\n*VM:* ${vmName}\n*From:* ${backupHost}\n*To:* ${restoreHost}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Restore',
+      state: 'Transfer',
+      status: 'Started',
+      name: vmName,
+      details: `From: ${backupHost} → To: ${restoreHost}`,
+    });
   }
 
-  /**
-   * Notify restore completed
-   */
   notifyRestoreCompleted(vmName, duration) {
-    const text = `✅ *Restore Completed*\n*VM:* ${vmName}\n*Duration:* ${duration}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Restore',
+      state: 'Transfer',
+      status: 'Completed',
+      name: vmName,
+      details: `Duration: ${duration}`,
+    });
   }
 
-  /**
-   * Notify restore failed
-   */
   notifyRestoreFailed(vmName, error) {
-    const text = `❌ *Restore Failed*\n*VM:* ${vmName}\n*Error:* ${error}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Restore',
+      state: 'Transfer',
+      status: 'Failed',
+      name: vmName,
+      details: `Error: ${error}`,
+    });
   }
 
-  /**
-   * Critical alert for system errors
-   */
   notifyCriticalError(component, error, details = '') {
-    const text = `🚨 *CRITICAL ERROR*\n*Component:* ${component}\n*Error:* ${error}\n*Details:* ${details}\n*Time:* ${new Date().toISOString()}\n\n⚠️ Immediate attention required!`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'System',
+      state: component,
+      status: 'Critical Error',
+      name: component,
+      details: details ? `${error} | ${details}` : error,
+    });
   }
 
-  /**
-   * Notify when scheduled backup fails to execute
-   */
   notifyScheduledBackupFailed(vmName, scheduleType, error) {
-    const text = `❌ *Scheduled Backup Failed*\n*VM:* ${vmName}\n*Schedule:* ${scheduleType}\n*Error:* ${error}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: `${scheduleType} schedule`,
+      status: 'Failed',
+      name: vmName,
+      details: `Error: ${error}`,
+    });
   }
 
-  /**
-   * Notify when hypervisor connection fails
-   */
   notifyHypervisorConnectionFailed(hypervisorName, hypervisorIp, error) {
-    const text = `⚠️ *Hypervisor Connection Failed*\n*Hypervisor:* ${hypervisorName}\n*IP:* ${hypervisorIp}\n*Error:* ${error}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Hypervisor',
+      state: 'Connectivity',
+      status: 'Failed',
+      name: hypervisorName,
+      details: `IP: ${hypervisorIp}, Error: ${error}`,
+    });
   }
 
-  /**
-   * Notify when storage pool is full or has issues
-   */
   notifyStoragePoolIssue(poolName, issue, usage = '') {
-    const text = `⚠️ *Storage Pool Issue*\n*Pool:* ${poolName}\n*Issue:* ${issue}\n*Usage:* ${usage}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Storage Pool',
+      state: 'Health',
+      status: 'Warning',
+      name: poolName,
+      details: `Issue: ${issue}${usage ? `, Usage: ${usage}` : ''}`,
+    });
   }
 
-  /**
-   * Notify when backup job is stuck
-   */
   notifyBackupStuck(vmName, jobId, duration) {
-    const text = `⚠️ *Backup Job Stuck*\n*VM:* ${vmName}\n*Job ID:* ${jobId}\n*Running for:* ${duration}\n*Time:* ${new Date().toISOString()}\n\n⚠️ Job may need manual intervention`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: 'Job Health',
+      status: 'Stuck',
+      name: vmName,
+      details: `Job ID: ${jobId}, Running for: ${duration}`,
+    });
   }
 
-  /**
-   * Notify when restore job is stuck
-   */
   notifyRestoreStuck(vmName, restoreId, duration) {
-    const text = `⚠️ *Restore Job Stuck*\n*VM:* ${vmName}\n*Restore ID:* ${restoreId}\n*Running for:* ${duration}\n*Time:* ${new Date().toISOString()}\n\n⚠️ Job may need manual intervention`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Restore',
+      state: 'Job Health',
+      status: 'Stuck',
+      name: vmName,
+      details: `Restore ID: ${restoreId}, Running for: ${duration}`,
+    });
   }
 
-  /**
-   * Notify when multiple backups fail in a row
-   */
   notifyMultipleBackupFailures(vmName, failureCount, lastError) {
-    const text = `🚨 *Multiple Backup Failures*\n*VM:* ${vmName}\n*Consecutive Failures:* ${failureCount}\n*Last Error:* ${lastError}\n*Time:* ${new Date().toISOString()}\n\n⚠️ VM may have persistent issues`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: 'Reliability',
+      status: 'Multiple Failures',
+      name: vmName,
+      details: `Consecutive failures: ${failureCount}, Last error: ${lastError}`,
+    });
   }
 
-  /**
-   * Notify when agent is down for extended period
-   */
   notifyAgentDownExtended(agentName, downSince, missedBackups = 0) {
-    const text = `🚨 *Agent Down - Extended Outage*\n*Agent:* ${agentName}\n*Down Since:* ${downSince}\n*Missed Backups:* ${missedBackups}\n*Time:* ${new Date().toISOString()}\n\n⚠️ Critical: Agent requires immediate attention`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Agent',
+      state: 'Connectivity',
+      status: 'Extended Outage',
+      name: agentName,
+      details: `Down since: ${downSince}, Missed backups: ${missedBackups}`,
+    });
   }
 
-  /**
-   * Notify when backup verification fails
-   */
   notifyBackupVerificationFailed(vmName, backupPath, error) {
-    const text = `❌ *Backup Verification Failed*\n*VM:* ${vmName}\n*Path:* ${backupPath}\n*Error:* ${error}\n*Time:* ${new Date().toISOString()}\n\n⚠️ Backup may be corrupted`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Backup',
+      state: 'Verification',
+      status: 'Failed',
+      name: vmName,
+      details: `Path: ${backupPath}, Error: ${error}`,
+    });
   }
 
-  /**
-   * Notify when SSH connection fails
-   */
   notifySSHConnectionFailed(host, error) {
-    const text = `⚠️ *SSH Connection Failed*\n*Host:* ${host}\n*Error:* ${error}\n*Time:* ${new Date().toISOString()}`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'SSH',
+      state: 'Connectivity',
+      status: 'Failed',
+      name: host,
+      details: `Error: ${error}`,
+    });
   }
 
-  /**
-   * Notify when disk space is low
-   */
   notifyLowDiskSpace(host, path, available, total, percentage) {
-    const text = `⚠️ *Low Disk Space Warning*\n*Host:* ${host}\n*Path:* ${path}\n*Available:* ${available}\n*Total:* ${total}\n*Usage:* ${percentage}%\n*Time:* ${new Date().toISOString()}\n\n⚠️ Action required to prevent backup failures`;
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Storage',
+      state: 'Disk Space',
+      status: 'Low',
+      name: host,
+      details: `Path: ${path}, Available: ${available}/${total} (${percentage}% used)`,
+    });
   }
 
-  /**
-   * Notify about missed-run recovery after controller downtime
-   */
   notifyMissedRunsRecovered({ downtimeMinutes, lastSeenAt, bootedAt, replayed, skippedByPolicy, skippedTooOld }) {
-    const text = `🔄 *Missed-Run Recovery*\n` +
-      `*Controller Downtime:* ${downtimeMinutes} minute(s)\n` +
-      `*Down From:* ${lastSeenAt}\n` +
-      `*Back At:* ${bootedAt}\n` +
-      `*Replayed:* ${replayed} backup(s)\n` +
-      `*Skipped (policy):* ${skippedByPolicy}\n` +
-      `*Skipped (too old):* ${skippedTooOld}\n` +
-      `*Time:* ${new Date().toISOString()}\n\n` +
-      (replayed > 0 ? '✅ Missed backups are being replayed now' : '📋 No backups needed replay');
-    return this.sendMessage(text);
+    return this.notify({
+      entity: 'Controller',
+      state: 'Missed-Run Recovery',
+      status: replayed > 0 ? 'Replaying' : 'Idle',
+      name: 'Backup Controller',
+      details: `Downtime: ${downtimeMinutes}min (${lastSeenAt} → ${bootedAt}), Replayed: ${replayed}, SkippedByPolicy: ${skippedByPolicy}, SkippedTooOld: ${skippedTooOld}`,
+    });
   }
 }
 

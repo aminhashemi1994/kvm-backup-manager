@@ -1,46 +1,26 @@
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
-const fs = require('fs').promises;
-const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const agentService = require('../services/agentService');
 const rocketChatService = require('../services/rocketChatService');
+const {
+  getRestoreJobs,
+  saveRestoreJobs,
+} = require('../services/fileStorage');
 
-const RESTORE_JOBS_FILE = path.join(__dirname, '../data/restore-jobs.json');
-
-// Ensure restore jobs file exists
-async function ensureRestoreJobsFile() {
-  try {
-    await fs.access(RESTORE_JOBS_FILE);
-  } catch (error) {
-    // Create data directory if it doesn't exist
-    const dataDir = path.dirname(RESTORE_JOBS_FILE);
-    try {
-      await fs.mkdir(dataDir, { recursive: true });
-    } catch (err) {
-      // Directory might already exist
-    }
-    // Create empty jobs array
-    await fs.writeFile(RESTORE_JOBS_FILE, JSON.stringify({ jobs: [] }, null, 2));
-  }
-}
-
-// Read restore jobs
+// readRestoreJobs / writeRestoreJobs route through fileStorage's atomic
+// helpers so a crash can never leave restore-jobs.json truncated. The
+// returned shape is preserved for backwards compatibility with the rest
+// of this file ({ jobs: [...] }).
 async function readRestoreJobs() {
-  await ensureRestoreJobsFile();
-  const data = await fs.readFile(RESTORE_JOBS_FILE, 'utf8');
-  const parsed = JSON.parse(data);
-  // Ensure jobs property exists
-  if (!parsed.jobs) {
-    parsed.jobs = [];
-  }
-  return parsed;
+  const jobs = await getRestoreJobs();
+  return { jobs };
 }
 
-// Write restore jobs
 async function writeRestoreJobs(data) {
-  await fs.writeFile(RESTORE_JOBS_FILE, JSON.stringify(data, null, 2));
+  const jobs = (data && Array.isArray(data.jobs)) ? data.jobs : [];
+  await saveRestoreJobs(jobs);
 }
 
 /**

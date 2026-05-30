@@ -1,11 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const agentService = require('../services/agentService');
-const fs = require('fs').promises;
-const path = require('path');
-
-const BACKUP_HOSTS_FILE = path.join(__dirname, '../data/backup-hosts.json');
-const RESTORE_JOBS_FILE = path.join(__dirname, '../data/restore-jobs.json');
+const {
+  getBackupHosts,
+  getRestoreJobs,
+  saveRestoreJobs,
+} = require('../services/fileStorage');
 
 /**
  * GET /api/cleanup/scan
@@ -18,8 +18,7 @@ router.get('/scan', async (req, res, next) => {
     console.log(`[Cleanup] Scanning all agents for files older than ${olderThanHours} hours`);
     
     // Get all backup hosts
-    const backupHostsData = await fs.readFile(BACKUP_HOSTS_FILE, 'utf8');
-    const backupHosts = JSON.parse(backupHostsData);
+    const backupHosts = await getBackupHosts();
     
     if (!Array.isArray(backupHosts)) {
       return res.status(500).json({
@@ -72,8 +71,7 @@ router.get('/scan', async (req, res, next) => {
     
     // Also scan controller's own restore jobs
     try {
-      const jobsData = await fs.readFile(RESTORE_JOBS_FILE, 'utf8');
-      const jobs = JSON.parse(jobsData);
+      const jobs = { jobs: await getRestoreJobs() };
       
       const cutoffDate = new Date();
       cutoffDate.setHours(cutoffDate.getHours() - parseInt(olderThanHours));
@@ -130,8 +128,7 @@ router.post('/execute', async (req, res, next) => {
     console.log(`[Cleanup] Executing cleanup on agent ${agentId} for ${files.length} files`);
     
     // Get agent details
-    const backupHostsData = await fs.readFile(BACKUP_HOSTS_FILE, 'utf8');
-    const backupHosts = JSON.parse(backupHostsData);
+    const backupHosts = await getBackupHosts();
     const agent = backupHosts.find(h => h.id === agentId);
     
     if (!agent) {
@@ -174,8 +171,7 @@ router.post('/controller-jobs', async (req, res, next) => {
     
     console.log(`[Cleanup] Cleaning controller jobs older than ${olderThanHours} hours`);
     
-    const jobsData = await fs.readFile(RESTORE_JOBS_FILE, 'utf8');
-    const jobs = JSON.parse(jobsData);
+    const jobs = { jobs: await getRestoreJobs() };
     
     const cutoffDate = new Date();
     cutoffDate.setHours(cutoffDate.getHours() - parseInt(olderThanHours));
@@ -196,7 +192,7 @@ router.post('/controller-jobs', async (req, res, next) => {
     
     const deletedCount = originalCount - jobs.jobs.length;
     
-    await fs.writeFile(RESTORE_JOBS_FILE, JSON.stringify(jobs, null, 2));
+    await saveRestoreJobs(jobs.jobs);
     
     console.log(`[Cleanup] Deleted ${deletedCount} old controller jobs`);
     
@@ -222,8 +218,7 @@ router.get('/stats', async (req, res, next) => {
     console.log('[Cleanup] Getting stats from all agents');
     
     // Get all backup hosts
-    const backupHostsData = await fs.readFile(BACKUP_HOSTS_FILE, 'utf8');
-    const backupHosts = JSON.parse(backupHostsData);
+    const backupHosts = await getBackupHosts();
     
     const results = {
       agents: [],

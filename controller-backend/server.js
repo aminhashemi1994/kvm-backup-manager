@@ -31,6 +31,7 @@ const restoreRoutes = require('./routes/restore');
 const healthCheckRoutes = require('./routes/healthCheck');
 const usersRoutes = require('./routes/users');
 const auditRoutes = require('./routes/audit');
+const { router: notificationsRoutes, loadSettings: loadNotificationSettings } = require('./routes/notifications');
 
 // Import services
 const schedulerService = require('./services/schedulerService');
@@ -101,6 +102,19 @@ authService.ensureUsersFile().then(() => {
   console.error('Failed to initialize auth service:', err);
 });
 
+// Load persisted notification settings (admin can edit them from the panel).
+// The defaults still come from env vars; the file-based config takes
+// precedence once it exists.
+const rocketChatService = require('./services/rocketChatService');
+loadNotificationSettings().then((settings) => {
+  if (settings && settings.rocketChat) {
+    rocketChatService.reloadConfig(settings.rocketChat);
+    console.log('✓ Notification settings loaded');
+  }
+}).catch(err => {
+  console.error('Failed to load notification settings:', err);
+});
+
 // Routes
 app.use('/api/auth', authRoutes); // Authentication routes (no auth required)
 
@@ -126,6 +140,7 @@ app.use('/api/health-check', authenticateUser, healthCheckRoutes);
 app.use('/api/users', authenticateUser, usersRoutes);
 app.use('/api/audit', authenticateUser, auditRoutes);
 app.use('/api/cleanup', authenticateUser, require('./routes/cleanup'));
+app.use('/api/notifications', authenticateUser, notificationsRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

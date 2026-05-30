@@ -1,6 +1,7 @@
 const fs = require('fs').promises;
 const path = require('path');
 const config = require('../config/config');
+const { writeJSON, readJSON } = require('./fileStorage');
 
 /**
  * HeartbeatService
@@ -30,9 +31,11 @@ class HeartbeatService {
    */
   async readBootSnapshot() {
     try {
-      const data = await fs.readFile(this.heartbeatFile, 'utf8');
-      const parsed = JSON.parse(data);
-      if (!parsed || !parsed.lastSeenAt) return null;
+      const parsed = await readJSON(this.heartbeatFile);
+      // readJSON returns [] for an empty/corrupt/missing file — the
+      // heartbeat is an object not an array, so any non-object means
+      // "no usable previous heartbeat".
+      if (!parsed || Array.isArray(parsed) || !parsed.lastSeenAt) return null;
 
       const snapshot = {
         lastSeenAt: parsed.lastSeenAt,
@@ -41,9 +44,7 @@ class HeartbeatService {
       this.lastBootSnapshot = snapshot;
       return snapshot;
     } catch (err) {
-      if (err.code !== 'ENOENT') {
-        console.warn('[Heartbeat] Could not read previous heartbeat:', err.message);
-      }
+      console.warn('[Heartbeat] Could not read previous heartbeat:', err.message);
       return null;
     }
   }
@@ -58,7 +59,7 @@ class HeartbeatService {
       version: 1,
     };
     try {
-      await fs.writeFile(this.heartbeatFile, JSON.stringify(payload, null, 2), 'utf8');
+      await writeJSON(this.heartbeatFile, payload);
     } catch (err) {
       console.error('[Heartbeat] Failed to write heartbeat:', err.message);
     }

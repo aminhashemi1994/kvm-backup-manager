@@ -3,28 +3,18 @@ const {
   getBackupJobs,
   saveBackupJobs,
   appendLog,
+  getRestoreJobs,
+  saveRestoreJobs,
 } = require('./fileStorage');
-const path = require('path');
-const fs = require('fs').promises;
-const config = require('../config/config');
 const agentService = require('./agentService');
 const rocketChatService = require('./rocketChatService');
 
-const RESTORE_JOBS_FILE = path.join(config.dataDir, 'restore-jobs.json');
-
-async function readRestoreJobs() {
-  try {
-    const data = await fs.readFile(RESTORE_JOBS_FILE, 'utf8');
-    const parsed = JSON.parse(data);
-    return parsed.jobs || [];
-  } catch (err) {
-    if (err.code === 'ENOENT') return [];
-    throw err;
-  }
-}
-async function writeRestoreJobs(jobs) {
-  await fs.writeFile(RESTORE_JOBS_FILE, JSON.stringify({ jobs }, null, 2), 'utf8');
-}
+// Use the unified, atomic helpers from fileStorage. The previous local
+// readRestoreJobs/writeRestoreJobs helpers used plain fs.writeFile, which
+// could corrupt the file under crash conditions and (worse) races with the
+// other modules that also write this file.
+const readRestoreJobs = getRestoreJobs;
+const writeRestoreJobs = saveRestoreJobs;
 
 /**
  * AgentSyncService

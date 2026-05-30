@@ -24,8 +24,56 @@ class FileStorage {
 
       for (const file of files) {
         if (!fsSync.existsSync(file)) {
+          // If a backup exists from a previous run, prefer that over creating
+          // a brand-new empty file. Protects against the case where a crash
+          // (OOM, power loss) left the main file truncated and someone or
+          // something then deleted it, making us "lose" all schedules etc.
+          const bakPath = `${file}.bak`;
+          if (fsSync.existsSync(bakPath)) {
+            try {
+              const bakRaw = fsSync.readFileSync(bakPath, 'utf8');
+              JSON.parse(bakRaw); // validate
+              fsSync.copyFileSync(bakPath, file);
+              console.log(`Recovered ${file} from ${bakPath} on startup`);
+              continue;
+            } catch (e) {
+              console.error(`Backup ${bakPath} unusable: ${e.message}`);
+            }
+          }
           await fs.writeFile(file, JSON.stringify([], null, 2), 'utf8');
           console.log(`Created: ${file}`);
+        } else {
+          // File exists — sanity check it. If parsing fails, try recovery
+          // before any other code reads it.
+          try {
+            const raw = fsSync.readFileSync(file, 'utf8');
+            if (raw && raw.trim()) JSON.parse(raw);
+          } catch (parseErr) {
+            console.error(`[fileStorage] ${file} is corrupt: ${parseErr.message}`);
+            const bakPath = `${file}.bak`;
+            if (fsSync.existsSync(bakPath)) {
+              try {
+                const bakRaw = fsSync.readFileSync(bakPath, 'utf8');
+                JSON.parse(bakRaw);
+                fsSync.copyFileSync(bakPath, file);
+                console.log(`Recovered ${file} from ${bakPath} on startup`);
+                continue;
+              } catch (e) {
+                console.error(`Backup ${bakPath} also unusable: ${e.message}`);
+              }
+            }
+            // Last resort: move the corrupt file aside so the app can boot
+            // and the user can investigate, and replace it with an empty array.
+            const corruptPath = `${file}.corrupt-${Date.now()}`;
+            try {
+              fsSync.renameSync(file, corruptPath);
+              console.error(`Quarantined corrupt file to ${corruptPath}`);
+            } catch (e) {
+              console.error(`Could not quarantine ${file}: ${e.message}`);
+            }
+            await fs.writeFile(file, JSON.stringify([], null, 2), 'utf8');
+            console.log(`Created fresh: ${file}`);
+          }
         }
       }
 
@@ -48,23 +96,98 @@ class FileStorage {
     let release;
     try {
       release = await lockfile.lock(filePath, { retries: 5, stale: 10000 });
-      const data = await fs.readFile(filePath, 'utf8');
-      return JSON.parse(data);
-    } catch (error) {
-      if (error.code === 'ENOENT') return [];
-      throw error;
+      let data;
+      try {
+        data = await fs.readFile(filePath, 'utf8');
+      } catch (readErr) {
+        if (readErr.code === 'ENOENT') return [];
+        throw readErr;
+      }
+
+      // Empty / whitespace-only file: treat as corrupt and try to recover
+      if (!data || !data.trim()) {
+        console.error(`[fileStorage] ${filePath} is empty — attempting recovery from .bak`);
+        const recovered = await this._tryReadBackup(filePath);
+        if (recovered !== null) return recovered;
+        return [];
+      }
+
+      try {
+        return JSON.parse(data);
+      } catch (parseErr) {
+        // Corrupt JSON — most likely a truncated write from a crash.
+        // Try the backup copy before giving up so we never silently lose data.
+        console.error(`[fileStorage] Failed to parse ${filePath}: ${parseErr.message}. Attempting recovery from .bak`);
+        const recovered = await this._tryReadBackup(filePath);
+        if (recovered !== null) {
+          // Restore the main file from the backup so the next read is clean.
+          try {
+            const bakPath = `${filePath}.bak`;
+            await fs.copyFile(bakPath, filePath);
+            console.error(`[fileStorage] Restored ${filePath} from ${bakPath}`);
+          } catch (restoreErr) {
+            console.error(`[fileStorage] Could not restore ${filePath} from .bak: ${restoreErr.message}`);
+          }
+          return recovered;
+        }
+        // No usable backup — return empty array so callers don't crash.
+        // (Throwing here would 500 every API endpoint that touches this file.)
+        console.error(`[fileStorage] No usable backup for ${filePath}; returning empty array. Manual intervention may be required.`);
+        return [];
+      }
     } finally {
-      if (release) await release();
+      if (release) {
+        try { await release(); } catch (_) { /* lock may already be gone */ }
+      }
+    }
+  }
+
+  async _tryReadBackup(filePath) {
+    const bakPath = `${filePath}.bak`;
+    try {
+      const bakData = await fs.readFile(bakPath, 'utf8');
+      if (!bakData || !bakData.trim()) return null;
+      const parsed = JSON.parse(bakData);
+      console.error(`[fileStorage] Recovered ${filePath} from ${bakPath}`);
+      return parsed;
+    } catch (err) {
+      return null;
     }
   }
 
   async writeJSON(filePath, data) {
     let release;
     try {
-      release = await lockfile.lock(filePath, { retries: 5, stale: 10000 });
-      await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+      release = await lockfile.lock(filePath, { retries: 5, stale: 10000, realpath: false });
+      const json = JSON.stringify(data, null, 2);
+      const tmpPath = `${filePath}.tmp`;
+      const bakPath = `${filePath}.bak`;
+
+      // Write to a temp file, fsync, then atomically rename into place.
+      // This prevents truncation/corruption if the process is killed mid-write.
+      const fh = await fs.open(tmpPath, 'w');
+      try {
+        await fh.writeFile(json, 'utf8');
+        try { await fh.sync(); } catch (_) { /* sync may not be supported on some FS */ }
+      } finally {
+        await fh.close();
+      }
+
+      // Rotate previous version to .bak (so a corrupted next-write is recoverable)
+      try {
+        await fs.copyFile(filePath, bakPath);
+      } catch (copyErr) {
+        // Original may not exist on first write — that's fine.
+        if (copyErr.code !== 'ENOENT') {
+          console.error(`[fileStorage] Could not refresh backup ${bakPath}: ${copyErr.message}`);
+        }
+      }
+
+      await fs.rename(tmpPath, filePath);
     } finally {
-      if (release) await release();
+      if (release) {
+        try { await release(); } catch (_) { /* lock may already be gone */ }
+      }
     }
   }
 
@@ -213,20 +336,28 @@ module.exports = {
   },
   appendLog: (jobId, logLine) => fileStorage.appendLog(jobId, logLine),
   readLog: (jobId) => fileStorage.readLog(jobId),
-  // Restore Jobs (stored in data/restore-jobs.json with { jobs: [] } wrapper)
+  // Generic atomic JSON helpers — exported so other modules (heartbeat,
+  // restore routes, auth, etc.) can persist their files crash-safely
+  // without re-inventing the temp-file/rename dance.
+  readJSON: (filePath) => fileStorage.readJSON(filePath),
+  writeJSON: (filePath, data) => fileStorage.writeJSON(filePath, data),
+  // Restore Jobs (stored in data/restore-jobs.json with { jobs: [] } wrapper).
+  // Uses the same atomic write path as everything else; readers transparently
+  // unwrap the { jobs: [...] } envelope.
   getRestoreJobs: async () => {
     const filePath = path.join(config.dataDir, 'restore-jobs.json');
     try {
-      const data = await fs.readFile(filePath, 'utf8');
-      const parsed = JSON.parse(data);
+      const parsed = await fileStorage.readJSON(filePath);
+      // readJSON returns [] on missing/corrupt; if a fresh file got created
+      // it'll also be []. Otherwise unwrap the envelope.
+      if (Array.isArray(parsed)) return parsed; // legacy / fallback shape
       return parsed.jobs || [];
     } catch (err) {
-      if (err.code === 'ENOENT') return [];
       return [];
     }
   },
   saveRestoreJobs: async (jobs) => {
     const filePath = path.join(config.dataDir, 'restore-jobs.json');
-    await fs.writeFile(filePath, JSON.stringify({ jobs }, null, 2), 'utf8');
+    await fileStorage.writeJSON(filePath, { jobs });
   },
 };

@@ -7,13 +7,13 @@ import { Select } from '@/components/ui/select'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Calendar } from '@/components/ui/calendar'
 import { useCreateSchedule, useUpdateSchedule } from '@/hooks/useBackups'
-import { useBackupHosts, useHypervisorsByBackupHost, useVMsByHypervisor } from '@/hooks/useBackupHosts'
+import { useBackupHosts, useHypervisorsByBackupHost, useVMsByHypervisor, useAllVMs } from '@/hooks/useBackupHosts'
 import { useOffsiteHostsByBackupHost } from '@/hooks/useOffsiteHosts'
 import { Loader2, Trash2, Plus, Search, HardDrive, AlertCircle } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { useQuery } from '@tanstack/react-query'
-import { storagePoolsApi } from '@/services/api'
+import { storagePoolsApi, hypervisorsApi } from '@/services/api'
 
 interface ScheduleFormProps {
   schedule?: any
@@ -28,8 +28,12 @@ interface CustomDate {
 
 export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
   const [formData, setFormData] = useState({
-    vmId: '',
-    storagePoolId: '',
+    // Lazy-init vmId from the schedule (if editing) so the VM-by-hypervisor
+    // dropdown picks the right item on the very first render. Otherwise,
+    // the schedule-load effect would set it after mount and the cascading
+    // reset effects would race and clear it.
+    vmId: schedule?.vmId || '',
+    storagePoolId: schedule?.storagePoolId || '',
     name: '',
     scheduleType: 'daily' as 'daily' | 'weekly' | 'custom-days' | 'interval' | 'cron' | 'once' | 'monthly',
     
@@ -69,9 +73,13 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     offsiteHostIds: [] as string[], // Changed from offsiteHostId to offsiteHostIds array
   })
 
-  // Hierarchical selection state
-  const [selectedBackupHostId, setSelectedBackupHostId] = useState('')
-  const [selectedHypervisorId, setSelectedHypervisorId] = useState('')
+  // Hierarchical selection state. In edit mode we initialize from the
+  // schedule prop directly so the cascading effects below never observe a
+  // transition from "" -> real-id and therefore never trigger the resets
+  // that would wipe vmId / hypervisorId. The schedule object is enriched
+  // server-side with backupHostId / hypervisorId (see GET /api/schedules).
+  const [selectedBackupHostId, setSelectedBackupHostId] = useState<string>(() => schedule?.backupHostId || '')
+  const [selectedHypervisorId, setSelectedHypervisorId] = useState<string>(() => schedule?.hypervisorId || '')
   const [vmSearchQuery, setVmSearchQuery] = useState('')
   // Multi-VM selection (only used when creating new schedules; edit mode uses single vmId)
   const [selectedVmIds, setSelectedVmIds] = useState<Set<string>>(new Set())
@@ -83,6 +91,44 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
   const { data: backupHosts } = useBackupHosts()
   const { data: hypervisors } = useHypervisorsByBackupHost(selectedBackupHostId)
   const { data: vms } = useVMsByHypervisor(selectedHypervisorId)
+
+  // Cross-reference data for edit-mode fallbacks. If the schedule prop
+  // didn't include enriched backupHostId / hypervisorId (older data, or
+  // a code path that bypasses the enriching GET /api/schedules), derive
+  // them from the VM record + hypervisor list. Without this fallback
+  // editing such a schedule lands the user on an empty backup host /
+  // hypervisor dropdown.
+  const { data: allVMs } = useAllVMs()
+  const { data: allHypervisors } = useQuery({
+    queryKey: ['hypervisors', 'all'],
+    queryFn: async () => {
+      const response = await hypervisorsApi.getAll()
+      return response.data.data as Array<{ id: string; backupHostId?: string }>
+    },
+    staleTime: 60_000,
+  })
+
+  useEffect(() => {
+    if (!isEditing || !schedule) return
+
+    // Resolve hypervisorId from VM if missing
+    if (!selectedHypervisorId && allVMs) {
+      const vm = allVMs.find(v => v.id === schedule.vmId)
+      if (vm?.hypervisorId) {
+        setSelectedHypervisorId(vm.hypervisorId)
+      }
+    }
+
+    // Resolve backupHostId from hypervisor if missing
+    if (!selectedBackupHostId) {
+      const hypId = selectedHypervisorId || allVMs?.find(v => v.id === schedule.vmId)?.hypervisorId
+      const hyp = hypId && allHypervisors?.find(h => h.id === hypId)
+      if (hyp?.backupHostId) {
+        setSelectedBackupHostId(hyp.backupHostId)
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEditing, schedule, allVMs, allHypervisors])
   
   // Load storage pools for selected backup host
   const { data: storagePools, isLoading: poolsLoading } = useQuery({
@@ -126,6 +172,9 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
 
   useEffect(() => {
     if (schedule) {
+      // Cascading dropdown state (selectedBackupHostId / selectedHypervisorId)
+      // is lazily initialized from the schedule prop above, so we don't
+      // touch them here. We only need to populate the rest of the form.
       setFormData({
         vmId: schedule.vmId,
         storagePoolId: schedule.storagePoolId || '',
@@ -152,7 +201,7 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         syncToOffsite: schedule.syncToOffsite || false,
         offsiteHostIds: schedule.offsiteHostIds || (schedule.offsiteHostId ? [schedule.offsiteHostId] : []),
       })
-      
+
       // Load custom dates into calendar
       if (schedule.customDates && schedule.customDates.length > 0) {
         const dates = schedule.customDates.map((cd: CustomDate) => new Date(cd.date))
@@ -161,18 +210,13 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     }
   }, [schedule])
 
-  // Reset hypervisor and VM when backup host changes
-  useEffect(() => {
-    setSelectedHypervisorId('')
-    setFormData(prev => ({ ...prev, vmId: '' }))
-    setVmSearchQuery('')
-  }, [selectedBackupHostId])
-
-  // Reset VM when hypervisor changes
-  useEffect(() => {
-    setFormData(prev => ({ ...prev, vmId: '' }))
-    setVmSearchQuery('')
-  }, [selectedHypervisorId])
+  // Cascade resets happen explicitly in the backup-host / hypervisor
+  // dropdown onChange handlers below, not in effects. The effect-driven
+  // pattern was racy: any code path that programmatically set
+  // selectedBackupHostId / selectedHypervisorId (lazy init from schedule,
+  // fallback resolver from VM lookup, etc.) would trip the effect and
+  // wipe the user's selections. onChange-driven resets only fire when
+  // the user actually picks a different option.
 
   const handleCalendarSelect = (dates: Date[] | undefined) => {
     if (!dates) {
@@ -344,7 +388,14 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                 <Select
                   id="backupHostId"
                   value={selectedBackupHostId}
-                  onChange={(e) => setSelectedBackupHostId(e.target.value)}
+                  onChange={(e) => {
+                    const newId = e.target.value
+                    setSelectedBackupHostId(newId)
+                    // Cascade reset: changing backup host clears hypervisor and VM
+                    setSelectedHypervisorId('')
+                    setFormData(prev => ({ ...prev, vmId: '', storagePoolId: '' }))
+                    setVmSearchQuery('')
+                  }}
                   required
                 >
                   <option value="">Select backup host</option>
@@ -363,7 +414,12 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                   <Select
                     id="hypervisorId"
                     value={selectedHypervisorId}
-                    onChange={(e) => setSelectedHypervisorId(e.target.value)}
+                    onChange={(e) => {
+                      setSelectedHypervisorId(e.target.value)
+                      // Cascade reset: changing hypervisor clears VM
+                      setFormData(prev => ({ ...prev, vmId: '' }))
+                      setVmSearchQuery('')
+                    }}
                     required
                   >
                     <option value="">Select hypervisor</option>

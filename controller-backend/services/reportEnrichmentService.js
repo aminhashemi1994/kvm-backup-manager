@@ -8,6 +8,7 @@ const {
   getVirtualMachines,
   getHypervisors,
   getStoragePools,
+  writeJSON,
 } = require('./fileStorage');
 const agentService = require('./agentService');
 
@@ -148,11 +149,59 @@ class ReportEnrichmentService {
   }
 
   /**
-   * Get report data formatted for download (JSON/CSV scope).
+   * Get report data formatted for download.
+   *
+   *   global → summary rollup PLUS the full enriched report from every
+   *            online host, so the txt/md/xlsx exports can render the
+   *            same detail the user sees in the panel.
+   *   host   → enriched report for that one host.
+   *   vm     → per-VM section pulled from the host's enriched report.
    */
   async getDownloadData(scope, scopeId = null) {
     if (scope === 'global') {
-      return await this.getGlobalRollup();
+      const rollup = await this.getGlobalRollup();
+      const hosts = await getBackupHosts();
+
+      // Fetch each host's enriched report in parallel; tolerate failures
+      // (offline / never-generated agents) so one bad host doesn't kill
+      // the whole download.
+      const settled = await Promise.allSettled(
+        hosts.map(async (h) => {
+          const r = await this.getEnrichedReport(h.id);
+          return {
+            ok: r.success,
+            data: r.success ? r.data : null,
+            error: r.success ? null : (r.error || 'Report not available'),
+          };
+        })
+      );
+
+      // Re-shape into something the formatters can iterate cleanly.
+      const hostReports = hosts.map((h, i) => {
+        const s = settled[i];
+        if (s.status === 'fulfilled') {
+          return {
+            hostId: h.id,
+            hostName: h.name,
+            hostUrl: h.url,
+            online: h.status === 'online',
+            ok: s.value.ok,
+            data: s.value.data,
+            error: s.value.error,
+          };
+        }
+        return {
+          hostId: h.id,
+          hostName: h.name,
+          hostUrl: h.url,
+          online: false,
+          ok: false,
+          data: null,
+          error: String(s.reason),
+        };
+      });
+
+      return { ...rollup, hosts: hostReports };
     }
     if (scope === 'host' && scopeId) {
       const result = await this.getEnrichedReport(scopeId);
@@ -326,10 +375,10 @@ class ReportEnrichmentService {
 
     try {
       const globalRollup = await this.getGlobalRollup();
-      await fs.writeFile(snapshotFile, JSON.stringify({
+      await writeJSON(snapshotFile, {
         date: today,
         ...globalRollup,
-      }, null, 2), 'utf8');
+      });
       console.log(`[ReportEnrich] Daily snapshot saved: ${snapshotFile}`);
 
       // Prune old snapshots (keep 90 days)

@@ -9,9 +9,16 @@ const WS_URL = backendUrl.replace(/\/api.*$/, '')
 class SocketService {
   private socket: Socket | null = null
   private listeners: Map<string, Set<Function>> = new Map()
+  private rawListenersAttached = false
 
   connect() {
-    if (this.socket?.connected) {
+    // Be strictly idempotent. The previous guard checked `connected`, but
+    // if connect() was invoked while a socket was still in its initial
+    // handshake, the guard failed, a new socket was created, and another
+    // round of setupEventListeners() attached duplicate raw listeners.
+    // The result was every server `backup-started` (etc.) being delivered
+    // 2-3 times to the in-app notification center.
+    if (this.socket) {
       return this.socket
     }
 
@@ -34,14 +41,18 @@ class SocketService {
       console.error('WebSocket connection error:', error)
     })
 
-    // Setup event listeners
+    // Setup event listeners — attach raw socket listeners exactly once
+    // for the lifetime of the page. Even if the socket is re-created
+    // later we re-bind them via setupEventListeners; the guard inside
+    // prevents accumulation.
     this.setupEventListeners()
 
     return this.socket
   }
 
   private setupEventListeners() {
-    if (!this.socket) return
+    if (!this.socket || this.rawListenersAttached) return
+    this.rawListenersAttached = true
 
     // Backup events
     this.socket.on('backup-started', (data) => {
@@ -96,6 +107,7 @@ class SocketService {
       this.socket.disconnect()
       this.socket = null
     }
+    this.rawListenersAttached = false
   }
 
   subscribeToJob(jobId: string) {

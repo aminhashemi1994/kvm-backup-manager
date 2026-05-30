@@ -8,6 +8,7 @@ import { Eye, Loader2, Trash2, AlertTriangle, RefreshCw } from 'lucide-react'
 import { useBackupHistory, useForceRemoveJob, useRetryBackup } from '@/hooks/useBackups'
 import { formatDate, formatDuration, getStatusColor } from '@/lib/utils'
 import LiveLogViewer from './LiveLogViewer'
+import JobProgressBar from './JobProgressBar'
 import socketService from '@/services/socket'
 import { useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
@@ -175,24 +176,13 @@ export default function BackupHistory() {
                     </TableCell>
                     <TableCell>
                       {job.status === 'running' || job.status === 'queued' ? (
-                        <div className="w-full">
-                          <div className="flex items-center space-x-2 mb-1">
-                            <div className="flex-1 bg-gray-200 rounded-full h-2 overflow-hidden">
-                              <div 
-                                className="bg-blue-600 h-full transition-all duration-300"
-                                style={{ width: `${job.progress || 0}%` }}
-                              />
-                            </div>
-                            <span className="text-xs font-medium text-gray-600 min-w-[3rem] text-right">
-                              {job.progress || 0}%
-                            </span>
-                          </div>
-                          {job.progressText && (
-                            <div className="text-xs text-gray-500 font-mono truncate" title={job.progressText}>
-                              {job.progressText}
-                            </div>
-                          )}
-                        </div>
+                        <JobProgressBar
+                          progress={job.progress || 0}
+                          phase={job.phase}
+                          progressText={job.progressText}
+                          jobType={job.jobType || 'backup'}
+                          status={job.status}
+                        />
                       ) : job.status === 'completed' ? (
                         <div className="flex items-center space-x-2">
                           <div className="flex-1 bg-green-200 rounded-full h-2">
