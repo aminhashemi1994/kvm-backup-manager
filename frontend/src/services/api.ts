@@ -107,6 +107,7 @@ export const schedulesApi = {
   update: (id: string, data: any) => api.put(`/schedules/${id}`, data),
   delete: (id: string) => api.delete(`/schedules/${id}`),
   toggle: (id: string) => api.post(`/schedules/${id}/toggle`),
+  runNow: (id: string) => api.post(`/schedules/${id}/run`),
 }
 
 // Backups

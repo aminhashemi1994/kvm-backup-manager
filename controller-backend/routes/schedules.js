@@ -431,6 +431,40 @@ router.post('/:id/toggle', requireUser, async (req, res, next) => {
   }
 });
 
+// POST /api/schedules/:id/run - Run a schedule immediately, ignoring cron
+router.post('/:id/run', requireUser, async (req, res, next) => {
+  try {
+    const schedules = await getBackupSchedules();
+    const schedule = schedules.find(s => s.id === req.params.id);
+
+    if (!schedule) {
+      return res.status(404).json({ success: false, error: 'Schedule not found' });
+    }
+
+    // We deliberately don't require the schedule to be enabled — "run now"
+    // should work even on disabled schedules so operators can fire a one-off
+    // backup with the schedule's saved configuration without flipping the
+    // toggle. The next cron tick still respects the enabled flag.
+
+    // Fire-and-forget: kick off the same execution path the cron tick uses,
+    // returning 202 immediately so the UI can update without waiting for
+    // the (potentially long-running) trigger to land on the agent. We
+    // pass no replay metadata so the resulting job record looks like a
+    // normal scheduled run rather than a missed-run replay.
+    schedulerService.executeScheduledBackup(schedule).catch(err => {
+      console.error(`[Schedules] run-now failed for ${schedule.id}:`, err.message);
+    });
+
+    res.status(202).json({
+      success: true,
+      message: `Schedule "${schedule.name}" triggered`,
+      data: { id: schedule.id, name: schedule.name },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // GET /api/schedules/upcoming - Get upcoming scheduled backups
 router.get('/upcoming/list', async (req, res, next) => {
   try {

@@ -6,11 +6,11 @@ import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   Plus, Trash2, Edit, Power, Loader2, CheckSquare, Search, XCircle,
-  Filter, ChevronDown, ChevronUp,
+  Filter, ChevronDown, ChevronUp, Play,
 } from 'lucide-react'
 import ScheduleForm from './ScheduleForm'
 import BulkEditScheduleDialog from './BulkEditScheduleDialog'
-import { useSchedules, useDeleteSchedule, useToggleSchedule } from '@/hooks/useBackups'
+import { useSchedules, useDeleteSchedule, useToggleSchedule, useRunScheduleNow } from '@/hooks/useBackups'
 import { getStatusColor } from '@/lib/utils'
 import { toast } from 'sonner'
 
@@ -47,6 +47,7 @@ export default function ScheduleList() {
   const { data: schedules, isLoading } = useSchedules()
   const deleteSchedule = useDeleteSchedule()
   const toggleSchedule = useToggleSchedule()
+  const runScheduleNow = useRunScheduleNow()
 
   // Build filter options from current schedules
   const filterOptions = useMemo(() => {
@@ -138,6 +139,11 @@ export default function ScheduleList() {
   const handleToggle = async (id: string) => { await toggleSchedule.mutateAsync(id) }
   const handleEdit = (schedule: any) => { setEditingSchedule(schedule); setShowForm(true) }
   const handleCloseForm = () => { setShowForm(false); setEditingSchedule(null) }
+  const handleRunNow = async (id: string, name: string) => {
+    if (confirm(`Trigger schedule "${name}" right now? A new backup will start using this schedule's configuration.`)) {
+      await runScheduleNow.mutateAsync(id)
+    }
+  }
   const handleToggleScheduleSelection = (scheduleId: string) => {
     setSelectedScheduleIds(prev => {
       const newSet = new Set(prev)
@@ -493,6 +499,16 @@ export default function ScheduleList() {
                             </TableCell>
                             <TableCell>
                               <div className="flex items-center space-x-1">
+                                <Button variant="ghost" size="sm"
+                                  onClick={() => handleRunNow(schedule.id, schedule.name)}
+                                  disabled={runScheduleNow.isPending}
+                                  title="Run this schedule now"
+                                  className="text-blue-600 hover:text-blue-700 hover:bg-blue-50 dark:hover:bg-blue-900/20"
+                                >
+                                  {runScheduleNow.isPending && runScheduleNow.variables === schedule.id
+                                    ? <Loader2 className="h-4 w-4 animate-spin" />
+                                    : <Play className="h-4 w-4" />}
+                                </Button>
                                 <Button variant="ghost" size="sm"
                                   onClick={() => handleToggle(schedule.id)}
                                   disabled={toggleSchedule.isPending}

@@ -30,7 +30,11 @@ const config = {
   logLevel: process.env.LOG_LEVEL || 'info',
   
   // Backup
-  maxConcurrentBackups: parseInt(process.env.MAX_CONCURRENT_BACKUPS) || 2,
+  // maxConcurrentBackups is no longer set via env var. The agent pulls it
+  // from the controller (per backup host) on a 60-second sync loop and
+  // caches it locally — see concurrencyConfigSyncService. Use that
+  // service's getMaxConcurrent() at the call site instead of reading
+  // config.maxConcurrentBackups.
   defaultCompressionLevel: 2,
 };
 

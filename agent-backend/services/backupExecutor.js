@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
 const controllerAuthService = require('./controllerAuthService');
+const concurrencyConfigSyncService = require('./concurrencyConfigSyncService');
 
 class BackupExecutor {
   constructor() {
@@ -12,9 +13,24 @@ class BackupExecutor {
     this.activeProcesses = new Map(); // Store child processes
     this.vmLocks = new Map(); // Track which VMs are currently being backed up
     this.jobQueue = [];
-    this.maxConcurrent = 2;
-    this.jobStateDir = null; // Directory to store job state
+    // The concurrency limit comes from the controller (synced by
+    // concurrencyConfigSyncService). The local field is no longer the
+    // source of truth — getMaxConcurrent() always defers to the sync
+    // service so a panel-side change takes effect on the next 60-second
+    // refresh, no agent restart needed.
+    this.jobStateDir = null;
     this.recoveryCheckInterval = null;
+    this._concurrencyUnsubscribe = null;
+  }
+
+  /**
+   * Resolve the current concurrency limit. Reads from the sync service
+   * which itself caches the controller-supplied value.
+   */
+  getMaxConcurrent() {
+    const v = concurrencyConfigSyncService.getMaxConcurrent();
+    if (Number.isFinite(v) && v >= 1) return v;
+    return 15;
   }
 
   /**
@@ -23,9 +39,21 @@ class BackupExecutor {
   initialize(io, config) {
     this.io = io;
     this.config = config;
-    this.maxConcurrent = config.maxConcurrentBackups || 2;
     this.jobStateDir = path.join(this.config.logDir, 'job-state');
-    
+
+    // When the controller bumps maxConcurrentBackups, drain any queued
+    // jobs that can now run. Going down doesn't interrupt active jobs;
+    // they finish naturally, then processQueue won't dequeue more until
+    // active count drops below the new limit.
+    this._concurrencyUnsubscribe = concurrencyConfigSyncService.onChange((prev, next) => {
+      if (next > prev) {
+        console.log(`[BackupExecutor] Concurrency raised ${prev} → ${next}; processing queue`);
+        this.processQueue();
+      } else {
+        console.log(`[BackupExecutor] Concurrency lowered ${prev} → ${next}; in-flight jobs will finish first`);
+      }
+    });
+
     // Ensure job state directory exists
     if (!fs.existsSync(this.jobStateDir)) {
       fs.mkdirSync(this.jobStateDir, { recursive: true });
@@ -764,7 +792,7 @@ class BackupExecutor {
    * Process backup queue
    */
   async processQueue() {
-    if (this.activeJobs.size >= this.maxConcurrent) {
+    if (this.activeJobs.size >= this.getMaxConcurrent()) {
       return;
     }
 
@@ -1155,6 +1183,12 @@ class BackupExecutor {
     if (this.recoveryCheckInterval) {
       clearInterval(this.recoveryCheckInterval);
       this.recoveryCheckInterval = null;
+    }
+
+    // Unsubscribe from concurrency config changes
+    if (this._concurrencyUnsubscribe) {
+      try { this._concurrencyUnsubscribe(); } catch (_) {}
+      this._concurrencyUnsubscribe = null;
     }
     
     // Close all log watchers but don't kill processes

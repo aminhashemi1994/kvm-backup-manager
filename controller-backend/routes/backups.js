@@ -18,6 +18,7 @@ const agentService = require('../services/agentService');
 const backupCycleService = require('../services/backupCycleService');
 const rocketChatService = require('../services/rocketChatService');
 const auditService = require('../services/auditService');
+const schedulerService = require('../services/schedulerService');
 const { validateBackupTrigger } = require('../utils/validator');
 const { requireUser, requireAdmin } = require('../middleware/rbac');
 
@@ -360,7 +361,7 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       (j.status === 'running' || j.status === 'queued')
     );
     
-    const maxConcurrent = host.maxConcurrentBackups || 2;
+    const maxConcurrent = host.maxConcurrentBackups || 15;
     if (runningJobsOnHost.length >= maxConcurrent) {
       return res.status(429).json({ 
         success: false, 
@@ -682,6 +683,17 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', job.error || 'Unknown error');
     }
 
+    // A slot just freed up on this host — release any backups that were
+    // skipped earlier because the concurrent_limit was hit. Without this
+    // step, jobs skipped during a burst would never re-queue: the
+    // existing retry logic only fires when an agent transitions
+    // offline → online, not when a regular slot frees up.
+    if (status === 'completed' || status === 'failed' || status === 'cancelled') {
+      schedulerService.releaseConcurrentSlotsOnHost(job.backupHostId).catch(err => {
+        console.error('[Backups] Failed to release concurrent slots:', err.message);
+      });
+    }
+
     res.json({ success: true, data: job });
   } catch (error) {
     next(error);
@@ -874,6 +886,23 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       });
     }
 
+    // Don't push the host past its concurrent limit on a retry — the user
+    // would just get a fresh "skipped" job and a confusing UI loop. The
+    // releaseConcurrentSlotsOnHost flow will pick this VM up automatically
+    // as soon as a slot frees up.
+    const runningOnHost = jobs.filter(j =>
+      j.backupHostId === host.id && (j.status === 'running' || j.status === 'queued')
+    );
+    const maxConcurrent = host.maxConcurrentBackups || 15;
+    if (runningOnHost.length >= maxConcurrent) {
+      return res.status(429).json({
+        success: false,
+        error: `Backup host is at concurrent limit (${runningOnHost.length}/${maxConcurrent}). The retry will run automatically when a slot frees up.`,
+        currentRunning: runningOnHost.length,
+        maxAllowed: maxConcurrent,
+      });
+    }
+
     // Get VM and hypervisor info
     const vms = await getVirtualMachines();
     const vm = vms.find(v => v.id === originalJob.vmId);
@@ -887,6 +916,66 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Hypervisor not found' });
     }
 
+    // Look up the schedule (if any) so we can rebuild the same payload
+    // executeScheduledBackup uses. The agent rejects without storagePoolPath.
+    let schedule = null;
+    if (originalJob.scheduleId) {
+      const schedules = await getBackupSchedules();
+      schedule = schedules.find(s => s.id === originalJob.scheduleId) || null;
+    }
+
+    // Resolve storage pool. Prefer the schedule's pool, then the original
+    // job's pool id (manual triggers store storagePoolId on the job
+    // record), otherwise refuse — without it the agent returns 400.
+    const { getStoragePools, getOffsiteHosts } = require('../services/fileStorage');
+    const pools = await getStoragePools();
+    const poolId = schedule?.storagePoolId || originalJob.storagePoolId;
+    const pool = poolId
+      ? pools.find(p => p.id === poolId && p.backupHostId === host.id)
+      : null;
+    if (!pool) {
+      return res.status(400).json({
+        success: false,
+        error: poolId
+          ? `Storage pool ${poolId} not found on this backup host`
+          : 'Original job has no storage pool on record; cannot retry. Edit the schedule and trigger a fresh backup instead.',
+      });
+    }
+
+    // Resolve offsite hosts (optional)
+    const offsiteIds = Array.isArray(schedule?.offsiteHostIds)
+      ? schedule.offsiteHostIds
+      : (schedule?.offsiteHostId ? [schedule.offsiteHostId]
+        : (Array.isArray(originalJob.offsiteHosts) ? [] : [])); // originalJob.offsiteHosts already holds IPs
+    let offsiteHostIps = [];
+    if (offsiteIds.length > 0) {
+      const allOffsiteHosts = await getOffsiteHosts();
+      offsiteHostIps = offsiteIds
+        .map(id => allOffsiteHosts.find(h => h.id === id))
+        .filter(Boolean)
+        .map(h => h.ip);
+    } else if (Array.isArray(originalJob.offsiteHosts)) {
+      // Manual jobs persist resolved IPs directly
+      offsiteHostIps = originalJob.offsiteHosts;
+    }
+
+    // Translate the controller's scheduleType to one the bash script
+    // accepts (once / monthly / daily / weekly / custom). interval and
+    // cron behave like daily chains for the script.
+    const sourceScheduleType = schedule?.scheduleType || originalJob.scheduleType || 'once';
+    const agentScheduleType = (() => {
+      switch (sourceScheduleType) {
+        case 'once':
+        case 'monthly':
+        case 'daily':
+        case 'weekly': return sourceScheduleType;
+        case 'interval':
+        case 'cron': return 'daily';
+        case 'custom-days': return 'custom';
+        default: return 'once';
+      }
+    })();
+
     // Create new job for retry
     const newJobId = uuidv4();
     const retryJob = {
@@ -898,8 +987,15 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       backupHostId: originalJob.backupHostId,
       backupHostName: originalJob.backupHostName,
       method: originalJob.method,
+      scheduleType: sourceScheduleType,
+      storagePoolId: pool.id,
+      storagePoolName: pool.name,
+      retention: schedule?.retention ?? originalJob.retention ?? 7,
+      keepArchive: schedule?.keepArchive ?? originalJob.keepArchive ?? 2,
+      compression: schedule?.compression ?? originalJob.compression ?? 2,
       noCompression: originalJob.noCompression || false,
       noVerify: originalJob.noVerify || false,
+      offsiteHosts: offsiteHostIps,
       status: 'queued',
       startTime: new Date().toISOString(),
       endTime: null,
@@ -916,51 +1012,51 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
 
     await appendLog(newJobId, `Retry of job ${originalJob.id} (${originalJob.status})`);
     await appendLog(newJobId, `Original job: ${originalJob.vmName} - ${originalJob.error || 'No error message'}`);
+    await appendLog(newJobId, `Storage pool: ${pool.name} (${pool.path})`);
 
     // Get io from app
     const io = req.app.get('io');
     io.emit('backup-started', retryJob);
 
-    // Trigger backup on agent
+    // Trigger backup on agent with the full payload
     try {
-      const backupData = {
+      let url = host.url;
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'http://' + url;
+      }
+
+      await agentService.triggerBackup(url, {
         jobId: newJobId,
         vmName: originalJob.vmName,
         hypervisorId: hypervisor.id,
         hypervisorIp: hypervisor.ip,
+        scheduleType: agentScheduleType,
         method: originalJob.method,
-        noCompression: originalJob.noCompression,
-        noVerify: originalJob.noVerify,
-      };
-
-      // Check if this was a scheduled backup with cycle management
-      if (originalJob.scheduleId) {
-        const schedules = await getBackupSchedules();
-        const schedule = schedules.find(s => s.id === originalJob.scheduleId);
-        
-        if (schedule && (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron')) {
-          await agentService.triggerScheduledBackup(host.url, {
-            ...backupData,
-            vmId: originalJob.vmId,
-            incrementalCount: schedule.incrementalCount,
-          });
-        } else {
-          await agentService.triggerBackup(host.url, backupData);
-        }
-      } else {
-        await agentService.triggerBackup(host.url, backupData);
-      }
+        storagePoolId: pool.id,
+        storagePoolPath: pool.path,
+        retention: retryJob.retention,
+        keepArchive: retryJob.keepArchive,
+        compression: retryJob.compression,
+        noCompression: retryJob.noCompression,
+        noVerify: retryJob.noVerify,
+        offsiteHosts: offsiteHostIps,
+        verbose: schedule?.verbose || false,
+        ...(sourceScheduleType === 'daily' || sourceScheduleType === 'interval' || sourceScheduleType === 'cron'
+          ? { vmId: originalJob.vmId, incrementalCount: schedule?.incrementalCount }
+          : {}),
+      });
 
       // Update job status
       retryJob.status = 'running';
       await saveBackupJobs(jobs);
 
     } catch (error) {
+      const detail = error.response?.data?.error || error.message;
       retryJob.status = 'failed';
-      retryJob.error = error.message;
+      retryJob.error = `Retry trigger failed: ${detail}`;
       retryJob.endTime = new Date().toISOString();
       await saveBackupJobs(jobs);
-      await appendLog(newJobId, `Error triggering retry: ${error.message}`);
+      await appendLog(newJobId, `Error triggering retry: ${detail}`);
       io.emit('backup-error', retryJob);
     }
 
