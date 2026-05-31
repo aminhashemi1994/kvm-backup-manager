@@ -69,7 +69,7 @@ router.post('/', async (req, res, next) => {
       name: req.body.name,
       url: req.body.url,
       description: req.body.description || '',
-      maxConcurrentBackups: req.body.maxConcurrentBackups || 2, // Default to 2
+      maxConcurrentBackups: req.body.maxConcurrentBackups || 15, // Default to 15
       status: healthResult.success ? 'online' : 'offline',
       lastHealthCheck: new Date().toISOString(),
       hypervisorCount: 0,
@@ -101,16 +101,32 @@ router.put('/:id', async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Backup host not found' });
     }
 
+    const before = hosts[index];
     hosts[index] = {
-      ...hosts[index],
-      name: req.body.name || hosts[index].name,
-      url: req.body.url || hosts[index].url,
-      description: req.body.description !== undefined ? req.body.description : hosts[index].description,
-      maxConcurrentBackups: req.body.maxConcurrentBackups !== undefined ? req.body.maxConcurrentBackups : hosts[index].maxConcurrentBackups,
+      ...before,
+      name: req.body.name || before.name,
+      url: req.body.url || before.url,
+      description: req.body.description !== undefined ? req.body.description : before.description,
+      maxConcurrentBackups: req.body.maxConcurrentBackups !== undefined ? req.body.maxConcurrentBackups : before.maxConcurrentBackups,
       updatedAt: new Date().toISOString(),
     };
 
     await saveBackupHosts(hosts);
+
+    // If the concurrency cap changed, push a refresh hint to the agent so
+    // the change takes effect right away instead of waiting for the next
+    // 60-second poll. Best-effort — the periodic poll is the authoritative
+    // mechanism, so a failure here is non-fatal.
+    if (req.body.maxConcurrentBackups !== undefined &&
+        req.body.maxConcurrentBackups !== before.maxConcurrentBackups) {
+      try {
+        const client = agentService.createAgentClient(hosts[index].url, hosts[index].id, hosts[index].name);
+        await client.post('/api/concurrency-config/refresh', {}, { timeout: 5000 });
+      } catch (e) {
+        console.log(`[backupHosts] Could not push concurrency refresh to agent ${hosts[index].name}: ${e.message}`);
+      }
+    }
+
     res.json({ success: true, data: hosts[index] });
   } catch (error) {
     next(error);
@@ -142,6 +158,31 @@ router.delete('/:id', async (req, res, next) => {
     await saveBackupHosts(hosts);
 
     res.json({ success: true, data: deleted });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// GET /api/backup-hosts/:id/concurrent-config - Return the concurrency
+// configuration for this backup host. The agent polls this on a fixed
+// interval (mirroring how it pulls storage pools) so the controller is
+// the single source of truth for maxConcurrentBackups. Editing the host
+// in the panel takes effect on the next agent poll automatically.
+router.get('/:id/concurrent-config', async (req, res, next) => {
+  try {
+    const hosts = await getBackupHosts();
+    const host = hosts.find(h => h.id === req.params.id);
+    if (!host) {
+      return res.status(404).json({ success: false, error: 'Backup host not found' });
+    }
+    res.json({
+      success: true,
+      data: {
+        backupHostId: host.id,
+        maxConcurrentBackups: host.maxConcurrentBackups || 15,
+        updatedAt: host.updatedAt || null,
+      },
+    });
   } catch (error) {
     next(error);
   }

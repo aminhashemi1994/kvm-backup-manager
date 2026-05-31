@@ -47,7 +47,7 @@ const config = {
   agentHealthCheckInterval: parseInt(process.env.AGENT_HEALTH_CHECK_INTERVAL) || 60000, // 1 minute
   
   // Backup
-  maxConcurrentBackups: parseInt(process.env.MAX_CONCURRENT_BACKUPS) || 3,
+  maxConcurrentBackups: parseInt(process.env.MAX_CONCURRENT_BACKUPS) || 15,
   defaultCompressionLevel: 2,
   
   // Log rotation

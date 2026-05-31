@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const os = require('os');
 const backupExecutor = require('../services/backupExecutor');
+const concurrencyConfigSyncService = require('../services/concurrencyConfigSyncService');
 
 // GET /api/health - Health check
 router.get('/', async (req, res) => {
@@ -24,7 +25,9 @@ router.get('/', async (req, res) => {
     config: {
       backupPath: config.backupPath,
       restorePath: config.restorePath,
-      maxConcurrentBackups: config.maxConcurrentBackups,
+      // Pulled from the controller; see concurrencyConfigSyncService.
+      maxConcurrentBackups: concurrencyConfigSyncService.getMaxConcurrent(),
+      concurrencyConfigLastSync: concurrencyConfigSyncService.getStatus().lastSync,
     },
     jobs: {
       active: backupExecutor.getActiveJobs().length,

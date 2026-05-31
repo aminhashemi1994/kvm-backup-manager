@@ -260,3 +260,26 @@ export function useToggleSchedule() {
     },
   })
 }
+
+export function useRunScheduleNow() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async (id: string) => {
+      const response = await schedulesApi.runNow(id)
+      return response.data
+    },
+    onSuccess: (data) => {
+      // Invalidate active backups and history so the new job shows up
+      // immediately, plus the schedules list (lastFiredAt updates).
+      queryClient.invalidateQueries({ queryKey: ['backups', 'active'] })
+      queryClient.invalidateQueries({ queryKey: ['backups', 'history'] })
+      queryClient.invalidateQueries({ queryKey: ['schedules'] })
+      const name = data?.data?.name || 'Schedule'
+      toast.success(`${name} triggered`)
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.error || 'Failed to trigger schedule')
+    },
+  })
+}

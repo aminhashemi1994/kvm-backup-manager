@@ -517,18 +517,79 @@ remote_backup_TPM() {
 }
 
 generate_random_nbd_port() {
+    # Allocate a free NBD port atomically. Without this, multiple parallel
+    # backups on the same hypervisor (which is normal under
+    # maxConcurrentBackups > 1) can pick the same port via a check-then-use
+    # race: each script's `ss` snapshot doesn't see the port as bound yet,
+    # then both qemu-nbd processes try to bind it. The losing one ends up
+    # racing the cleanup `pkill -f qemu-nbd.*$nbd_port` of the other,
+    # causing the live backup's NBD socket to be ripped out partway through
+    # — which surfaces inside virtnbdbackup as a chunk-write exception
+    # whose error class lookup then fails (the AttributeError seen in the
+    # logs). The fix is two-pronged:
+    #
+    #   1. Serialize the pick-and-claim with `flock` against a shared lock
+    #      file so two concurrent allocators can't both walk away believing
+    #      they own the same port.
+    #   2. Track our claimed ports in a registry directory so a port that's
+    #      reserved but not yet bound is still considered taken by the next
+    #      caller. Stale entries (older than 24h) are pruned automatically.
+    #
+    # Using a wider port range further reduces collision probability.
     local attempt=0
     local p=0
-    for attempt in $(seq 1 200); do
-        p=$((RANDOM % 1000 + 62000))
-        if ! ss -tulpn 2>/dev/null | grep -qw "$p"; then
-            if ! ssh "root@$destination_ip" "ss -tulpn 2>/dev/null | grep -qw $p" 2>/dev/null; then
-                nbd_port=$p
-                return 0
-            fi
+    local lock_dir="${TMP_DIR:-/tmp}/backup-manager-nbd"
+    local lock_file="$lock_dir/allocator.lock"
+    local registry="$lock_dir/in-use"
+    mkdir -p "$registry"
+    : >"$lock_file" 2>/dev/null || true
+
+    # Prune stale port reservations (>24h old). A backup either finishes
+    # cleanly (which removes its claim) or crashes — either way 24h is a
+    # safe upper bound.
+    find "$registry" -type f -mmin +1440 -delete 2>/dev/null || true
+
+    # Take an exclusive lock for the entire pick-and-claim sequence.
+    exec 9>"$lock_file"
+    flock -x 9 || die "Could not acquire NBD port allocator lock."
+
+    for attempt in $(seq 1 500); do
+        # Wider range: 60000..63999 → 4000 candidates, lowering collision
+        # probability for high concurrency.
+        p=$(( (RANDOM * RANDOM) % 4000 + 60000 ))
+
+        # Skip if another concurrent backup has already reserved this port
+        # (claim file present in our registry).
+        if [[ -e "$registry/$p" ]]; then
+            continue
+        fi
+
+        # Skip if anyone is bound on either side right now.
+        if ss -tulpn 2>/dev/null | grep -qw "$p"; then
+            continue
+        fi
+        if ssh -o ConnectTimeout=5 "root@$destination_ip" "ss -tulpn 2>/dev/null | grep -qw $p" 2>/dev/null; then
+            continue
+        fi
+
+        # Reserve it. Write the claim file with our PID + VM context so we
+        # can identify and clean it up later. mkfifo would be more atomic
+        # but `set -C` (noclobber) on a regular file gives us the same
+        # effect: if another process beat us to this exact filename, the
+        # write fails and we loop.
+        if ( set -C; echo "$$ $vm_name $schedule $(date -u +%FT%TZ)" >"$registry/$p" ) 2>/dev/null; then
+            nbd_port=$p
+            # Stash the registry path so cleanup can release the claim.
+            nbd_port_claim_file="$registry/$p"
+            flock -u 9
+            exec 9>&-
+            return 0
         fi
     done
-    die "Could not find a free NBD port after 200 attempts."
+
+    flock -u 9
+    exec 9>&-
+    die "Could not find a free NBD port after 500 attempts."
 }
 
 create_backup_lock() {
@@ -2107,10 +2168,18 @@ cleanup_on_exit() {
         fi
     fi
     
-    # Stop NBD server if running
+    # Stop NBD server if running. The pattern is anchored with `\b` so we
+    # don't accidentally match a sibling backup whose port happens to share
+    # a digit-prefix (e.g. killing port 6294 must not match port 62943).
     if [[ -n "$nbd_port" && -n "$remote_ip" ]]; then
         echo "Stopping NBD server on port $nbd_port..."
-        ssh "root@$remote_ip" "pkill -f 'qemu-nbd.*$nbd_port'" 2>/dev/null || true
+        ssh "root@$remote_ip" "pkill -f 'qemu-nbd.*\\b$nbd_port\\b'" 2>/dev/null || true
+    fi
+
+    # Release our reservation in the allocator registry so other backups
+    # can pick this port again.
+    if [[ -n "$nbd_port_claim_file" && -f "$nbd_port_claim_file" ]]; then
+        rm -f "$nbd_port_claim_file" 2>/dev/null || true
     fi
     
     # Remove backup lock

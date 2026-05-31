@@ -247,6 +247,174 @@ class SchedulerService {
     }
   }
 
+  /**
+   * Release backups that were skipped because the host's concurrent
+   * limit was hit. Called whenever a backup job on that host finishes
+   * (completed / failed / cancelled), which frees up a slot.
+   *
+   * The previous behaviour stalled forever in scenarios like the user's:
+   *   - 5 backups fire at once
+   *   - First few hit the concurrent_limit and get marked skipped
+   *   - When the running ones finish, no one ever retried the skipped ones
+   *
+   * This method picks up to N skipped-by-concurrent-limit jobs (oldest
+   * first), where N is the number of free slots on that host right now,
+   * and re-issues them through the same payload-resolving path that
+   * `executeScheduledBackup` uses.
+   */
+  async releaseConcurrentSlotsOnHost(backupHostId) {
+    if (!backupHostId) return;
+    try {
+      const hosts = await getBackupHosts();
+      const host = hosts.find(h => h.id === backupHostId);
+      if (!host) return;
+
+      const jobs = await getBackupJobs();
+      const running = jobs.filter(j =>
+        j.backupHostId === backupHostId &&
+        (j.status === 'running' || j.status === 'queued')
+      );
+      const max = host.maxConcurrentBackups || 15;
+      const free = max - running.length;
+      if (free <= 0) return;
+
+      // Only consider jobs from the last 24h to avoid replaying ancient
+      // skipped runs the operator may have intentionally abandoned.
+      const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+      const candidates = jobs
+        .filter(j =>
+          j.backupHostId === backupHostId &&
+          j.status === 'skipped' &&
+          j.canRetry === true &&
+          j.skippedReason === 'concurrent_limit' &&
+          new Date(j.startTime).getTime() > oneDayAgo
+        )
+        .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))
+        .slice(0, free);
+
+      if (candidates.length === 0) return;
+
+      console.log(`[Scheduler] Releasing ${candidates.length} skipped-by-concurrent-limit job(s) on ${host.name} (free slots: ${free}/${max})`);
+
+      const schedules = await getBackupSchedules();
+      for (const skipped of candidates) {
+        await this._retrySkippedJob(skipped, host, schedules, jobs);
+      }
+    } catch (err) {
+      console.error('[Scheduler] releaseConcurrentSlotsOnHost error:', err.message);
+    }
+  }
+
+  /**
+   * Internal: re-issue a single skipped job. Reuses the exact same
+   * payload shape as executeScheduledBackup (storage pool, offsite hosts,
+   * retention, compression — all from the schedule record). Without
+   * this the agent rejects with 400 because storagePoolPath is missing.
+   */
+  async _retrySkippedJob(skipped, host, schedules, jobs) {
+    const schedule = schedules.find(s => s.id === skipped.scheduleId);
+    if (!schedule) {
+      console.log(`[Scheduler] Cannot retry ${skipped.id}: schedule ${skipped.scheduleId} not found`);
+      return;
+    }
+
+    const newJobId = uuidv4();
+    const retryJob = {
+      ...skipped,
+      id: newJobId,
+      status: 'queued',
+      startTime: new Date().toISOString(),
+      endTime: null,
+      exitCode: null,
+      error: null,
+      retryOf: skipped.id,
+      progress: 0,
+      progressText: 'Queued (auto-retry)...',
+      autoRetry: true,
+    };
+    jobs.push(retryJob);
+    await saveBackupJobs(jobs);
+    await appendLog(newJobId, `Auto-retry of job ${skipped.id} that was skipped due to concurrent_limit`);
+
+    if (this.io) this.io.emit('backup-started', retryJob);
+
+    try {
+      const vms = await getVirtualMachines();
+      const vm = vms.find(v => v.id === skipped.vmId);
+      if (!vm) throw new Error(`VM ${skipped.vmId} not found`);
+      const hypervisors = await getHypervisors();
+      const hypervisor = hypervisors.find(h => h.id === vm.hypervisorId);
+      if (!hypervisor) throw new Error(`Hypervisor ${vm.hypervisorId} not found`);
+
+      const pools = await getStoragePools();
+      const pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
+      if (!pool) throw new Error('Storage pool for schedule not found on backup host');
+
+      let offsiteHostIps = [];
+      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
+        ? schedule.offsiteHostIds
+        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
+      if (offsiteIds.length > 0) {
+        const allOffsiteHosts = await getOffsiteHosts();
+        offsiteHostIps = offsiteIds
+          .map(id => allOffsiteHosts.find(h => h.id === id))
+          .filter(Boolean)
+          .map(h => h.ip);
+      }
+
+      const agentScheduleType = (() => {
+        switch (schedule.scheduleType) {
+          case 'once':
+          case 'monthly':
+          case 'daily':
+          case 'weekly': return schedule.scheduleType;
+          case 'interval':
+          case 'cron': return 'daily';
+          case 'custom-days': return 'custom';
+          default: return 'once';
+        }
+      })();
+
+      let url = host.url;
+      if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'http://' + url;
+
+      await agentService.triggerBackup(url, {
+        jobId: newJobId,
+        vmName: vm.name,
+        hypervisorId: hypervisor.id,
+        hypervisorIp: hypervisor.ip,
+        scheduleType: agentScheduleType,
+        storagePoolId: pool.id,
+        storagePoolPath: pool.path,
+        retention: schedule.retention || 7,
+        keepArchive: schedule.keepArchive || 2,
+        compression: schedule.compression || 2,
+        noCompression: schedule.noCompression || false,
+        noVerify: schedule.noVerify || false,
+        offsiteHosts: offsiteHostIps,
+        verbose: schedule.verbose || false,
+        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron'
+          ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
+          : {}),
+      });
+
+      retryJob.status = 'running';
+      await saveBackupJobs(jobs);
+      try {
+        rocketChatService.notifyBackupRetry(skipped.vmName, host.name, skipped.id);
+      } catch (_) { /* non-fatal */ }
+      console.log(`[Scheduler] ✓ Auto-retry triggered for ${skipped.vmName} on ${host.name}`);
+    } catch (err) {
+      retryJob.status = 'failed';
+      retryJob.error = `Auto-retry failed: ${err.message}`;
+      retryJob.endTime = new Date().toISOString();
+      await saveBackupJobs(jobs);
+      await appendLog(newJobId, `Error triggering auto-retry: ${err.message}`);
+      if (this.io) this.io.emit('backup-error', retryJob);
+      console.error(`[Scheduler] ✗ Auto-retry failed for ${skipped.vmName}: ${err.message}`);
+    }
+  }
+
   async loadSchedules() {
     this.tasks.forEach(task => task.stop());
     this.tasks.clear();
@@ -453,7 +621,7 @@ class SchedulerService {
         (j.status === 'running' || j.status === 'queued')
       );
       
-      const maxConcurrent = host.maxConcurrentBackups || 2;
+      const maxConcurrent = host.maxConcurrentBackups || 15;
       if (runningJobsOnHost.length >= maxConcurrent) {
         console.error(`Maximum concurrent backups (${maxConcurrent}) reached for ${host.name}, skipping backup`);
         

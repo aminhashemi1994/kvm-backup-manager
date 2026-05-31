@@ -28,6 +28,7 @@ const storagePoolsRoutes = require('./routes/storagePools');
 const restoreStoragePoolsRoutes = require('./routes/restoreStoragePools');
 const restoreRoutes = require('./routes/restore');
 const storagePoolSyncRoutes = require('./routes/storagePoolSync');
+const concurrencyConfigSyncRoutes = require('./routes/concurrencyConfigSync');
 const scheduleValidationRoutes = require('./routes/scheduleValidation');
 const liveStatusRoutes = require('./routes/liveStatus');
 
@@ -38,6 +39,7 @@ const initHostService = require('./services/initHostService');
 const reportService = require('./services/reportService');
 const metricsService = require('./services/metricsService');
 const storagePoolSyncService = require('./services/storagePoolSyncService');
+const concurrencyConfigSyncService = require('./services/concurrencyConfigSyncService');
 const liveStatusService = require('./services/liveStatusService');
 const cleanupService = require('./services/cleanupService');
 
@@ -87,6 +89,12 @@ metricsService.initialize(config).catch(err => {
 // Initialize storage pool sync service
 storagePoolSyncService.initialize(config);
 
+// Initialize concurrency config sync service. Pulls maxConcurrentBackups
+// from the controller every 60s and exposes it to backupExecutor — so the
+// concurrency cap is centrally managed in the panel, not via the agent's
+// .env file.
+concurrencyConfigSyncService.initialize(config);
+
 // Initialize live status service (Item 2)
 liveStatusService.initialize({ config, backupExecutor, restoreExecutor });
 console.log('✓ Live status service initialized');
@@ -111,6 +119,7 @@ app.use('/api/storage-pools', storagePoolsRoutes);
 app.use('/api/restore-storage-pools', restoreStoragePoolsRoutes);
 app.use('/api/restore', restoreRoutes);
 app.use('/api/storage-pool-sync', storagePoolSyncRoutes);
+app.use('/api/concurrency-config', concurrencyConfigSyncRoutes);
 app.use('/api/schedule-validation', scheduleValidationRoutes);
 app.use('/api/jobs', liveStatusRoutes);
 app.use('/api/cleanup', require('./routes/cleanup'));
@@ -175,6 +184,8 @@ process.on('SIGTERM', () => {
   reportService.shutdown();
   backupExecutor.shutdown();
   cleanupService.shutdown();
+  storagePoolSyncService.shutdown?.();
+  concurrencyConfigSyncService.shutdown();
   server.close(() => process.exit(0));
 });
 
@@ -184,6 +195,8 @@ process.on('SIGINT', () => {
   reportService.shutdown();
   backupExecutor.shutdown();
   cleanupService.shutdown();
+  storagePoolSyncService.shutdown?.();
+  concurrencyConfigSyncService.shutdown();
   server.close(() => process.exit(0));
 });
 
