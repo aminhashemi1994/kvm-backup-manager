@@ -32,6 +32,7 @@ const healthCheckRoutes = require('./routes/healthCheck');
 const usersRoutes = require('./routes/users');
 const auditRoutes = require('./routes/audit');
 const { router: notificationsRoutes, loadSettings: loadNotificationSettings } = require('./routes/notifications');
+const { router: settingsRoutes } = require('./routes/settings');
 
 // Import services
 const schedulerService = require('./services/schedulerService');
@@ -141,6 +142,7 @@ app.use('/api/users', authenticateUser, usersRoutes);
 app.use('/api/audit', authenticateUser, auditRoutes);
 app.use('/api/cleanup', authenticateUser, require('./routes/cleanup'));
 app.use('/api/notifications', authenticateUser, notificationsRoutes);
+app.use('/api/settings', authenticateUser, settingsRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

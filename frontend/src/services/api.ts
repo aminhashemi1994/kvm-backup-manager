@@ -246,4 +246,10 @@ export const notificationsApi = {
   sendTest: () => api.post('/notifications/test'),
 }
 
+// General system settings (panel-managed defaults)
+export const settingsApi = {
+  get: () => api.get('/settings'),
+  save: (settings: any) => api.put('/settings', settings),
+}
+
 export default api

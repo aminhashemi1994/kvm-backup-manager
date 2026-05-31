@@ -25,7 +25,7 @@ class ConcurrencyConfigSyncService {
 
     // Sensible default until the first successful sync. Mirrors the
     // controller-side default for backup hosts that have no value set.
-    this.maxConcurrentBackups = 15;
+    this.maxConcurrentBackups = 20;
     this.lastSync = null;
     this.changeListeners = new Set();
   }

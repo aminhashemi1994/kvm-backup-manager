@@ -75,40 +75,30 @@ router.put('/settings', requireAdmin, async (req, res, next) => {
     const incoming = req.body || {};
     const incomingRC = incoming.rocketChat || {};
 
-    // Preserve the current authToken if the client didn't send one (since we
-    // never echo it back, the UI submits an empty string when "unchanged").
+    // Webhook is now the only supported mode. We accept legacy fields in
+    // the persisted file (so older configs survive a read), but on write
+    // we lock the mode to 'webhook' and only honor webhook fields.
     const merged = {
       ...current,
       ...incoming,
       rocketChat: {
         ...current.rocketChat,
         ...incomingRC,
+        mode: 'webhook',
+        // Preserve the legacy authToken in the file but never reset it
+        // from the webhook-only UI.
         authToken: incomingRC.authToken && incomingRC.authToken.length > 0
           ? incomingRC.authToken
           : current.rocketChat.authToken,
       },
     };
 
-    // Light validation
-    if (merged.rocketChat.enabled) {
-      const m = merged.rocketChat.mode || (merged.rocketChat.webhookUrl ? 'webhook' : 'api');
-      merged.rocketChat.mode = m;
-      if (m === 'webhook' && !merged.rocketChat.webhookUrl) {
-        return res.status(400).json({ success: false, error: 'webhookUrl is required when mode is webhook' });
-      }
-      if (m === 'api') {
-        const missing = [];
-        if (!merged.rocketChat.url) missing.push('url');
-        if (!merged.rocketChat.authToken) missing.push('authToken');
-        if (!merged.rocketChat.userId) missing.push('userId');
-        if (!merged.rocketChat.channel) missing.push('channel');
-        if (missing.length) {
-          return res.status(400).json({
-            success: false,
-            error: `Missing required fields: ${missing.join(', ')}`,
-          });
-        }
-      }
+    // Validation: webhookUrl is required only when notifications are on.
+    if (merged.rocketChat.enabled && !merged.rocketChat.webhookUrl) {
+      return res.status(400).json({
+        success: false,
+        error: 'Webhook URL is required when RocketChat notifications are enabled',
+      });
     }
 
     await writeJSON(SETTINGS_FILE, merged);
