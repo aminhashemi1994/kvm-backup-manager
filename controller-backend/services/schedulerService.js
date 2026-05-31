@@ -274,7 +274,7 @@ class SchedulerService {
         j.backupHostId === backupHostId &&
         (j.status === 'running' || j.status === 'queued')
       );
-      const max = host.maxConcurrentBackups || 15;
+      const max = host.maxConcurrentBackups || 20;
       const free = max - running.length;
       if (free <= 0) return;
 
@@ -621,7 +621,7 @@ class SchedulerService {
         (j.status === 'running' || j.status === 'queued')
       );
       
-      const maxConcurrent = host.maxConcurrentBackups || 15;
+      const maxConcurrent = host.maxConcurrentBackups || 20;
       if (runningJobsOnHost.length >= maxConcurrent) {
         console.error(`Maximum concurrent backups (${maxConcurrent}) reached for ${host.name}, skipping backup`);
         

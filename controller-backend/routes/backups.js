@@ -361,7 +361,7 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       (j.status === 'running' || j.status === 'queued')
     );
     
-    const maxConcurrent = host.maxConcurrentBackups || 15;
+    const maxConcurrent = host.maxConcurrentBackups || 20;
     if (runningJobsOnHost.length >= maxConcurrent) {
       return res.status(429).json({ 
         success: false, 
@@ -893,7 +893,7 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
     const runningOnHost = jobs.filter(j =>
       j.backupHostId === host.id && (j.status === 'running' || j.status === 'queued')
     );
-    const maxConcurrent = host.maxConcurrentBackups || 15;
+    const maxConcurrent = host.maxConcurrentBackups || 20;
     if (runningOnHost.length >= maxConcurrent) {
       return res.status(429).json({
         success: false,

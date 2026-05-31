@@ -3,7 +3,7 @@ import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { Settings, Users, Shield, Bell, MessageSquare, Sun, Moon, Save, Send, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTheme } from '@/contexts/ThemeContext'
-import { notificationsApi } from '@/services/api'
+import { notificationsApi, settingsApi } from '@/services/api'
 import { toast } from 'sonner'
 
 const settingsTabs = [
@@ -73,6 +73,75 @@ function SettingsContent() {
 
 function GeneralSettings() {
   const { theme, toggleTheme } = useTheme()
+  type Settings = {
+    defaultMaxConcurrentBackups: number
+    healthCheckIntervalSeconds: number
+    defaultMissedRunPolicy: 'immediate' | 'most-recent' | 'skip'
+  }
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [settings, setSettings] = useState<Settings>({
+    defaultMaxConcurrentBackups: 20,
+    healthCheckIntervalSeconds: 60,
+    defaultMissedRunPolicy: 'immediate',
+  })
+  const [applyConcurrencyToAllHosts, setApplyConcurrencyToAllHosts] = useState(false)
+
+  useEffect(() => {
+    let mounted = true
+    settingsApi.get()
+      .then(res => {
+        if (!mounted) return
+        const data = res.data?.data
+        if (data) {
+          setSettings({
+            defaultMaxConcurrentBackups: Number(data.defaultMaxConcurrentBackups) || 20,
+            healthCheckIntervalSeconds: Number(data.healthCheckIntervalSeconds) || 60,
+            defaultMissedRunPolicy: data.defaultMissedRunPolicy || 'immediate',
+          })
+        }
+      })
+      .catch(err => toast.error(`Failed to load settings: ${err.message}`))
+      .finally(() => mounted && setLoading(false))
+    return () => { mounted = false }
+  }, [])
+
+  const updateField = <K extends keyof Settings>(key: K, value: Settings[K]) =>
+    setSettings(prev => ({ ...prev, [key]: value }))
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      const res = await settingsApi.save({
+        ...settings,
+        applyConcurrencyToAllHosts,
+      })
+      const propagated = res.data?.propagated
+      if (propagated && propagated.hostsUpdated > 0) {
+        toast.success(
+          `Settings saved · ${propagated.hostsUpdated} host(s) updated · ${propagated.agentsRefreshed}/${propagated.agentsTotal} agents refreshed`
+        )
+      } else {
+        toast.success('Settings saved')
+      }
+      // Reset the propagate checkbox after a successful apply
+      if (applyConcurrencyToAllHosts) setApplyConcurrencyToAllHosts(false)
+    } catch (err: any) {
+      toast.error(err.response?.data?.error || err.message || 'Save failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const inputCls = 'w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500'
+
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2 text-sm text-gray-500 p-4">
+        <Loader2 className="h-4 w-4 animate-spin" /> Loading settings...
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-6">
@@ -119,23 +188,70 @@ function GeneralSettings() {
         </div>
       </div>
 
-      {/* System config */}
-      <div className="grid gap-4 max-w-lg">
+      {/* System config — all fields persist when you click Save Settings */}
+      <div className="space-y-4 p-4 border border-gray-200 dark:border-gray-700 rounded-xl max-w-lg">
+        <h3 className="text-sm font-semibold">System defaults</h3>
+
         <div className="space-y-2">
           <label className="text-sm font-medium">Max Concurrent Backups (per host)</label>
-          <input type="number" defaultValue={2} min={1} max={10} className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800" />
+          <input
+            type="number"
+            value={settings.defaultMaxConcurrentBackups}
+            onChange={(e) => updateField('defaultMaxConcurrentBackups', Number(e.target.value) || 1)}
+            min={1}
+            max={200}
+            className={inputCls}
+          />
+          <p className="text-xs text-gray-500">
+            Default value applied to newly-created backup hosts. Existing hosts keep their current
+            value unless you tick "Apply to all existing backup hosts" below.
+          </p>
+          <label className="flex items-center gap-2 text-xs cursor-pointer pt-1">
+            <input
+              type="checkbox"
+              checked={applyConcurrencyToAllHosts}
+              onChange={(e) => setApplyConcurrencyToAllHosts(e.target.checked)}
+              className="h-3.5 w-3.5"
+            />
+            <span>Apply to all existing backup hosts (and push refresh to their agents)</span>
+          </label>
         </div>
+
         <div className="space-y-2">
           <label className="text-sm font-medium">Health Check Interval (seconds)</label>
-          <input type="number" defaultValue={60} min={15} max={300} className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800" />
+          <input
+            type="number"
+            value={settings.healthCheckIntervalSeconds}
+            onChange={(e) => updateField('healthCheckIntervalSeconds', Number(e.target.value) || 60)}
+            min={15}
+            max={3600}
+            className={inputCls}
+          />
         </div>
+
         <div className="space-y-2">
           <label className="text-sm font-medium">Default Missed-Run Policy</label>
-          <select className="w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+          <select
+            value={settings.defaultMissedRunPolicy}
+            onChange={(e) => updateField('defaultMissedRunPolicy', e.target.value as Settings['defaultMissedRunPolicy'])}
+            className={inputCls}
+          >
             <option value="immediate">Run immediately when back online</option>
             <option value="most-recent">Run only most recent missed</option>
             <option value="skip">Skip (log only)</option>
           </select>
+        </div>
+
+        <div className="pt-2">
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving}
+            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+          >
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            {saving ? 'Saving...' : 'Save Settings'}
+          </button>
         </div>
       </div>
 
@@ -658,16 +774,9 @@ function AuditSettings() {
 }
 
 function NotificationSettings() {
-  type RcMode = 'webhook' | 'api'
   type RcSettings = {
     enabled: boolean
-    mode: RcMode
     webhookUrl: string
-    url: string
-    authToken: string
-    authTokenSet?: boolean
-    userId: string
-    channel: string
     entity: string
     version: string
   }
@@ -677,13 +786,7 @@ function NotificationSettings() {
   const [testing, setTesting] = useState(false)
   const [rc, setRc] = useState<RcSettings>({
     enabled: false,
-    mode: 'api',
     webhookUrl: '',
-    url: '',
-    authToken: '',
-    authTokenSet: false,
-    userId: '',
-    channel: 'backup-notifications',
     entity: 'Backup Manager',
     version: '',
   })
@@ -697,8 +800,10 @@ function NotificationSettings() {
         if (data) {
           setRc(prev => ({
             ...prev,
-            ...data,
-            authToken: '', // never echoed by the server
+            enabled: !!data.enabled,
+            webhookUrl: data.webhookUrl || '',
+            entity: data.entity || prev.entity,
+            version: data.version || prev.version,
           }))
         }
       })
@@ -710,28 +815,33 @@ function NotificationSettings() {
   const updateField = <K extends keyof RcSettings>(key: K, value: RcSettings[K]) =>
     setRc(prev => ({ ...prev, [key]: value }))
 
+  const buildPayload = (override?: Partial<RcSettings>) => ({
+    rocketChat: {
+      // Webhook is the only supported mode now. The API mode was removed
+      // because the simple webhook covers every use case here and avoids
+      // the extra configuration burden (auth token, user id, channel).
+      mode: 'webhook' as const,
+      enabled: rc.enabled,
+      webhookUrl: rc.webhookUrl,
+      entity: rc.entity,
+      version: rc.version,
+      ...override,
+    },
+  })
+
   const handleSave = async () => {
     setSaving(true)
     try {
-      // Only send authToken if the user typed a new one; an empty string
-      // tells the server to keep what it already has.
-      const payload = {
-        rocketChat: {
-          enabled: rc.enabled,
-          mode: rc.mode,
-          webhookUrl: rc.webhookUrl,
-          url: rc.url,
-          userId: rc.userId,
-          channel: rc.channel,
-          entity: rc.entity,
-          version: rc.version,
-          ...(rc.authToken ? { authToken: rc.authToken } : {}),
-        },
-      }
-      const res = await notificationsApi.saveSettings(payload)
+      const res = await notificationsApi.saveSettings(buildPayload())
       const fresh = res.data?.data?.rocketChat
       if (fresh) {
-        setRc(prev => ({ ...prev, ...fresh, authToken: '' }))
+        setRc(prev => ({
+          ...prev,
+          enabled: !!fresh.enabled,
+          webhookUrl: fresh.webhookUrl || prev.webhookUrl,
+          entity: fresh.entity ?? prev.entity,
+          version: fresh.version ?? prev.version,
+        }))
       }
       toast.success('Notification settings saved')
     } catch (err: any) {
@@ -742,32 +852,20 @@ function NotificationSettings() {
   }
 
   const handleTest = async () => {
+    if (!rc.webhookUrl) {
+      toast.error('Enter the webhook URL first')
+      return
+    }
     setTesting(true)
     try {
-      // Save first — the backend test endpoint reads from the persisted file.
-      // This way users don't have to remember to hit Save before Test.
-      const payload = {
-        rocketChat: {
-          enabled: rc.enabled,
-          mode: rc.mode,
-          webhookUrl: rc.webhookUrl,
-          url: rc.url,
-          userId: rc.userId,
-          channel: rc.channel,
-          entity: rc.entity,
-          version: rc.version,
-          ...(rc.authToken ? { authToken: rc.authToken } : {}),
-        },
-      }
-      // For the test, treat enabled=true so the backend will actually send
-      // even if the user hasn't flipped the toggle yet. We restore their
-      // chosen value when they click Save.
-      const testPayload = { rocketChat: { ...payload.rocketChat, enabled: true } }
-      await notificationsApi.saveSettings(testPayload)
+      // Save first so the backend test endpoint reads the values the user
+      // is looking at right now. Force enabled=true for the test even if
+      // the user hasn't ticked the toggle yet, then restore the choice
+      // afterwards.
+      await notificationsApi.saveSettings(buildPayload({ enabled: true }))
       const res = await notificationsApi.sendTest()
-      // Now restore the user's actual enabled choice if it differs
       if (!rc.enabled) {
-        await notificationsApi.saveSettings(payload)
+        await notificationsApi.saveSettings(buildPayload({ enabled: false }))
       }
       if (res.data?.success) {
         toast.success('Test message sent — check your RocketChat channel')
@@ -832,90 +930,25 @@ function NotificationSettings() {
           </span>
         </label>
 
-        <div className="space-y-1 max-w-lg">
-          <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Mode</label>
-          <div className="flex gap-4 text-sm">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="radio"
-                name="rc-mode"
-                value="api"
-                checked={rc.mode === 'api'}
-                onChange={() => updateField('mode', 'api')}
-              />
-              API (supports message updates)
-            </label>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="radio"
-                name="rc-mode"
-                value="webhook"
-                checked={rc.mode === 'webhook'}
-                onChange={() => updateField('mode', 'webhook')}
-              />
-              Webhook (simple)
-            </label>
-          </div>
-        </div>
-
         <div className="grid gap-3 max-w-lg">
-          {rc.mode === 'webhook' ? (
-            <div className="space-y-1">
-              <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Webhook URL</label>
-              <input
-                type="url"
-                placeholder="https://your-rocketchat.com/hooks/..."
-                value={rc.webhookUrl}
-                onChange={(e) => updateField('webhookUrl', e.target.value)}
-                className={inputCls}
-              />
-            </div>
-          ) : (
-            <>
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">RocketChat URL</label>
-                <input
-                  type="url"
-                  placeholder="https://chat.example.com"
-                  value={rc.url}
-                  onChange={(e) => updateField('url', e.target.value)}
-                  className={inputCls}
-                />
-                <p className="text-xs text-gray-500">Base URL — the route appends <code>/api/v1/chat.postMessage</code>.</p>
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Auth Token (X-Auth-Token)</label>
-                <input
-                  type="password"
-                  placeholder={rc.authTokenSet ? '•••••••• (leave blank to keep current)' : 'tSrhyUc8qOG7_...'}
-                  value={rc.authToken}
-                  onChange={(e) => updateField('authToken', e.target.value)}
-                  className={inputCls}
-                  autoComplete="new-password"
-                />
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">User ID (X-User-Id)</label>
-                <input
-                  type="text"
-                  placeholder="ZyDJx8fGTXaN2JGse"
-                  value={rc.userId}
-                  onChange={(e) => updateField('userId', e.target.value)}
-                  className={inputCls}
-                />
-              </div>
-              <div className="space-y-1">
-                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Channel</label>
-                <input
-                  type="text"
-                  placeholder="event-cando-automation"
-                  value={rc.channel}
-                  onChange={(e) => updateField('channel', e.target.value)}
-                  className={inputCls}
-                />
-              </div>
-            </>
-          )}
+          <div className="space-y-1">
+            <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Webhook URL</label>
+            <input
+              type="url"
+              placeholder="https://chat.example.com/hooks/<hookId>/<secret>"
+              value={rc.webhookUrl}
+              onChange={(e) => updateField('webhookUrl', e.target.value)}
+              className={inputCls}
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <p className="text-xs text-gray-500">
+              In RocketChat: <em>Administration → Workspace → Integrations → New → Incoming</em>.
+              Create the integration, then copy the URL labeled <strong>Webhook URL</strong> from
+              that page (it looks like <code>https://your-chat.example/hooks/&lt;id&gt;/&lt;secret&gt;</code>)
+              and paste it here.
+            </p>
+          </div>
         </div>
 
         <div className="grid gap-3 max-w-lg pt-2 border-t border-gray-200 dark:border-gray-700">
@@ -958,8 +991,8 @@ function NotificationSettings() {
           <button
             type="button"
             onClick={handleTest}
-            disabled={testing}
-            title="Sends a test message using the values currently in the form"
+            disabled={testing || !rc.webhookUrl}
+            title={!rc.webhookUrl ? 'Enter the webhook URL first' : 'Sends a test message using the values currently in the form'}
             className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
           >
             {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}

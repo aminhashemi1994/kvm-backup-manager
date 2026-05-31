@@ -63,13 +63,25 @@ router.post('/', async (req, res, next) => {
 
     // Test connection before adding
     const healthResult = await agentService.healthCheck(req.body.url);
-    
+
+    // Default concurrency comes from system-wide settings (set in
+    // Settings → General). The user can still override per host on
+    // creation by sending maxConcurrentBackups in the body.
+    let systemDefault = 20;
+    try {
+      const { loadSettings } = require('./settings');
+      const sys = await loadSettings();
+      if (Number.isFinite(sys?.defaultMaxConcurrentBackups)) {
+        systemDefault = sys.defaultMaxConcurrentBackups;
+      }
+    } catch (_) { /* fall back to literal default */ }
+
     const newHost = {
       id: uuidv4(),
       name: req.body.name,
       url: req.body.url,
       description: req.body.description || '',
-      maxConcurrentBackups: req.body.maxConcurrentBackups || 15, // Default to 15
+      maxConcurrentBackups: req.body.maxConcurrentBackups || systemDefault,
       status: healthResult.success ? 'online' : 'offline',
       lastHealthCheck: new Date().toISOString(),
       hypervisorCount: 0,
@@ -179,7 +191,7 @@ router.get('/:id/concurrent-config', async (req, res, next) => {
       success: true,
       data: {
         backupHostId: host.id,
-        maxConcurrentBackups: host.maxConcurrentBackups || 15,
+        maxConcurrentBackups: host.maxConcurrentBackups || 20,
         updatedAt: host.updatedAt || null,
       },
     });
