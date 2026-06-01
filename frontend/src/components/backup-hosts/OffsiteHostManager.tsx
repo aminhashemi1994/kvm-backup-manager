@@ -13,6 +13,7 @@ import { offsiteHostsApi, metricsApi, storagePoolsApi } from '@/services/api'
 import { toast } from 'sonner'
 import { getStatusColor } from '@/lib/utils'
 import { useInitOffsiteHost } from '@/hooks/useInit'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 interface OffsiteHostManagerProps {
   backupHostId: string
@@ -35,6 +36,26 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
   const { data: offsiteHosts, isLoading } = useOffsiteHostsByBackupHost(backupHostId)
   const deleteHost = useDeleteOffsiteHost()
   const testHost = useTestOffsiteHost()
+  const confirm = useConfirm()
+
+  const handleDeleteOffsite = async (id: string, name: string) => {
+    const ok = await confirm({
+      title: 'Delete offsite host?',
+      description: `Are you sure you want to delete the offsite host "${name}"?`,
+      confirmText: 'Delete',
+      variant: 'danger',
+    })
+    if (ok) deleteHost.mutate(id)
+  }
+
+  const handleInitOffsite = async (id: string, name: string) => {
+    const ok = await confirm({
+      title: 'Initialize offsite host?',
+      description: `Install the required dependencies on "${name}".`,
+      confirmText: 'Initialize',
+    })
+    if (ok) initOffsiteHost.mutate(id)
+  }
 
   // Fetch offsite metrics
   const { data: offsiteMetrics } = useQuery({
@@ -173,11 +194,7 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
                             <Button
                               variant="ghost"
                               size="sm"
-                              onClick={() => {
-                                if (confirm(`Initialize "${host.name}" with dependencies?`)) {
-                                  initOffsiteHost.mutate(host.id)
-                                }
-                              }}
+                              onClick={() => handleInitOffsite(host.id, host.name)}
                               disabled={initOffsiteHost.isPending}
                               title="Initialize with dependencies"
                             >
@@ -195,7 +212,7 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
                             <Button
                               variant="ghost"
                               size="sm"
-                              onClick={() => deleteHost.mutate(host.id)}
+                              onClick={() => handleDeleteOffsite(host.id, host.name)}
                               disabled={deleteHost.isPending}
                             >
                               <Trash2 className="h-4 w-4 text-red-500" />

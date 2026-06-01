@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils'
 import { useTheme } from '@/contexts/ThemeContext'
 import { notificationsApi, settingsApi } from '@/services/api'
 import { toast } from 'sonner'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 const settingsTabs = [
   { name: 'General', to: '/settings', icon: Settings, end: true },
@@ -323,6 +324,7 @@ function UsersSettings() {
   const [formData, setFormData] = useState({ username: '', password: '', role: 'user', email: '', fullName: '' })
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const confirm = useConfirm()
 
   const apiBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000/api'
   const headers = { Authorization: `Bearer ${localStorage.getItem('authToken')}`, 'Content-Type': 'application/json' }
@@ -402,7 +404,14 @@ function UsersSettings() {
   }
 
   const handleDelete = async (userId: string, username: string) => {
-    if (!confirm(`Are you sure you want to delete user "${username}"? This cannot be undone.`)) return
+    const ok = await confirm({
+      title: 'Delete user?',
+      description: `Are you sure you want to delete the user "${username}"? This cannot be undone.`,
+      confirmText: 'Delete',
+      cancelText: 'Cancel',
+      variant: 'danger',
+    })
+    if (!ok) return
     try {
       const res = await fetch(`${apiBase}/users/${userId}`, { method: 'DELETE', headers })
       const data = await res.json()

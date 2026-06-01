@@ -21,6 +21,7 @@ class SchedulerService {
     this.customDaysTasks = new Map(); // For custom-days schedules
     this.io = null;
     this.healthCheckInterval = null;
+    this._retryTimers = new Set(); // pending auto-retry setTimeout handles
   }
 
   async initialize(io) {
@@ -244,6 +245,240 @@ class SchedulerService {
       }
     } catch (error) {
       console.error('Error retrying skipped backups:', error);
+    }
+  }
+
+  /**
+   * Handle a failed scheduled backup: if the schedule still has retry
+   * attempts left, schedule another attempt after the configured delay.
+   * The schedule itself is never disabled or removed — it keeps its
+   * normal cron cadence regardless of how many retries fail.
+   *
+   * IMPORTANT: This retries the SAME job (updates its status to 'running' again),
+   * rather than creating a new job record.
+   *
+   * Called from the job-update handler when a scheduled job ends in
+   * 'failed'. `failedJob` is the controller-side job record that just
+   * failed (it carries attemptNumber / maxAttempts / retryDelayMinutes /
+   * scheduleId).
+   */
+  async handleScheduledBackupFailure(failedJob) {
+    try {
+      if (!failedJob || !failedJob.scheduled || !failedJob.scheduleId) return;
+
+      const attempt = failedJob.attemptNumber || 1;
+      const maxAttempts = failedJob.maxAttempts || 1;
+
+      if (attempt >= maxAttempts) {
+        console.log(`[Scheduler] ${failedJob.vmName}: all ${maxAttempts} attempt(s) exhausted; giving up until next scheduled run`);
+        return;
+      }
+
+      const schedules = await getBackupSchedules();
+      const schedule = schedules.find(s => s.id === failedJob.scheduleId);
+      if (!schedule) {
+        console.log(`[Scheduler] Cannot retry: schedule ${failedJob.scheduleId} no longer exists`);
+        return;
+      }
+
+      const delayMinutes = typeof failedJob.retryDelayMinutes === 'number'
+        ? failedJob.retryDelayMinutes
+        : (typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5);
+      const delayMs = Math.max(0, delayMinutes) * 60 * 1000;
+      const nextAttempt = attempt + 1;
+
+      console.log(`[Scheduler] ${failedJob.vmName}: attempt ${attempt}/${maxAttempts} failed; scheduling attempt ${nextAttempt} in ${delayMinutes} minute(s)`);
+
+      // Track the timer so shutdown can clear it.
+      const timer = setTimeout(async () => {
+        this._retryTimers.delete(timer);
+        
+        try {
+          // Re-read the schedule at fire time in case it was edited/deleted
+          const freshSchedules = await getBackupSchedules();
+          const fresh = freshSchedules.find(s => s.id === failedJob.scheduleId);
+          if (!fresh) {
+            console.log(`[Scheduler] Retry aborted: schedule ${failedJob.scheduleId} was removed during the delay`);
+            // Mark job as failed since we can't retry
+            const jobs = await getBackupJobs();
+            const job = jobs.find(j => j.id === failedJob.id);
+            if (job && job.status === 'retrying') {
+              job.status = 'failed';
+              job.error = (job.error || '') + ' (retry aborted: schedule was deleted)';
+              job.endTime = new Date().toISOString();
+              await saveBackupJobs(jobs);
+            }
+            return;
+          }
+          
+          // Retry the SAME job (don't create a new one)
+          await this.retryExistingJob(failedJob.id, fresh, nextAttempt, maxAttempts);
+        } catch (err) {
+          console.error(`[Scheduler] Retry execution failed for ${failedJob.vmName}:`, err.message);
+        }
+      }, delayMs);
+
+      if (timer.unref) timer.unref();
+      this._retryTimers.add(timer);
+    } catch (err) {
+      console.error('[Scheduler] handleScheduledBackupFailure error:', err.message);
+    }
+  }
+
+  /**
+   * Retry an existing job (same job ID, just re-trigger the backup on the agent)
+   */
+  async retryExistingJob(jobId, schedule, attemptNumber, maxAttempts) {
+    try {
+      const jobs = await getBackupJobs();
+      const job = jobs.find(j => j.id === jobId);
+      
+      if (!job) {
+        console.error(`[Scheduler] Cannot retry: job ${jobId} not found`);
+        return;
+      }
+
+      const hosts = await getBackupHosts();
+      const hypervisors = await getHypervisors();
+      const vms = await getVirtualMachines();
+
+      const vm = vms.find(v => v.id === schedule.vmId);
+      if (!vm) {
+        console.error(`[Scheduler] Cannot retry: VM ${schedule.vmId} not found`);
+        job.status = 'failed';
+        job.error = (job.error || '') + ' (retry failed: VM not found)';
+        job.endTime = new Date().toISOString();
+        await saveBackupJobs(jobs);
+        return;
+      }
+
+      const hypervisor = hypervisors.find(h => h.id === vm.hypervisorId);
+      if (!hypervisor) {
+        console.error(`[Scheduler] Cannot retry: Hypervisor ${vm.hypervisorId} not found`);
+        job.status = 'failed';
+        job.error = (job.error || '') + ' (retry failed: Hypervisor not found)';
+        job.endTime = new Date().toISOString();
+        await saveBackupJobs(jobs);
+        return;
+      }
+
+      const host = hosts.find(h => h.id === vm.backupHostId);
+      if (!host) {
+        console.error(`[Scheduler] Cannot retry: Backup host ${vm.backupHostId} not found`);
+        job.status = 'failed';
+        job.error = (job.error || '') + ' (retry failed: Backup host not found)';
+        job.endTime = new Date().toISOString();
+        await saveBackupJobs(jobs);
+        return;
+      }
+
+      if (host.status !== 'online') {
+        console.error(`[Scheduler] Cannot retry: Backup host ${host.name} is offline`);
+        job.status = 'failed';
+        job.error = (job.error || '') + ' (retry failed: Backup host offline)';
+        job.endTime = new Date().toISOString();
+        await saveBackupJobs(jobs);
+        return;
+      }
+
+      // Update job for retry attempt
+      job.attemptNumber = attemptNumber;
+      job.status = 'running';
+      job.progress = 0;
+      job.progressText = `Retrying (attempt ${attemptNumber}/${maxAttempts})...`;
+      job.error = null; // Clear previous error
+      job.exitCode = null;
+      // Don't update startTime - keep original
+      // Don't set endTime - job is running again
+      job.endTime = null;
+
+      await saveBackupJobs(jobs);
+      await appendLog(jobId, `\n=== RETRY ATTEMPT ${attemptNumber}/${maxAttempts} ===`);
+      await appendLog(jobId, `Retrying backup after ${job.retryDelayMinutes || 5} minute delay...`);
+
+      // Emit event
+      if (this.io) {
+        this.io.emit('backup-started', job);
+      }
+
+      // Resolve storage pool
+      const pools = await getStoragePools();
+      const pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
+      if (!pool) {
+        throw new Error('Storage pool not found on backup host');
+      }
+
+      // Resolve offsite hosts
+      let offsiteHostIps = [];
+      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
+        ? schedule.offsiteHostIds
+        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
+      if (offsiteIds.length > 0) {
+        const allOffsiteHosts = await getOffsiteHosts();
+        offsiteHostIps = offsiteIds
+          .map(id => allOffsiteHosts.find(h => h.id === id))
+          .filter(Boolean)
+          .map(h => h.ip);
+      }
+
+      const agentScheduleType = (() => {
+        switch (schedule.scheduleType) {
+          case 'once':
+          case 'monthly':
+          case 'daily':
+          case 'weekly': return schedule.scheduleType;
+          case 'interval':
+          case 'cron': return 'daily';
+          case 'custom-days': return 'custom';
+          default: return 'once';
+        }
+      })();
+
+      let url = host.url;
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = 'http://' + url;
+      }
+
+      // Trigger backup on agent with SAME job ID
+      await agentService.triggerBackup(url, {
+        jobId: job.id, // SAME job ID!
+        vmName: vm.name,
+        hypervisorId: hypervisor.id,
+        hypervisorIp: hypervisor.ip,
+        scheduleType: agentScheduleType,
+        storagePoolId: pool.id,
+        storagePoolPath: pool.path,
+        retention: schedule.retention || 7,
+        keepArchive: schedule.keepArchive || 2,
+        compression: schedule.compression || 2,
+        noCompression: schedule.noCompression || false,
+        noVerify: schedule.noVerify || false,
+        offsiteHosts: offsiteHostIps,
+        verbose: schedule.verbose || false,
+        method: job.method, // Use same method as original
+        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron'
+          ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
+          : {}),
+      });
+
+      console.log(`[Scheduler] ✓ Retry triggered for ${vm.name} (attempt ${attemptNumber}/${maxAttempts})`);
+    } catch (err) {
+      console.error(`[Scheduler] Failed to retry job ${jobId}:`, err.message);
+      
+      // Mark job as failed
+      const jobs = await getBackupJobs();
+      const job = jobs.find(j => j.id === jobId);
+      if (job) {
+        job.status = 'failed';
+        job.error = (job.error || '') + ` (retry trigger failed: ${err.message})`;
+        job.endTime = new Date().toISOString();
+        await saveBackupJobs(jobs);
+        await appendLog(jobId, `ERROR: Failed to trigger retry: ${err.message}`);
+        
+        if (this.io) {
+          this.io.emit('backup-error', job);
+        }
+      }
     }
   }
 
@@ -689,6 +924,13 @@ class SchedulerService {
         exitCode: null,
         error: null,
         scheduled: true,
+        // Retry tracking. attemptNumber is 1 for the first run. When a
+        // scheduled backup fails, the job-completion handler schedules
+        // another attempt up to schedule.retryCount, with this job's
+        // config carried forward via these fields.
+        attemptNumber: replayMeta && replayMeta.attemptNumber ? replayMeta.attemptNumber : 1,
+        maxAttempts: (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3) + 1,
+        retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
         ...(replayMeta ? {
           replay: true,
           originallyScheduledAt: replayMeta.scheduledAt
@@ -858,6 +1100,14 @@ class SchedulerService {
       }
 
       this.io.emit('backup-error', { jobId, error: error.message });
+
+      // The trigger itself failed (agent unreachable, bad payload, etc.).
+      // Apply the same auto-retry policy as an agent-reported failure.
+      if (job) {
+        this.handleScheduledBackupFailure(job).catch(err => {
+          console.error('[Scheduler] Failed to schedule auto-retry after trigger error:', err.message);
+        });
+      }
     }
   }
 
@@ -1118,6 +1368,11 @@ class SchedulerService {
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
     }
+    // Cancel any pending auto-retry timers
+    for (const t of this._retryTimers) {
+      clearTimeout(t);
+    }
+    this._retryTimers.clear();
     this.tasks.forEach(task => task.stop());
     this.tasks.clear();
     this.customDaysTasks.forEach(tasks => tasks.forEach(t => t.stop()));

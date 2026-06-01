@@ -68,6 +68,16 @@ export default function JobStatusBadge({
       }
     }
 
+    // Retrying state
+    if (status === 'retrying') {
+      return {
+        label: 'Retrying',
+        icon: RefreshCw,
+        color: 'bg-purple-100 text-purple-800 border-purple-200',
+        pulse: true,
+      }
+    }
+
     // Terminal states
     switch (status) {
       case 'completed':

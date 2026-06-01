@@ -9,6 +9,8 @@ import { useRestoreJob, useRestoreJobLogs, useKillRestoreJob } from '@/hooks/use
 import { useJobSubscription } from '@/hooks/useSocket'
 import { getStatusColor } from '@/lib/utils'
 import AnsiToHtml from 'ansi-to-html'
+import { toast } from 'sonner'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 interface LiveLogViewerProps {
   jobId: string
@@ -34,6 +36,7 @@ export default function LiveLogViewer({ jobId, jobType = 'backup', onClose }: Li
   const staticLogs = jobType === 'backup' ? backupLogs : restoreLogs
   const refetchLogs = jobType === 'backup' ? refetchBackupLogs : refetchRestoreLogs
   const killMutation = jobType === 'backup' ? killBackupMutation : killRestoreMutation
+  const confirm = useConfirm()
 
   // Listen for progress bar updates
   useEffect(() => {
@@ -124,9 +127,15 @@ export default function LiveLogViewer({ jobId, jobType = 'backup', onClose }: Li
 
   const handleKill = async () => {
     const action = jobType === 'backup' ? 'backup' : 'restore'
-    if (confirm(`Are you sure you want to cancel this ${action} job? This will terminate the running process.`)) {
-      await killMutation.mutateAsync(jobId)
-    }
+    const ok = await confirm({
+      title: `Cancel ${action}?`,
+      description: `This will terminate the running ${action} job. This action cannot be undone.`,
+      confirmText: `Cancel ${action}`,
+      cancelText: 'Keep running',
+      variant: 'danger',
+    })
+    if (!ok) return
+    await killMutation.mutateAsync(jobId)
   }
 
   const isRunning = status === 'running' || job?.status === 'running' || job?.status === 'queued'

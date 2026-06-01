@@ -27,6 +27,7 @@ import { useHypervisorsByBackupHost, useDeleteBackupHost, useHealthCheckBackupHo
 import { useInitBackupHost } from '@/hooks/useInit'
 import { toast } from 'sonner'
 import MetricsCard from '@/components/metrics/MetricsCard'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 interface BackupHostCardProps {
   backupHost: BackupHost
@@ -45,11 +46,16 @@ export default function BackupHostCard({ backupHost }: BackupHostCardProps) {
   const deleteHost = useDeleteBackupHost()
   const healthCheck = useHealthCheckBackupHost()
   const initHost = useInitBackupHost()
+  const confirm = useConfirm()
 
-  const handleDelete = () => {
-    if (confirm(`Are you sure you want to delete "${backupHost.name}" and all its hypervisors?`)) {
-      deleteHost.mutate(backupHost.id)
-    }
+  const handleDelete = async () => {
+    const ok = await confirm({
+      title: 'Delete backup host?',
+      description: `This will delete "${backupHost.name}" and all of its hypervisors from the panel.`,
+      confirmText: 'Delete',
+      variant: 'danger',
+    })
+    if (ok) deleteHost.mutate(backupHost.id)
   }
 
   const handleHealthCheck = () => {
@@ -71,7 +77,13 @@ export default function BackupHostCard({ backupHost }: BackupHostCardProps) {
   }
 
   const handleInit = async () => {
-    if (confirm(`Initialize "${backupHost.name}" with required dependencies?\n\nThis will install:\n- virtnbdbackup\n- rsync\n- Other required tools`)) {
+    const ok = await confirm({
+      title: 'Initialize backup host?',
+      description: `Install the required dependencies on "${backupHost.name}".`,
+      details: ['virtnbdbackup', 'rsync', 'Other required tools'],
+      confirmText: 'Initialize',
+    })
+    if (ok) {
       try {
         setIsInitializing(true)
         const result = await initHost.mutateAsync(backupHost.id)

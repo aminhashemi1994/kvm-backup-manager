@@ -26,6 +26,7 @@ export default function JobProgressBar({
     if (status === 'completed') return 'bg-green-500'
     if (status === 'failed') return 'bg-red-500'
     if (status === 'skipped') return 'bg-orange-400'
+    if (status === 'retrying') return 'bg-gradient-to-r from-purple-500 to-purple-600'
 
     switch (phase) {
       case 'rsync':
@@ -52,6 +53,7 @@ export default function JobProgressBar({
   // stuck. Showing the shimmer signals that work is happening.
   const isIndeterminate =
     status === 'queued' ||
+    status === 'retrying' ||
     status === 'initializing' ||
     (status === 'running' && (!progress || progress <= 0))
 

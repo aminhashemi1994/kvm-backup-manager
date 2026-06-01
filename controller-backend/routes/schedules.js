@@ -180,6 +180,13 @@ router.post('/', requireUser, async (req, res, next) => {
       missedRunGracePeriodMinutes: typeof req.body.missedRunGracePeriodMinutes === 'number'
         ? req.body.missedRunGracePeriodMinutes
         : 360,
+
+      // Auto-retry on failure (per-schedule). When a scheduled backup
+      // fails, the scheduler retries up to `retryCount` times, waiting
+      // `retryDelayMinutes` between attempts. The schedule itself stays
+      // intact regardless of the outcome.
+      retryCount: typeof req.body.retryCount === 'number' ? req.body.retryCount : 3,
+      retryDelayMinutes: typeof req.body.retryDelayMinutes === 'number' ? req.body.retryDelayMinutes : 5,
       
       // Type-specific fields
       ...(req.body.scheduleType === 'daily' && {
@@ -330,6 +337,14 @@ router.put('/:id', requireUser, async (req, res, next) => {
       missedRunGracePeriodMinutes: typeof req.body.missedRunGracePeriodMinutes === 'number'
         ? req.body.missedRunGracePeriodMinutes
         : (existingSchedule.missedRunGracePeriodMinutes ?? 360),
+
+      // Auto-retry on failure (per-schedule)
+      retryCount: typeof req.body.retryCount === 'number'
+        ? req.body.retryCount
+        : (existingSchedule.retryCount ?? 3),
+      retryDelayMinutes: typeof req.body.retryDelayMinutes === 'number'
+        ? req.body.retryDelayMinutes
+        : (existingSchedule.retryDelayMinutes ?? 5),
       
       // Type-specific updates
       ...(scheduleType === 'daily' && {

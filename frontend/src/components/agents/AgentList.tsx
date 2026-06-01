@@ -8,17 +8,23 @@ import AddAgentDialog from './AddAgentDialog'
 import { useAgents, useDeleteAgent, useHealthCheckAgent } from '@/hooks/useAgents'
 import { formatDate } from '@/lib/utils'
 import { toast } from 'sonner'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 export default function AgentList() {
   const [showAddDialog, setShowAddDialog] = useState(false)
   const { data: agents, isLoading } = useAgents()
   const deleteAgent = useDeleteAgent()
   const healthCheck = useHealthCheckAgent()
+  const confirm = useConfirm()
 
   const handleDelete = async (id: string, name: string) => {
-    if (confirm(`Are you sure you want to delete agent "${name}"?`)) {
-      await deleteAgent.mutateAsync(id)
-    }
+    const ok = await confirm({
+      title: 'Delete agent?',
+      description: `Are you sure you want to delete the agent "${name}"?`,
+      confirmText: 'Delete',
+      variant: 'danger',
+    })
+    if (ok) await deleteAgent.mutateAsync(id)
   }
 
   const handleHealthCheck = async (id: string) => {

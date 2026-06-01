@@ -12,6 +12,7 @@ import JobStatusBadge from './JobStatusBadge'
 import JobProgressBar from './JobProgressBar'
 import socketService from '@/services/socket'
 import { useQueryClient } from '@tanstack/react-query'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 export default function ActiveBackups() {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
@@ -21,6 +22,7 @@ export default function ActiveBackups() {
   const { data: activeRestores, isLoading: isLoadingRestores } = useActiveRestores()
   const killBackupMutation = useKillBackupJob()
   const killRestoreMutation = useKillRestoreJob()
+  const confirm = useConfirm()
 
   // Combine backups and restores into a single list
   const activeJobs = [
@@ -141,7 +143,14 @@ export default function ActiveBackups() {
 
   const handleKill = async (jobId: string, vmName: string, jobType: 'backup' | 'restore') => {
     const action = jobType === 'backup' ? 'backup' : 'restore'
-    if (confirm(`Are you sure you want to cancel the ${action} for ${vmName}?`)) {
+    const ok = await confirm({
+      title: `Cancel ${action}?`,
+      description: `This will terminate the running ${action} for "${vmName}".`,
+      confirmText: `Cancel ${action}`,
+      cancelText: 'Keep running',
+      variant: 'danger',
+    })
+    if (ok) {
       if (jobType === 'backup') {
         await killBackupMutation.mutateAsync(jobId)
       } else {
