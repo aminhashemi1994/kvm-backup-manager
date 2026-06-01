@@ -14,6 +14,7 @@ import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { useQuery } from '@tanstack/react-query'
 import { storagePoolsApi, hypervisorsApi } from '@/services/api'
+import { toast } from 'sonner'
 
 interface ScheduleFormProps {
   schedule?: any
@@ -65,8 +66,12 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     enabled: true,
     
     // Missed-run policy (Item 1)
-    missedRunPolicy: 'immediate' as 'immediate' | 'most-recent' | 'skip',
-    missedRunGracePeriodMinutes: 360,
+    missedRunPolicy: schedule?.missedRunPolicy || 'immediate' as 'immediate' | 'most-recent' | 'skip',
+    missedRunGracePeriodMinutes: typeof schedule?.missedRunGracePeriodMinutes === 'number' ? schedule.missedRunGracePeriodMinutes : 360,
+
+    // Auto-retry on failure
+    retryCount: typeof schedule?.retryCount === 'number' ? schedule.retryCount : 3,
+    retryDelayMinutes: typeof schedule?.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
     
     // Offsite - Changed to support multiple hosts
     syncToOffsite: false,
@@ -198,6 +203,8 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         missedRunPolicy: schedule.missedRunPolicy || 'immediate',
         missedRunGracePeriodMinutes: typeof schedule.missedRunGracePeriodMinutes === 'number'
           ? schedule.missedRunGracePeriodMinutes : 360,
+        retryCount: typeof schedule.retryCount === 'number' ? schedule.retryCount : 3,
+        retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
         syncToOffsite: schedule.syncToOffsite || false,
         offsiteHostIds: schedule.offsiteHostIds || (schedule.offsiteHostId ? [schedule.offsiteHostId] : []),
       })
@@ -272,18 +279,18 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     
     // Validation
     if (formData.scheduleType === 'weekly' && formData.daysOfWeek.length === 0) {
-      alert('Please select at least one day of the week')
+      toast.error('Please select at least one day of the week')
       return
     }
     
     if (formData.scheduleType === 'custom-days' && formData.customDates.length === 0) {
-      alert('Please select at least one date on the calendar')
+      toast.error('Please select at least one date on the calendar')
       return
     }
 
     // For new schedules, require at least one VM selected
     if (!isEditing && selectedVmIds.size === 0) {
-      alert('Please select at least one VM')
+      toast.error('Please select at least one VM')
       return
     }
 
@@ -299,6 +306,8 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         enabled: formData.enabled,
         missedRunPolicy: formData.missedRunPolicy,
         missedRunGracePeriodMinutes: formData.missedRunGracePeriodMinutes,
+        retryCount: formData.retryCount,
+        retryDelayMinutes: formData.retryDelayMinutes,
         syncToOffsite: formData.syncToOffsite,
         offsiteHostIds: formData.syncToOffsite && formData.offsiteHostIds.length > 0 ? formData.offsiteHostIds : undefined,
       }
@@ -635,6 +644,52 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                 <option value="monthly">Monthly</option>
                 <option value="cron">Cron Expression</option>
               </Select>
+            </div>
+
+            {/* Retry Settings */}
+            <div className="space-y-4 p-4 border rounded-md bg-blue-50 dark:bg-blue-900/20">
+              <h3 className="font-medium text-sm flex items-center gap-2">
+                <AlertCircle className="h-4 w-4" />
+                Backup Retry Settings
+              </h3>
+              <p className="text-xs text-gray-600 dark:text-gray-400">
+                Configure automatic retry behavior when a scheduled backup fails. The schedule will remain active regardless of retry outcomes.
+              </p>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="retryCount">Retry Attempts *</Label>
+                  <Input
+                    id="retryCount"
+                    type="number"
+                    min="0"
+                    max="10"
+                    value={formData.retryCount}
+                    onChange={(e) => setFormData({ ...formData, retryCount: parseInt(e.target.value) || 0 })}
+                    required
+                  />
+                  <p className="text-xs text-gray-500">
+                    Number of retry attempts (0-10, default: 3)
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="retryDelayMinutes">Retry Delay (minutes) *</Label>
+                  <Input
+                    id="retryDelayMinutes"
+                    type="number"
+                    min="1"
+                    max="1440"
+                    value={formData.retryDelayMinutes}
+                    onChange={(e) => setFormData({ ...formData, retryDelayMinutes: parseInt(e.target.value) || 5 })}
+                    required
+                  />
+                  <p className="text-xs text-gray-500">
+                    Wait time between retries (1-1440 minutes, default: 5)
+                  </p>
+                </div>
+              </div>
+              <div className="text-xs text-gray-600 dark:text-gray-400 bg-white dark:bg-gray-800 p-3 rounded border">
+                <strong>Example:</strong> With 3 retry attempts and 5 minute delay, a failed backup will be retried up to 3 times with 5 minutes between each attempt. After all retries are exhausted, the schedule continues normally for the next scheduled run.
+              </div>
             </div>
 
             {/* Daily Schedule */}
@@ -1018,6 +1073,50 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                 <p className="text-xs text-gray-500">
                   Missed runs older than this many minutes will not be replayed (0 = no limit, default 360 = 6 hours)
                 </p>
+              </div>
+            </div>
+
+            {/* Auto-retry on failure */}
+            <div className="space-y-4 p-4 border rounded-md bg-amber-50 dark:bg-amber-900/10 dark:border-amber-900/30">
+              <h3 className="font-medium text-sm flex items-center">
+                <span className="mr-2">♻️</span>
+                Retry on Failure
+              </h3>
+              <p className="text-xs text-gray-600 dark:text-gray-400">
+                If a backup from this schedule fails, automatically retry it. The schedule itself
+                always stays active regardless of how many retries fail.
+              </p>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label htmlFor="retryCount">Retry attempts</Label>
+                  <Input
+                    id="retryCount"
+                    type="number"
+                    min="0"
+                    max="10"
+                    value={formData.retryCount}
+                    onChange={(e) => setFormData({ ...formData, retryCount: Math.max(0, Math.min(10, parseInt(e.target.value) || 0)) })}
+                  />
+                  <p className="text-xs text-gray-500">
+                    Number of retries after the first failure (default 3, 0 = never retry).
+                  </p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="retryDelayMinutes">Delay between retries (minutes)</Label>
+                  <Input
+                    id="retryDelayMinutes"
+                    type="number"
+                    min="0"
+                    max="1440"
+                    value={formData.retryDelayMinutes}
+                    onChange={(e) => setFormData({ ...formData, retryDelayMinutes: Math.max(0, Math.min(1440, parseInt(e.target.value) || 0)) })}
+                  />
+                  <p className="text-xs text-gray-500">
+                    Wait this long before each retry (default 5 minutes).
+                  </p>
+                </div>
               </div>
             </div>
 

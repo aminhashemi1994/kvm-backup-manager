@@ -12,6 +12,7 @@ import JobProgressBar from './JobProgressBar'
 import socketService from '@/services/socket'
 import { useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router-dom'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 export default function BackupHistory() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -27,6 +28,7 @@ export default function BackupHistory() {
   
   const forceRemoveJob = useForceRemoveJob()
   const retryBackup = useRetryBackup()
+  const confirm = useConfirm()
 
   // Update URL when filter changes
   useEffect(() => {
@@ -96,15 +98,27 @@ export default function BackupHistory() {
   }, [queryClient, statusFilter])
 
   const handleForceRemove = async (jobId: string, vmName: string) => {
-    if (confirm(`Are you sure you want to force remove the backup job for "${vmName}"?\n\nThis will:\n- Remove the job from history\n- Attempt to kill the process on the agent\n- Cannot be undone`)) {
-      await forceRemoveJob.mutateAsync(jobId)
-    }
+    const ok = await confirm({
+      title: 'Force remove job?',
+      description: `Force remove the backup job for "${vmName}".`,
+      details: [
+        'Removes the job from history',
+        'Attempts to kill the process on the agent',
+        'Cannot be undone',
+      ],
+      confirmText: 'Force remove',
+      variant: 'danger',
+    })
+    if (ok) await forceRemoveJob.mutateAsync(jobId)
   }
 
   const handleRetry = async (jobId: string, vmName: string) => {
-    if (confirm(`Retry backup for "${vmName}"?\n\nThis will create a new backup job with the same configuration.`)) {
-      await retryBackup.mutateAsync(jobId)
-    }
+    const ok = await confirm({
+      title: 'Retry backup?',
+      description: `Create a new backup job for "${vmName}" using the same configuration.`,
+      confirmText: 'Retry',
+    })
+    if (ok) await retryBackup.mutateAsync(jobId)
   }
 
   return (

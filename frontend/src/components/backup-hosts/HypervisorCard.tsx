@@ -34,6 +34,8 @@ import TriggerBackupDialog from '../backups/TriggerBackupDialog'
 import FixBackupDialog from '../backups/FixBackupDialog'
 import EditHypervisorDialog from './EditHypervisorDialog'
 import BulkScheduleDialog from '../schedules/BulkScheduleDialog'
+import { toast } from 'sonner'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 interface HypervisorCardProps {
   hypervisor: Hypervisor
@@ -191,11 +193,16 @@ export default function HypervisorCard({ hypervisor, backupHostId }: HypervisorC
   const { data: vms, isLoading, refetch } = useVMsByHypervisor(hypervisor.id)
   const refreshVMs = useRefreshVMs()
   const deleteHypervisor = useDeleteHypervisor()
+  const confirm = useConfirm()
 
-  const handleDelete = () => {
-    if (confirm(`Are you sure you want to delete hypervisor "${hypervisor.name}"?`)) {
-      deleteHypervisor.mutate(hypervisor.id)
-    }
+  const handleDelete = async () => {
+    const ok = await confirm({
+      title: 'Delete hypervisor?',
+      description: `Are you sure you want to delete the hypervisor "${hypervisor.name}"?`,
+      confirmText: 'Delete',
+      variant: 'danger',
+    })
+    if (ok) deleteHypervisor.mutate(hypervisor.id)
   }
 
   const handleRefresh = async () => {
@@ -249,7 +256,7 @@ export default function HypervisorCard({ hypervisor, backupHostId }: HypervisorC
 
   const handleBulkSchedule = () => {
     if (selectedVMsForSchedule.size === 0) {
-      alert('Please select at least one VM')
+      toast.error('Please select at least one VM')
       return
     }
     setShowBulkScheduleDialog(true)

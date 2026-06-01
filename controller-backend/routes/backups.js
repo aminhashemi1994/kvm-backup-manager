@@ -628,8 +628,28 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Job not found' });
     }
 
+    // Handle status updates
     if (status) {
-      job.status = status;
+      // For scheduled backups with retry capability, check if we should mark as "retrying" instead of "failed"
+      if (status === 'failed' && job.scheduled && job.scheduleId) {
+        const attempt = job.attemptNumber || 1;
+        const maxAttempts = job.maxAttempts || 1;
+        
+        // If we have retries remaining, mark as "retrying" instead of "failed"
+        if (attempt < maxAttempts) {
+          job.status = 'retrying';
+          job.retryScheduled = true;
+          console.log(`[Backups] Job ${job.id} marked as 'retrying' (attempt ${attempt}/${maxAttempts})`);
+        } else {
+          // All retries exhausted, mark as failed
+          job.status = 'failed';
+          job.retriesExhausted = true;
+          console.log(`[Backups] Job ${job.id} marked as 'failed' - all ${maxAttempts} attempts exhausted`);
+        }
+      } else {
+        job.status = status;
+      }
+      
       // Treat cancelled as failed
       if (status === 'cancelled') {
         job.status = 'failed';
@@ -641,15 +661,25 @@ router.post('/jobs/:id/update', async (req, res, next) => {
         }
       }
     }
+    
     if (exitCode !== undefined) job.exitCode = exitCode;
     if (error) job.error = error;
     if (failureReason) job.failureReason = failureReason;
     if (progress !== undefined) job.progress = progress;
     if (progressText !== undefined) job.progressText = progressText;
-    if (status === 'completed' || status === 'failed' || status === 'cancelled') {
+    
+    // Set end time for terminal states
+    if (status === 'completed' || status === 'cancelled' || 
+        (status === 'failed' && job.status === 'failed')) { // Only set endTime if actually failed (not retrying)
       job.endTime = new Date().toISOString();
       if (status === 'completed') {
         job.progress = 100;
+        // Mark if this was a successful retry
+        if (job.attemptNumber && job.attemptNumber > 1) {
+          job.wasRetried = true;
+          job.succeededOnAttempt = job.attemptNumber;
+          console.log(`[Backups] Job ${job.id} completed successfully on retry attempt ${job.attemptNumber}`);
+        }
       }
     }
 
@@ -675,12 +705,30 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       const duration = job.endTime && job.startTime 
         ? `${Math.round((new Date(job.endTime) - new Date(job.startTime)) / 1000 / 60)}m`
         : 'unknown';
-      rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration);
-    } else if (status === 'failed' || status === 'cancelled') {
+      
+      // Include retry information in notification
+      const retryInfo = job.wasRetried ? ` (succeeded on attempt ${job.succeededOnAttempt})` : '';
+      rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration + retryInfo);
+    } else if (job.status === 'failed' || status === 'cancelled') {
+      // Only emit backup-error if truly failed (not retrying)
       io.emit('backup-error', job);
       
       // Notify RocketChat
-      rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', job.error || 'Unknown error');
+      const retryInfo = job.retriesExhausted ? ' (all retries exhausted)' : '';
+      rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', (job.error || 'Unknown error') + retryInfo);
+    } else if (job.status === 'retrying') {
+      // Emit a special event for retrying status
+      io.emit('backup-retrying', job);
+    }
+
+    // Auto-retry scheduled backups that failed (not user-cancelled).
+    // The scheduler decides whether attempts remain and schedules the
+    // next one after the configured delay. The schedule stays intact
+    // regardless of the outcome.
+    if (status === 'failed' && job.scheduled && job.scheduleId && job.status === 'retrying') {
+      schedulerService.handleScheduledBackupFailure(job).catch(err => {
+        console.error('[Backups] Failed to schedule auto-retry:', err.message);
+      });
     }
 
     // A slot just freed up on this host — release any backups that were
@@ -688,7 +736,7 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     // step, jobs skipped during a burst would never re-queue: the
     // existing retry logic only fires when an agent transitions
     // offline → online, not when a regular slot frees up.
-    if (status === 'completed' || status === 'failed' || status === 'cancelled') {
+    if (status === 'completed' || job.status === 'failed' || status === 'cancelled') {
       schedulerService.releaseConcurrentSlotsOnHost(job.backupHostId).catch(err => {
         console.error('[Backups] Failed to release concurrent slots:', err.message);
       });

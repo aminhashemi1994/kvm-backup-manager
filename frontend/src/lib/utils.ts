@@ -80,6 +80,8 @@ export function getStatusColor(status: string): string {
     case 'in-progress':
     case 'queued':
       return 'text-blue-600 bg-blue-100'
+    case 'retrying':
+      return 'text-purple-600 bg-purple-100'
     case 'skipped':
       return 'text-orange-600 bg-orange-100'
     case 'pending':

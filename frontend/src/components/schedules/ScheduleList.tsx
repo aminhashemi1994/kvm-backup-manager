@@ -11,6 +11,7 @@ import {
 import ScheduleForm from './ScheduleForm'
 import BulkEditScheduleDialog from './BulkEditScheduleDialog'
 import { useSchedules, useDeleteSchedule, useToggleSchedule, useRunScheduleNow } from '@/hooks/useBackups'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 import { getStatusColor } from '@/lib/utils'
 import { toast } from 'sonner'
 
@@ -48,6 +49,7 @@ export default function ScheduleList() {
   const deleteSchedule = useDeleteSchedule()
   const toggleSchedule = useToggleSchedule()
   const runScheduleNow = useRunScheduleNow()
+  const confirm = useConfirm()
 
   // Build filter options from current schedules
   const filterOptions = useMemo(() => {
@@ -132,17 +134,24 @@ export default function ScheduleList() {
   const resetFilters = () => setFilters(initialFilters)
 
   const handleDelete = async (id: string, name: string) => {
-    if (confirm(`Are you sure you want to delete schedule "${name}"?`)) {
-      await deleteSchedule.mutateAsync(id)
-    }
+    const ok = await confirm({
+      title: 'Delete schedule?',
+      description: `Are you sure you want to delete the schedule "${name}"?`,
+      confirmText: 'Delete',
+      variant: 'danger',
+    })
+    if (ok) await deleteSchedule.mutateAsync(id)
   }
   const handleToggle = async (id: string) => { await toggleSchedule.mutateAsync(id) }
   const handleEdit = (schedule: any) => { setEditingSchedule(schedule); setShowForm(true) }
   const handleCloseForm = () => { setShowForm(false); setEditingSchedule(null) }
   const handleRunNow = async (id: string, name: string) => {
-    if (confirm(`Trigger schedule "${name}" right now? A new backup will start using this schedule's configuration.`)) {
-      await runScheduleNow.mutateAsync(id)
-    }
+    const ok = await confirm({
+      title: 'Run schedule now?',
+      description: `A new backup will start immediately for "${name}" using this schedule's configuration.`,
+      confirmText: 'Run now',
+    })
+    if (ok) await runScheduleNow.mutateAsync(id)
   }
   const handleToggleScheduleSelection = (scheduleId: string) => {
     setSelectedScheduleIds(prev => {
@@ -158,7 +167,13 @@ export default function ScheduleList() {
   }
   const handleBulkDelete = async () => {
     if (selectedScheduleIds.size === 0) return
-    if (!confirm(`Delete ${selectedScheduleIds.size} schedule(s)?`)) return
+    const ok = await confirm({
+      title: `Delete ${selectedScheduleIds.size} schedule(s)?`,
+      description: 'This will permanently remove the selected schedules.',
+      confirmText: 'Delete all',
+      variant: 'danger',
+    })
+    if (!ok) return
     let success = 0, failed = 0
     for (const id of selectedScheduleIds) {
       try { await deleteSchedule.mutateAsync(id); success++ } catch { failed++ }

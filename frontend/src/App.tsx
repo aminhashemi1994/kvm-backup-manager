@@ -4,6 +4,7 @@ import { AuthProvider, useAuth } from './contexts/AuthContext'
 import { ThemeProvider } from './contexts/ThemeContext'
 import { NotificationProvider } from './contexts/NotificationContext'
 import { SidebarProvider } from './contexts/SidebarContext'
+import { ConfirmProvider } from './components/ui/confirm-dialog'
 import Layout from './components/layout/Layout'
 import LoginPage from './pages/LoginPage'
 import DashboardPage from './pages/DashboardPage'
@@ -197,22 +198,24 @@ function App() {
         <ThemeProvider>
           <SidebarProvider>
             <NotificationProvider>
-              <AppRoutes />
-              <Toaster 
-                position="top-right" 
-                richColors 
-                closeButton={true}
-                duration={5000}
-                expand={false}
-                visibleToasts={5}
-                toastOptions={{
-                  style: {
-                    cursor: 'pointer',
-                  },
-                  closeButton: true,
-                  dismissible: true,
-                }}
-              />
+              <ConfirmProvider>
+                <AppRoutes />
+                <Toaster 
+                  position="top-right" 
+                  richColors 
+                  closeButton={true}
+                  duration={5000}
+                  expand={false}
+                  visibleToasts={5}
+                  toastOptions={{
+                    style: {
+                      cursor: 'pointer',
+                    },
+                    closeButton: true,
+                    dismissible: true,
+                  }}
+                />
+              </ConfirmProvider>
             </NotificationProvider>
           </SidebarProvider>
         </ThemeProvider>

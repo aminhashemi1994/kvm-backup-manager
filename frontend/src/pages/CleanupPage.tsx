@@ -9,6 +9,7 @@ import { Loader2, Trash2, RefreshCw, AlertTriangle, CheckCircle2, FileText, Lock
 import { useCleanupScan, useExecuteCleanup, useCleanupControllerJobs, type AgentCleanupData, type CleanupFile } from '@/hooks/useCleanup'
 import { formatDistanceToNow } from 'date-fns'
 import { toast } from 'sonner'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 export default function CleanupPage() {
   const [olderThanHours, setOlderThanHours] = useState(6)
@@ -18,6 +19,7 @@ export default function CleanupPage() {
   const { data: scanData, isLoading: isScanning, refetch: scan } = useCleanupScan(olderThanHours)
   const executeCleanup = useExecuteCleanup()
   const cleanupControllerJobs = useCleanupControllerJobs()
+  const confirm = useConfirm()
 
   // Filter agents by selected host
   const filteredAgents = scanData?.agents?.filter(agent => 
@@ -280,7 +282,20 @@ export default function CleanupPage() {
                         variant="default"
                         size="sm"
                         onClick={async () => {
-                          if (!confirm(`Clean ALL ${scanData.totalFiles} files (${formatBytes(scanData.totalSize)}) across ${scanData.agents.length} backup host(s)? This cannot be undone.`)) return
+                          const ok = await confirm({
+                            title: 'Delete all files on all hosts?',
+                            description: `Clean ALL ${scanData.totalFiles} files (${formatBytes(scanData.totalSize)}) across ${scanData.agents.length} backup host(s). This action is IRREVERSIBLE.`,
+                            details: [
+                              `${scanData.totalFiles} files will be permanently deleted`,
+                              `Total size: ${formatBytes(scanData.totalSize)}`,
+                              `Affected hosts: ${scanData.agents.length}`,
+                            ],
+                            requireInput: 'DELETE ALL',
+                            confirmText: 'Delete all',
+                            cancelText: 'Cancel',
+                            variant: 'danger',
+                          })
+                          if (!ok) return
                           let total = 0
                           let failed = 0
                           for (const agent of scanData.agents) {
@@ -349,7 +364,14 @@ export default function CleanupPage() {
                             size="sm"
                             onClick={async () => {
                               const totalSelected = Array.from(selectedFiles.values()).reduce((s, set) => s + set.size, 0)
-                              if (!confirm(`Delete ${totalSelected} selected file(s) across ${selectedFiles.size} host(s)?`)) return
+                              const ok = await confirm({
+                                title: 'Delete selected files?',
+                                description: `Delete ${totalSelected} selected file(s) across ${selectedFiles.size} host(s). This cannot be undone.`,
+                                confirmText: 'Delete',
+                                cancelText: 'Cancel',
+                                variant: 'danger',
+                              })
+                              if (!ok) return
                               let success = 0
                               let failed = 0
                               for (const [agentId, fileSet] of selectedFiles.entries()) {

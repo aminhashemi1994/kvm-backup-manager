@@ -7,16 +7,22 @@ import AddBackupHostDialog from './AddBackupHostDialog'
 import { useBackupHosts, useDeleteBackupHost } from '@/hooks/useBackupHosts'
 import { Badge } from '@/components/ui/badge'
 import { getStatusColor } from '@/lib/utils'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 export default function BackupHostList() {
   const [showAddDialog, setShowAddDialog] = useState(false)
   const { data: hosts, isLoading } = useBackupHosts()
   const deleteHost = useDeleteBackupHost()
+  const confirm = useConfirm()
 
   const handleDelete = async (id: string, name: string) => {
-    if (confirm(`Are you sure you want to delete offsite host "${name}"?`)) {
-      await deleteHost.mutateAsync(id)
-    }
+    const ok = await confirm({
+      title: 'Delete backup host?',
+      description: `Are you sure you want to delete the backup host "${name}"?`,
+      confirmText: 'Delete',
+      variant: 'danger',
+    })
+    if (ok) await deleteHost.mutateAsync(id)
   }
 
   return (

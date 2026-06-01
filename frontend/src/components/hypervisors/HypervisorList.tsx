@@ -8,6 +8,7 @@ import VMSelector from './VMSelector'
 import { useHypervisors, useDeleteHypervisor, useRefreshVMs } from '@/hooks/useHypervisors'
 import { Badge } from '@/components/ui/badge'
 import { getStatusColor } from '@/lib/utils'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 export default function HypervisorList() {
   const [showAddDialog, setShowAddDialog] = useState(false)
@@ -16,11 +17,16 @@ export default function HypervisorList() {
   const { data: hypervisors, isLoading } = useHypervisors()
   const deleteHypervisor = useDeleteHypervisor()
   const refreshVMs = useRefreshVMs()
+  const confirm = useConfirm()
 
   const handleDelete = async (id: string, name: string) => {
-    if (confirm(`Are you sure you want to delete hypervisor "${name}" and all its VMs?`)) {
-      await deleteHypervisor.mutateAsync(id)
-    }
+    const ok = await confirm({
+      title: 'Delete hypervisor?',
+      description: `This will delete the hypervisor "${name}" and all of its virtual machines from the panel.`,
+      confirmText: 'Delete',
+      variant: 'danger',
+    })
+    if (ok) await deleteHypervisor.mutateAsync(id)
   }
 
   const handleRefreshVMs = async (id: string) => {
