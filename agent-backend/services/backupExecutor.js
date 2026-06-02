@@ -824,8 +824,11 @@ class BackupExecutor {
       noVerify = false,
       offsiteHosts = [],
       verbose = false,
-      storagePoolPath = null
+      storagePoolPath = null,
+      isRetry = false  // NEW: Flag to indicate this is a retry attempt
     } = jobData;
+
+    console.log(`[BackupExecutor] Starting backup for ${vmName}, jobId: ${jobId}, isRetry: ${isRetry}`);
 
     // Validate storage pool path is provided
     if (!storagePoolPath) {
@@ -933,6 +936,88 @@ class BackupExecutor {
     // Verbose
     if (verbose) {
       args.push('--verbose');
+    }
+
+    // Retry logic - Run cleanup script first, then start fresh backup
+    if (isRetry) {
+      log('');
+      log('='.repeat(70));
+      log('RETRY MODE: Cleaning up partial files before retry');
+      log('='.repeat(70));
+      log('');
+      
+      try {
+        const cleanupScriptPath = path.join(__dirname, '../scripts/Cleanup_Backup.sh');
+        
+        if (!fs.existsSync(cleanupScriptPath)) {
+          throw new Error(`Cleanup script not found: ${cleanupScriptPath}`);
+        }
+        
+        log(`Running cleanup script: ${cleanupScriptPath}`);
+        log(`  VM: ${vmName}`);
+        log(`  Storage Pool: ${storagePoolPath}`);
+        log(`  Schedule: ${scheduleType}`);
+        
+        // Execute cleanup script synchronously
+        const cleanupResult = await new Promise((resolve, reject) => {
+          const cleanupProc = spawn('bash', [
+            cleanupScriptPath,
+            '--domain', vmName,
+            '--backup-path', storagePoolPath
+          ]);
+          
+          let stdout = '';
+          let stderr = '';
+          
+          cleanupProc.stdout.on('data', (data) => {
+            const output = data.toString();
+            stdout += output;
+            log(`[Cleanup] ${output.trim()}`);
+          });
+          
+          cleanupProc.stderr.on('data', (data) => {
+            const output = data.toString();
+            stderr += output;
+            log(`[Cleanup Error] ${output.trim()}`);
+          });
+          
+          cleanupProc.on('close', (code) => {
+            resolve({ code, stdout, stderr });
+          });
+          
+          cleanupProc.on('error', (err) => {
+            reject(err);
+          });
+        });
+        
+        log('');
+        log(`Cleanup script exited with code: ${cleanupResult.code}`);
+        
+        if (cleanupResult.code === 0) {
+          log('✓ Cleanup completed successfully');
+          log('✓ Partial files and checkpoints removed');
+        } else if (cleanupResult.code === 11) {
+          log('✓ Backup is healthy (no partial files found)');
+        } else if (cleanupResult.code === 10) {
+          log('⚠ No backup directory found for this VM');
+        } else {
+          log(`⚠ Cleanup script exited with code ${cleanupResult.code}`);
+        }
+        
+        log('');
+        log('='.repeat(70));
+        log('Proceeding with fresh backup...');
+        log('='.repeat(70));
+        log('');
+        
+      } catch (cleanupError) {
+        log(`⚠ Cleanup failed: ${cleanupError.message}`);
+        log('⚠ Proceeding with backup anyway (script lock will protect)');
+        log('');
+      }
+      
+      // Note: Do NOT add --retry flag to args
+      // We've already cleaned up manually, now start a fresh backup
     }
 
     const command = `bash ${scriptPath} ${args.join(' ')}`;
@@ -1145,6 +1230,30 @@ class BackupExecutor {
               }
             } catch (err) {
               console.error(`Failed to clean lock file: ${err.message}`);
+            }
+          }
+          
+          // CRITICAL: Clean up tmux session on failure to ensure retry logic works
+          // If backup failed (exitCode !== 0), kill the tmux session to prevent
+          // retry logic from failing with "tmux session exists" error
+          if (exitCode !== 0 && tmuxSession) {
+            try {
+              const { exec } = require('child_process');
+              const { promisify } = require('util');
+              const execAsync = promisify(exec);
+              
+              // Check if session still exists and kill it
+              try {
+                await execAsync(`tmux has-session -t ${tmuxSession} 2>/dev/null`);
+                // Session exists, kill it
+                await execAsync(`tmux kill-session -t ${tmuxSession} 2>/dev/null`);
+                console.log(`[${jobId}] Killed tmux session ${tmuxSession} after failure`);
+              } catch (err) {
+                // Session doesn't exist or already killed, that's fine
+                console.log(`[${jobId}] Tmux session ${tmuxSession} already cleaned up`);
+              }
+            } catch (err) {
+              console.error(`[${jobId}] Failed to cleanup tmux session: ${err.message}`);
             }
           }
           

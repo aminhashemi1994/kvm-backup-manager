@@ -291,6 +291,31 @@ class AgentService {
       return { success: false, error: error.message, data: [] };
     }
   }
+
+  /**
+   * Check if a backup is currently in progress for a VM and schedule type
+   * Returns: { success, inProgress, status, details, checks }
+   */
+  async checkBackupStatus(agentUrl, vmName, scheduleType, storagePoolPath) {
+    try {
+      const client = this.createAgentClient(agentUrl);
+      const response = await client.get('/api/backup-status', {
+        params: {
+          vmName,
+          scheduleType,
+          storagePoolPath
+        }
+      });
+      return response.data;
+    } catch (error) {
+      console.error(`[AgentService] Error checking backup status:`, error.message);
+      return { 
+        success: false, 
+        error: error.message,
+        inProgress: false  // Assume not in progress if check fails
+      };
+    }
+  }
 }
 
 const agentService = new AgentService();

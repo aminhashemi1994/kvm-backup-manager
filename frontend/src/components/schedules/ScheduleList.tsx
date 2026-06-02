@@ -183,6 +183,33 @@ export default function ScheduleList() {
     else toast.warning(`Deleted ${success}, ${failed} failed`)
   }
   const handleBulkEdit = () => { if (selectedScheduleIds.size > 0) setShowBulkEditDialog(true) }
+  
+  const handleBulkRunNow = async () => {
+    if (selectedScheduleIds.size === 0) return
+    
+    const ok = await confirm({
+      title: `Run ${selectedScheduleIds.size} schedule(s) now?`,
+      description: `${selectedScheduleIds.size} new backup job(s) will start immediately using each schedule's configuration.`,
+      confirmText: 'Run all now',
+    })
+    
+    if (!ok) return
+    
+    let success = 0, failed = 0
+    for (const id of selectedScheduleIds) {
+      try {
+        await runScheduleNow.mutateAsync(id)
+        success++
+      } catch {
+        failed++
+      }
+    }
+    
+    setSelectedScheduleIds(new Set())
+    
+    if (failed === 0) toast.success(`Started ${success} backup(s)`)
+    else toast.warning(`Started ${success} backup(s), ${failed} failed`)
+  }
 
   // ─── render ──────────────────────────────────────────────────────────────
 
@@ -197,6 +224,10 @@ export default function ScheduleList() {
             <div className="flex items-center gap-2">
               {selectedScheduleIds.size > 0 && (
                 <>
+                  <Button variant="outline" size="sm" onClick={handleBulkRunNow}>
+                    <Play className="h-4 w-4 mr-2 text-blue-600" />
+                    Run Now ({selectedScheduleIds.size})
+                  </Button>
                   <Button variant="outline" size="sm" onClick={handleBulkEdit}>
                     <Edit className="h-4 w-4 mr-2" />
                     Edit ({selectedScheduleIds.size})

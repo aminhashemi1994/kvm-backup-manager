@@ -18,6 +18,7 @@ export default function BackupHistory() {
   const [searchParams, setSearchParams] = useSearchParams()
   const initialStatus = searchParams.get('status') || ''
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
+  const [selectedJobType, setSelectedJobType] = useState<'backup' | 'restore'>('backup')
   const [statusFilter, setStatusFilter] = useState<string>(initialStatus)
   const queryClient = useQueryClient()
   
@@ -135,6 +136,7 @@ export default function BackupHistory() {
                 <option value="">All Status</option>
                 <option value="completed">Completed</option>
                 <option value="failed">Failed</option>
+                <option value="retrying">Retrying</option>
                 <option value="skipped">Skipped</option>
                 <option value="running">Running</option>
               </Select>
@@ -228,7 +230,10 @@ export default function BackupHistory() {
                         <Button
                           variant="ghost"
                           size="sm"
-                          onClick={() => setSelectedJobId(job.id)}
+                          onClick={() => {
+                            setSelectedJobId(job.id)
+                            setSelectedJobType(job.jobType === 'restore' ? 'restore' : 'backup')
+                          }}
                         >
                           <Eye className="h-4 w-4 mr-2" />
                           View Logs
@@ -286,6 +291,7 @@ export default function BackupHistory() {
       {selectedJobId && (
         <LiveLogViewer
           jobId={selectedJobId}
+          jobType={selectedJobType}
           onClose={() => setSelectedJobId(null)}
         />
       )}

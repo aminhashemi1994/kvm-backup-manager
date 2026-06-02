@@ -21,7 +21,7 @@ class SchedulerService {
     this.customDaysTasks = new Map(); // For custom-days schedules
     this.io = null;
     this.healthCheckInterval = null;
-    this._retryTimers = new Set(); // pending auto-retry setTimeout handles
+    this._retryTimers = new Map(); // Map of jobId -> setTimeout handle for pending retries
   }
 
   async initialize(io) {
@@ -289,9 +289,9 @@ class SchedulerService {
 
       console.log(`[Scheduler] ${failedJob.vmName}: attempt ${attempt}/${maxAttempts} failed; scheduling attempt ${nextAttempt} in ${delayMinutes} minute(s)`);
 
-      // Track the timer so shutdown can clear it.
+      // Track the timer so shutdown can clear it and so it can be cancelled
       const timer = setTimeout(async () => {
-        this._retryTimers.delete(timer);
+        this._retryTimers.delete(failedJob.id);
         
         try {
           // Re-read the schedule at fire time in case it was edited/deleted
@@ -319,7 +319,7 @@ class SchedulerService {
       }, delayMs);
 
       if (timer.unref) timer.unref();
-      this._retryTimers.add(timer);
+      this._retryTimers.set(failedJob.id, timer);
     } catch (err) {
       console.error('[Scheduler] handleScheduledBackupFailure error:', err.message);
     }
@@ -348,6 +348,7 @@ class SchedulerService {
         job.status = 'failed';
         job.error = (job.error || '') + ' (retry failed: VM not found)';
         job.endTime = new Date().toISOString();
+        job.retryAt = null; // Clear retry timestamp
         await saveBackupJobs(jobs);
         return;
       }
@@ -358,6 +359,7 @@ class SchedulerService {
         job.status = 'failed';
         job.error = (job.error || '') + ' (retry failed: Hypervisor not found)';
         job.endTime = new Date().toISOString();
+        job.retryAt = null; // Clear retry timestamp
         await saveBackupJobs(jobs);
         return;
       }
@@ -368,6 +370,7 @@ class SchedulerService {
         job.status = 'failed';
         job.error = (job.error || '') + ' (retry failed: Backup host not found)';
         job.endTime = new Date().toISOString();
+        job.retryAt = null; // Clear retry timestamp
         await saveBackupJobs(jobs);
         return;
       }
@@ -377,6 +380,7 @@ class SchedulerService {
         job.status = 'failed';
         job.error = (job.error || '') + ' (retry failed: Backup host offline)';
         job.endTime = new Date().toISOString();
+        job.retryAt = null; // Clear retry timestamp
         await saveBackupJobs(jobs);
         return;
       }
@@ -391,6 +395,7 @@ class SchedulerService {
       // Don't update startTime - keep original
       // Don't set endTime - job is running again
       job.endTime = null;
+      job.retryAt = null; // Clear retry timestamp since retry is starting now
 
       await saveBackupJobs(jobs);
       await appendLog(jobId, `\n=== RETRY ATTEMPT ${attemptNumber}/${maxAttempts} ===`);
@@ -456,6 +461,7 @@ class SchedulerService {
         offsiteHosts: offsiteHostIps,
         verbose: schedule.verbose || false,
         method: job.method, // Use same method as original
+        isRetry: true, // NEW: Flag to indicate this is a retry
         ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
           : {}),
@@ -1043,6 +1049,48 @@ class SchedulerService {
           : {}),
       };
 
+      // PRE-FLIGHT CHECK: Verify no backup is already in progress
+      console.log(`[Scheduler] Checking if backup is already in progress for ${vm.name}/${agentScheduleType}`);
+      try {
+        const statusCheck = await agentService.checkBackupStatus(
+          url,
+          vm.name,
+          agentScheduleType,
+          pool.path
+        );
+
+        if (statusCheck.inProgress) {
+          console.error(`[Scheduler] Backup already in progress for ${vm.name}/${agentScheduleType}: ${statusCheck.details}`);
+          
+          // Mark job as failed
+          const jobs = await getBackupJobs();
+          const job = jobs.find(j => j.id === jobId);
+          if (job) {
+            job.status = 'failed';
+            job.error = `Backup already in progress: ${statusCheck.details}`;
+            job.endTime = new Date().toISOString();
+            job.failureReason = 'already_running';
+            await saveBackupJobs(jobs);
+          }
+          
+          await appendLog(jobId, `ERROR: Backup already in progress`);
+          await appendLog(jobId, `Status: ${statusCheck.status}`);
+          await appendLog(jobId, `Details: ${statusCheck.details}`);
+          
+          if (this.io) {
+            this.io.emit('backup-error', job);
+          }
+          
+          return; // Don't trigger backup
+        }
+
+        console.log(`[Scheduler] ✓ No backup in progress, proceeding with scheduled backup`);
+      } catch (error) {
+        // Log error but don't block backup if status check fails
+        console.warn(`[Scheduler] Warning: Status check failed, proceeding anyway:`, error.message);
+        await appendLog(jobId, `Warning: Status check failed: ${error.message}`);
+      }
+
       // The agent only exposes /api/backup/trigger. The previous
       // triggerScheduledBackup helper called /api/backup/trigger-scheduled
       // which does not exist — that's the source of the 404 errors that
@@ -1363,14 +1411,28 @@ class SchedulerService {
     }
   }
 
+  /**
+   * Cancel a pending retry for a specific job
+   */
+  cancelRetry(jobId) {
+    const timer = this._retryTimers.get(jobId);
+    if (timer) {
+      clearTimeout(timer);
+      this._retryTimers.delete(jobId);
+      console.log(`[Scheduler] Cancelled retry timer for job ${jobId}`);
+      return true;
+    }
+    return false;
+  }
+
   shutdown() {
     console.log('Shutting down scheduler...');
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
     }
     // Cancel any pending auto-retry timers
-    for (const t of this._retryTimers) {
-      clearTimeout(t);
+    for (const [jobId, timer] of this._retryTimers) {
+      clearTimeout(timer);
     }
     this._retryTimers.clear();
     this.tasks.forEach(task => task.stop());

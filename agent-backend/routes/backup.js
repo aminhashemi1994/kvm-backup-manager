@@ -20,7 +20,8 @@ router.post('/trigger', async (req, res, next) => {
       noVerify,
       offsiteHosts,
       verbose,
-      storagePoolPath
+      storagePoolPath,
+      isRetry  // Extract isRetry flag
     } = req.body;
 
     // Support both 'method' (scheduled) and 'scheduleType' (manual) parameters
@@ -68,6 +69,7 @@ router.post('/trigger', async (req, res, next) => {
       offsiteHosts: offsiteHosts || [],
       verbose: verbose || false,
       storagePoolPath: storagePoolPath,
+      isRetry: isRetry || false,  // Pass isRetry flag to executor
     });
 
     // Check if backup was rejected due to VM lock
