@@ -74,7 +74,7 @@ router.get('/active', async (req, res, next) => {
     const jobs = await getBackupJobs();
     const hosts = await getBackupHosts();
 
-    let activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued');
+    let activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'retrying');
     let statusUpdated = false;
 
     if (activeJobs.length > 0) {
@@ -96,7 +96,15 @@ router.get('/active', async (req, res, next) => {
     }
     
     // Re-filter after sync
-    activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued');
+    activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'retrying');
+    
+    // Add countdown for retrying jobs
+    activeJobs = activeJobs.map(job => ({
+      ...job,
+      ...(job.status === 'retrying' && job.retryAt ? {
+        retryCountdownSeconds: Math.max(0, Math.floor((new Date(job.retryAt) - new Date()) / 1000))
+      } : {})
+    }));
     
     res.json({ success: true, data: activeJobs });
   } catch (error) {
@@ -165,7 +173,11 @@ router.get('/history', async (req, res, next) => {
     // Add jobType to backup jobs
     backupJobs = backupJobs.map(job => ({
       ...job,
-      jobType: 'backup'
+      jobType: 'backup',
+      // Calculate countdown for retrying jobs
+      ...(job.status === 'retrying' && job.retryAt ? {
+        retryCountdownSeconds: Math.max(0, Math.floor((new Date(job.retryAt) - new Date()) / 1000))
+      } : {})
     }));
     
     // Combine backup and restore jobs
@@ -208,7 +220,15 @@ router.get('/jobs/:id', async (req, res, next) => {
       await saveBackupJobs(jobs);
     }
     
-    res.json({ success: true, data: job });
+    // Add countdown for retrying jobs
+    const jobData = {
+      ...job,
+      ...(job.status === 'retrying' && job.retryAt ? {
+        retryCountdownSeconds: Math.max(0, Math.floor((new Date(job.retryAt) - new Date()) / 1000))
+      } : {})
+    };
+    
+    res.json({ success: true, data: jobData });
   } catch (error) {
     next(error);
   }
@@ -414,6 +434,37 @@ router.post('/trigger', requireUser, async (req, res, next) => {
           offsiteHosts.push(offsiteHost.ip);
         }
       });
+    }
+
+    // PRE-FLIGHT CHECK: Verify no backup is already in progress
+    console.log(`[BackupTrigger] Checking if backup is already in progress for ${finalVmName}/${scheduleType}`);
+    try {
+      const statusCheck = await agentService.checkBackupStatus(
+        host.url,
+        finalVmName,
+        scheduleType,
+        pool.path
+      );
+
+      if (statusCheck.inProgress) {
+        console.error(`[BackupTrigger] Backup already in progress for ${finalVmName}/${scheduleType}: ${statusCheck.details}`);
+        return res.status(409).json({
+          success: false,
+          error: 'Backup already in progress',
+          message: `Cannot start backup: ${statusCheck.details}`,
+          details: {
+            vmName: finalVmName,
+            scheduleType: scheduleType,
+            status: statusCheck.status,
+            checks: statusCheck.checks
+          }
+        });
+      }
+
+      console.log(`[BackupTrigger] ✓ No backup in progress, proceeding with backup`);
+    } catch (error) {
+      // Log error but don't block backup if status check fails
+      console.warn(`[BackupTrigger] Warning: Status check failed, proceeding anyway:`, error.message);
     }
 
     // Create job record
@@ -630,24 +681,41 @@ router.post('/jobs/:id/update', async (req, res, next) => {
 
     // Handle status updates
     if (status) {
+      console.log(`[Backups] Job ${job.id} received status update: ${status}, current status: ${job.status}`);
+      
       // For scheduled backups with retry capability, check if we should mark as "retrying" instead of "failed"
       if (status === 'failed' && job.scheduled && job.scheduleId) {
         const attempt = job.attemptNumber || 1;
         const maxAttempts = job.maxAttempts || 1;
         
+        console.log(`[Backups] Job ${job.id} failed - checking retry eligibility:`);
+        console.log(`  - scheduled: ${job.scheduled}`);
+        console.log(`  - scheduleId: ${job.scheduleId}`);
+        console.log(`  - attempt: ${attempt}/${maxAttempts}`);
+        console.log(`  - retryCount from schedule: ${maxAttempts - 1}`);
+        
         // If we have retries remaining, mark as "retrying" instead of "failed"
         if (attempt < maxAttempts) {
           job.status = 'retrying';
           job.retryScheduled = true;
-          console.log(`[Backups] Job ${job.id} marked as 'retrying' (attempt ${attempt}/${maxAttempts})`);
+          // Set retry timestamp for countdown
+          const retryDelayMinutes = job.retryDelayMinutes || 5;
+          job.retryAt = new Date(Date.now() + (retryDelayMinutes * 60 * 1000)).toISOString();
+          console.log(`[Backups] ✓ Job ${job.id} marked as 'retrying' (attempt ${attempt}/${maxAttempts})`);
+          console.log(`[Backups] ✓ Retry scheduled at ${job.retryAt} (in ${retryDelayMinutes} minutes)`);
+          console.log(`[Backups] ✓ Job will NOT have endTime set (stays in active)`);
         } else {
           // All retries exhausted, mark as failed
           job.status = 'failed';
           job.retriesExhausted = true;
-          console.log(`[Backups] Job ${job.id} marked as 'failed' - all ${maxAttempts} attempts exhausted`);
+          job.retryAt = null; // Clear retry timestamp
+          console.log(`[Backups] ✗ Job ${job.id} marked as 'failed' - all ${maxAttempts} attempts exhausted`);
         }
       } else {
         job.status = status;
+        if (status === 'failed') {
+          console.log(`[Backups] Job ${job.id} marked as failed (no retry - scheduled:${job.scheduled}, scheduleId:${job.scheduleId})`);
+        }
       }
       
       // Treat cancelled as failed
@@ -786,6 +854,35 @@ router.post('/kill/:jobId', requireUser, async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Job not found' });
     }
 
+    // If job is in 'retrying' status, it's not running on the agent yet
+    // Just cancel it locally without calling the agent
+    if (job.status === 'retrying') {
+      // Cancel the scheduled retry timer
+      schedulerService.cancelRetry(req.params.jobId);
+      
+      job.status = 'failed';
+      job.endTime = new Date().toISOString();
+      job.error = 'Cancelled by user during retry wait';
+      job.retryAt = null; // Clear retry timestamp
+      await saveBackupJobs(jobs);
+      await appendLog(req.params.jobId, 'Retry cancelled by user');
+      
+      const io = req.app.get('io');
+      if (io) {
+        io.emit('backup-cancelled', job);
+      }
+      
+      // Audit log
+      try {
+        const username = req.user?.username || 'unknown';
+        auditService.logCancelBackup(username, req.params.jobId, job.vmName);
+      } catch (auditError) {
+        console.error('[Kill] Audit log failed:', auditError.message);
+      }
+      
+      return res.json({ success: true, message: 'Retry cancelled successfully' });
+    }
+
     // Get backup host
     const hosts = await getBackupHosts();
     const host = hosts.find(h => h.id === job.backupHostId);
@@ -794,7 +891,7 @@ router.post('/kill/:jobId', requireUser, async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Backup host not found' });
     }
 
-    // Forward kill request to agent
+    // Forward kill request to agent for running/queued jobs
     try {
       const client = agentService.createAgentClient(host.url, host.id, host.name);
       await client.post(`/api/backup/kill/${req.params.jobId}`);
@@ -807,16 +904,28 @@ router.post('/kill/:jobId', requireUser, async (req, res, next) => {
       await appendLog(req.params.jobId, 'Backup cancelled by user');
       
       const io = req.app.get('io');
-      io.emit('backup-cancelled', job);
+      if (io) {
+        io.emit('backup-cancelled', job);
+      }
+      
+      // Audit log
+      try {
+        const username = req.user?.username || 'unknown';
+        auditService.logCancelBackup(username, req.params.jobId, job.vmName);
+      } catch (auditError) {
+        console.error('[Kill] Audit log failed:', auditError.message);
+      }
       
       res.json({ success: true, message: 'Backup job cancelled' });
     } catch (error) {
+      console.error('[Kill] Failed to cancel job on agent:', error.message);
       res.status(500).json({ 
         success: false, 
         error: `Failed to cancel job: ${error.message}` 
       });
     }
   } catch (error) {
+    console.error('[Kill] Unexpected error:', error);
     next(error);
   }
 });

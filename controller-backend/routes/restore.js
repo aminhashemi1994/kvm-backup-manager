@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 const { v4: uuidv4 } = require('uuid');
+const fs = require('fs').promises;
+const path = require('path');
 const agentService = require('../services/agentService');
 const rocketChatService = require('../services/rocketChatService');
 const {
@@ -344,6 +346,7 @@ router.post('/trigger', async (req, res, next) => {
       id: restoreId,
       vmName,
       backupHostId,
+      backupHostName: backupHost.name, // Add backup host name for display
       method,
       restoreStoragePoolId,
       depth,

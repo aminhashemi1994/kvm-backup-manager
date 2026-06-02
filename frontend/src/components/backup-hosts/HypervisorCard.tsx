@@ -13,7 +13,7 @@ import {
   HardDrive, 
   ChevronDown, 
   ChevronUp, 
-  RefreshCw, 
+  RefreshCw,
   Trash2,
   Edit,
   Monitor,
@@ -32,8 +32,10 @@ import type { Hypervisor, VirtualMachine } from '@/types'
 import { useVMsByHypervisor, useRefreshVMs, useDeleteHypervisor } from '@/hooks/useBackupHosts'
 import TriggerBackupDialog from '../backups/TriggerBackupDialog'
 import FixBackupDialog from '../backups/FixBackupDialog'
+import CleanupBackupDialog from '../backups/CleanupBackupDialog'
 import EditHypervisorDialog from './EditHypervisorDialog'
 import BulkScheduleDialog from '../schedules/BulkScheduleDialog'
+import CleanupIcon from '../icons/CleanupIcon'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 
@@ -184,6 +186,7 @@ export default function HypervisorCard({ hypervisor, backupHostId }: HypervisorC
   const [expanded, setExpanded] = useState(false)
   const [selectedVM, setSelectedVM] = useState<VirtualMachine | null>(null)
   const [fixBackupVM, setFixBackupVM] = useState<VirtualMachine | null>(null)
+  const [cleanupBackupVM, setCleanupBackupVM] = useState<VirtualMachine | null>(null)
   const [showEditDialog, setShowEditDialog] = useState(false)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState<string>('')
@@ -524,6 +527,14 @@ export default function HypervisorCard({ hypervisor, backupHostId }: HypervisorC
                             >
                               <Wrench className="h-4 w-4 text-orange-600" />
                             </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setCleanupBackupVM(vm)}
+                              title="Cleanup Failed Backup - Remove partial files"
+                            >
+                              <CleanupIcon className="h-4 w-4" />
+                            </Button>
                           </div>
                         </div>
                       );
@@ -574,6 +585,15 @@ export default function HypervisorCard({ hypervisor, backupHostId }: HypervisorC
           hypervisorIp={hypervisor.ip}
           backupHostId={backupHostId}
           onClose={() => setFixBackupVM(null)}
+        />
+      )}
+
+      {cleanupBackupVM && (
+        <CleanupBackupDialog
+          vmId={cleanupBackupVM.id}
+          vmName={cleanupBackupVM.name}
+          backupHostId={backupHostId}
+          onClose={() => setCleanupBackupVM(null)}
         />
       )}
 

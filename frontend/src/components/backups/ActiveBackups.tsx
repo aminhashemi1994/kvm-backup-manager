@@ -30,6 +30,32 @@ export default function ActiveBackups() {
     ...(activeRestores || []).map(job => ({ ...job, jobType: 'restore' as const }))
   ].sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
 
+  // Real-time countdown for retrying jobs
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    // Update countdown every second for retrying jobs
+    const hasRetryingJobs = activeJobs.some(job => job.status === 'retrying')
+    if (!hasRetryingJobs) return
+
+    const interval = setInterval(() => {
+      setTick(tick => tick + 1) // Force re-render to update countdown
+    }, 1000)
+
+    return () => clearInterval(interval)
+  }, [activeJobs])
+
+  // Calculate countdown text for retrying jobs
+  const getProgressTextWithCountdown = (job: any) => {
+    if (job.status === 'retrying' && job.retryAt) {
+      const remainingMs = new Date(job.retryAt).getTime() - Date.now()
+      const seconds = Math.max(0, Math.floor(remainingMs / 1000))
+      const minutes = Math.floor(seconds / 60)
+      const secs = seconds % 60
+      return `Retrying in ${minutes}:${secs.toString().padStart(2, '0')}...`
+    }
+    return job.progressText
+  }
+
   // Show the spinner only on the very first render, before any data has
   // arrived. After that — including during background refetches and after
   // socket-driven invalidations — render the table even if temporarily
@@ -206,7 +232,7 @@ export default function ActiveBackups() {
                     <TableCell>
                       <Badge variant="outline">{(job.scheduleType || job.method || job.jobType).toUpperCase()}</Badge>
                     </TableCell>
-                    <TableCell>{job.agentName}</TableCell>
+                    <TableCell>{job.backupHostName || '-'}</TableCell>
                     <TableCell>
                       <JobStatusBadge
                         status={job.status === 'queued' && (job.progress || 0) > 0 ? 'running' : job.status}
@@ -220,7 +246,7 @@ export default function ActiveBackups() {
                       <JobProgressBar
                         progress={job.progress || 0}
                         phase={job.phase}
-                        progressText={job.progressText}
+                        progressText={getProgressTextWithCountdown(job)}
                         jobType={job.jobType}
                         status={job.status === 'queued' && (job.progress || 0) > 0 ? 'running' : job.status}
                       />

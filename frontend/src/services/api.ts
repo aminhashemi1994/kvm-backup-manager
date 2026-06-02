@@ -201,6 +201,11 @@ export const fixBackupApi = {
   fixBackup: (data: any) => api.post('/fix-backup', data),
 }
 
+// Cleanup Backup (cleanup only, no backup start)
+export const cleanupBackupApi = {
+  cleanupBackup: (data: any) => api.post('/cleanup-backup', data),
+}
+
 // Backup Removal
 export const backupRemovalApi = {
   listVMs: (backupHostId: string) => api.get(`/backup-removal/${backupHostId}/vms`),
