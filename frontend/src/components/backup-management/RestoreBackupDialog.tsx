@@ -111,14 +111,24 @@ export default function RestoreBackupDialog({
 
     setTriggering(true)
     try {
-      const response = await restoreApi.trigger({
+      // Get the selected method data to extract archiveName if it's an archived backup
+      const methodData = options?.availableMethods.find(m => m.method === selectedMethod)
+      
+      const restorePayload: any = {
         vmName,
         backupHostId,
         method: selectedMethod,
         restoreStoragePoolId: selectedRestorePool,
         depth: selectedDepth,
         disk: selectedDisk,
-      })
+      }
+      
+      // Add archiveName if this is an archived backup
+      if (methodData?.isArchived && methodData?.archiveName) {
+        restorePayload.archiveName = methodData.archiveName
+      }
+
+      const response = await restoreApi.trigger(restorePayload)
 
       if (response.data.success) {
         toast.success('Restore Started', {

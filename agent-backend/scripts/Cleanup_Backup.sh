@@ -105,17 +105,9 @@ cleanup_schedule() {
         return 0
     fi
     
-    # Check if there are any partial files
-    local partial_files=$(find "$backup_dir" -type f -name "*.partial" 2>/dev/null)
-    
-    if [[ -z "$partial_files" ]]; then
-        # No partial files, nothing to cleanup for this schedule
-        return 0
-    fi
-    
     echo ""
     echo -e "${Cyan}═══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${Cyan}  Found partial files in: ${Yellow}${schedule}${NC}"
+    echo -e "${Cyan}  Checking: ${Yellow}${schedule}${NC}"
     echo -e "${Cyan}═══════════════════════════════════════════════════════════════${NC}"
     echo ""
     
@@ -139,9 +131,18 @@ cleanup_schedule() {
     fi
     info "✓ No lock file found for ${schedule}"
     
-    # All safety checks passed - proceed with cleanup
+    # NOW check if there are any partial files (AFTER safety checks)
+    local partial_files=$(find "$backup_dir" -type f -name "*.partial" 2>/dev/null)
+    
+    if [[ -z "$partial_files" ]]; then
+        # No partial files, nothing to cleanup for this schedule
+        info "✓ No partial files found for ${schedule}"
+        return 0
+    fi
+    
     echo ""
-    info "Safety checks passed for ${schedule}. Cleaning up..."
+    info "Found partial files in ${schedule}"
+    info "Safety checks passed. Cleaning up..."
     echo ""
     
     # Count and remove partial files
@@ -251,18 +252,18 @@ for schedule in "${ALL_SCHEDULES[@]}"; do
         continue
     fi
     
-    # Check if there are partial files
-    partial_files=$(find "$backup_dir" -type f -name "*.partial" 2>/dev/null)
+    # Cleanup this schedule (it will check for tmux/lock first, then partial files)
+    cleanup_result=$(cleanup_schedule "$schedule")
+    cleanup_exit=$?
     
-    if [[ -z "$partial_files" ]]; then
-        ((total_empty++))
-        continue
-    fi
-    
-    # Cleanup this schedule
-    if cleanup_schedule "$schedule"; then
-        ((total_cleaned++))
-    else
+    if [[ $cleanup_exit -eq 0 ]]; then
+        # Check if actual cleanup happened (not just "no partial files")
+        if echo "$cleanup_result" | grep -q "Removed.*partial file"; then
+            ((total_cleaned++))
+        else
+            ((total_empty++))
+        fi
+    elif [[ $cleanup_exit -eq 1 ]]; then
         ((total_skipped++))
     fi
 done

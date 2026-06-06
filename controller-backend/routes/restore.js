@@ -118,11 +118,12 @@ router.get('/options/:vmName/:backupHostId', async (req, res, next) => {
     for (const schedule of availableMethods) {
       let backupPath;
       let methodName;
+      let archiveName = null;
       
       // Check if this is an archived backup
       if (schedule.schedule === 'archived') {
         // For archived backups, use the archive_name
-        const archiveName = schedule.archive_name;
+        archiveName = schedule.archive_name;
         if (!archiveName) {
           console.error(`[Restore] Archived schedule missing archive_name`);
           continue;
@@ -130,8 +131,8 @@ router.get('/options/:vmName/:backupHostId', async (req, res, next) => {
         
         // Build path to archived backup
         backupPath = `${storagePool.path}/${vmName}/archived/${archiveName}`;
-        // Use "archived_{archive_name}" as the method identifier
-        methodName = `archived_${archiveName}`;
+        // Use just "archived" as the method name
+        methodName = 'archived';
         
         console.log(`[Restore] Processing archived backup: ${archiveName}`);
       } else if (schedule.backup_location === 'current') {
@@ -165,8 +166,8 @@ router.get('/options/:vmName/:backupHostId', async (req, res, next) => {
           methodsWithDetails.push({
             method: methodName,
             backupPath,
+            archiveName: archiveName, // Separate field for archive name
             isArchived: schedule.schedule === 'archived',
-            archiveName: schedule.archive_name || null,
             originalSchedule: schedule.original_schedule || null,
             isLegacyFormat: schedule.is_legacy_format || false,
             backupLocation: schedule.backup_location || null,
@@ -237,6 +238,7 @@ router.post('/trigger', async (req, res, next) => {
       vmName,
       backupHostId,
       method,
+      archiveName, // Add archiveName parameter for archived backups
       restoreStoragePoolId,
       depth,
       disk
@@ -250,7 +252,15 @@ router.post('/trigger', async (req, res, next) => {
       });
     }
 
-    console.log(`[Restore] Triggering restore for ${vmName}/${method}`);
+    // If method is "archived", archiveName is required
+    if (method === 'archived' && !archiveName) {
+      return res.status(400).json({
+        success: false,
+        error: 'archiveName is required for archived backups'
+      });
+    }
+
+    console.log(`[Restore] Triggering restore for ${vmName}/${method}${archiveName ? ` (${archiveName})` : ''}`);
 
     // Get backup host details
     const backupHostsData = await fs.readFile(
@@ -298,33 +308,40 @@ router.post('/trigger', async (req, res, next) => {
     }
 
     // Build paths
-    // For "daily" method, check if it's in "current" directory (legacy format)
-    // by checking the VM details from the agent
+    // Determine the actual backup path based on method type
     let backupPath;
     
-    // Get VM backup details to determine the actual backup location
-    const client = agentService.createAgentClient(backupHost.url, backupHost.id, backupHost.name);
-    const vmDetailsResponse = await client.get(`/api/backup-removal/vm/${encodeURIComponent(vmName)}/details`, { timeout: 60000 });
-    
-    if (vmDetailsResponse.data.success) {
-      const vmDetails = vmDetailsResponse.data.data;
-      const dailySchedule = vmDetails.schedules.find(s => s.schedule === 'daily' && s.available);
+    if (method === 'archived') {
+      // For archived backups, use the archived directory with the archive name
+      backupPath = `${storagePool.path}/${vmName}/archived/${archiveName}`;
+      console.log(`[Restore] Restoring archived backup: ${archiveName}`);
+    } else {
+      // For non-archived backups, get VM backup details to determine the actual backup location
+      const client = agentService.createAgentClient(backupHost.url, backupHost.id, backupHost.name);
+      const vmDetailsResponse = await client.get(`/api/backup-removal/vm/${encodeURIComponent(vmName)}/details`, { timeout: 60000 });
       
-      // Check if this daily backup is in "current" directory (legacy format)
-      if (dailySchedule && dailySchedule.backup_location === 'current' && method === 'daily') {
-        backupPath = `${storagePool.path}/${vmName}/current`;
-        console.log(`[Restore] Using current directory for daily backup (legacy format)`);
+      if (vmDetailsResponse.data.success) {
+        const vmDetails = vmDetailsResponse.data.data;
+        const dailySchedule = vmDetails.schedules.find(s => s.schedule === 'daily' && s.available);
+        
+        // Check if this daily backup is in "current" directory (legacy format)
+        if (dailySchedule && dailySchedule.backup_location === 'current' && method === 'daily') {
+          backupPath = `${storagePool.path}/${vmName}/current`;
+          console.log(`[Restore] Using current directory for daily backup (legacy format)`);
+        } else {
+          // Regular path
+          backupPath = `${storagePool.path}/${vmName}/${method}`;
+        }
       } else {
-        // Regular path
+        // Fallback to regular path if we can't get VM details
         backupPath = `${storagePool.path}/${vmName}/${method}`;
       }
-    } else {
-      // Fallback to regular path if we can't get VM details
-      backupPath = `${storagePool.path}/${vmName}/${method}`;
     }
     
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const restorePath = `${restorePool.path}/${vmName}_${method}_${timestamp}`;
+    // For archived backups, include archive name in restore path for clarity
+    const restorePathSuffix = method === 'archived' ? `${archiveName}_${timestamp}` : `${method}_${timestamp}`;
+    const restorePath = `${restorePool.path}/${vmName}_${restorePathSuffix}`;
 
     // Generate restore ID
     const restoreId = uuidv4();
@@ -335,7 +352,7 @@ router.post('/trigger', async (req, res, next) => {
     const progressFile = `${progressDir}/restore_${vmName}_${method}_${restoreId}.progress`;
     const eventsFile = `/tmp/restore-manager/events/restore_events_${restoreId}.jsonl`;
 
-    console.log(`[Restore] Creating restore job for ${vmName}/${method}`);
+    console.log(`[Restore] Creating restore job for ${vmName}/${method}${archiveName ? ` (${archiveName})` : ''}`);
     console.log(`[Restore] Backup path: ${backupPath}`);
     console.log(`[Restore] Restore path: ${restorePath}`);
     console.log(`[Restore] Progress file: ${progressFile}`);
@@ -348,6 +365,7 @@ router.post('/trigger', async (req, res, next) => {
       backupHostId,
       backupHostName: backupHost.name, // Add backup host name for display
       method,
+      archiveName: archiveName || null, // Store archive name separately
       restoreStoragePoolId,
       depth,
       disk,
