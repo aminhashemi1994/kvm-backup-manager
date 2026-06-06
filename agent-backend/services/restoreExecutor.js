@@ -82,19 +82,27 @@ class RestoreExecutor {
     // Build Restore_Manager.sh command
     const scriptPath = path.join(__dirname, '../scripts/Restore_Manager.sh');
     
-    // Setup log file path in dedicated .logs directory
-    const baseBackupPath = path.dirname(path.dirname(backupPath));
-    const logsDir = path.join(baseBackupPath, '.logs');
+    // Calculate storage pool base from backup path (needed for both log and progress files)
+    const cleanBackupPath = backupPath.replace(/\/$/, ''); // Remove trailing slash
+    let storagePoolBase;
     
-    // Ensure .logs directory exists
-    try {
-      await fs.mkdir(logsDir, { recursive: true });
-    } catch (error) {
-      console.error(`[Restore] Failed to create logs directory:`, error);
+    if (cleanBackupPath.includes('/archived/')) {
+      // Archived backup: go up 3 levels from ARCHIVE_NAME -> archived -> vmname -> storage pool base
+      storagePoolBase = path.dirname(path.dirname(path.dirname(cleanBackupPath)));
+    } else {
+      // Regular backup: go up 2 levels from method -> vmname -> storage pool base
+      storagePoolBase = path.dirname(path.dirname(cleanBackupPath));
     }
     
+    // Setup log file path - always at storage pool base
+    const logsDir = path.join(storagePoolBase, '.logs');
+    await fs.mkdir(logsDir, { recursive: true }).catch(err => 
+      console.error(`[Restore] Failed to create logs directory:`, err)
+    );
     const logFile = path.join(logsDir, `restore_${vmName}_${restoreId}.log`);
+    
     jobData.logFile = logFile;
+    console.log(`[Restore] Log file will be: ${logFile}`);
     
     let command = `bash "${scriptPath}"`;
     command += ` --domain "${vmName}"`;
@@ -109,8 +117,8 @@ class RestoreExecutor {
       command += ` --progress-file "${providedProgressFile}"`;
       console.log(`[Restore] Using provided progress file: ${providedProgressFile}`);
     } else {
-      // If not provided, construct it and pass to script
-      const progressFile = path.join(baseBackupPath, '.progress', `restore_${vmName}_${method}_${restoreId}.progress`);
+      // If not provided, construct it at storage pool base level
+      const progressFile = path.join(storagePoolBase, '.progress', `restore_${vmName}_${method}_${restoreId}.progress`);
       command += ` --progress-file "${progressFile}"`;
       jobData.progressFile = progressFile;
       console.log(`[Restore] Constructed progress file: ${progressFile}`);
@@ -187,11 +195,10 @@ class RestoreExecutor {
       console.log(`[Restore] Skipping progress file cleanup - doesn't match restore ID: ${jobData.progressFile}`);
     }
     
-    // Add log file - ONLY if it matches this specific restore ID
-    if (jobData.logFile && jobData.logFile.includes(restoreId)) {
-      filesToClean.push(jobData.logFile);
-    } else if (jobData.logFile) {
-      console.log(`[Restore] Skipping log file cleanup - doesn't match restore ID: ${jobData.logFile}`);
+    // DO NOT delete log file - keep it for debugging even after job completes/fails
+    // Users need to see logs after cancellation or failure
+    if (jobData.logFile) {
+      console.log(`[Restore] Keeping log file for history: ${jobData.logFile}`);
     }
     
     // Add events file - ONLY if it matches this specific restore ID
@@ -443,10 +450,13 @@ class RestoreExecutor {
       throw new Error('Restore job not found');
     }
 
+    console.log(`[Restore] Getting logs for ${restoreId}, logFile: ${job.logFile}, tmuxSession: ${job.tmuxSession}, isActive: ${this.activeJobs.has(restoreId)}`);
+
     // Try to get logs from tmux session if still active
     if (job.tmuxSession && this.activeJobs.has(restoreId)) {
       try {
         const { stdout } = await execAsync(`tmux capture-pane -t ${job.tmuxSession} -p -S -`);
+        console.log(`[Restore] Got logs from tmux session, length: ${stdout.length}`);
         return stdout;
       } catch (error) {
         console.error(`Error capturing tmux logs:`, error);
@@ -456,13 +466,19 @@ class RestoreExecutor {
     // Try to read from log file
     if (job.logFile) {
       try {
+        console.log(`[Restore] Attempting to read log file: ${job.logFile}`);
         const content = await fs.readFile(job.logFile, 'utf8');
+        console.log(`[Restore] Successfully read log file, length: ${content.length}`);
         return content;
       } catch (error) {
         if (error.code !== 'ENOENT') {
           console.error(`Error reading log file ${job.logFile}:`, error);
+        } else {
+          console.error(`Log file not found: ${job.logFile}`);
         }
       }
+    } else {
+      console.error(`[Restore] No logFile in job data for ${restoreId}`);
     }
 
     return 'Logs not available';
@@ -537,15 +553,29 @@ class RestoreExecutor {
 
       // Manually remove lock file (in case trap didn't execute)
       try {
-        const baseBackupPath = path.dirname(path.dirname(job.backupPath));
-        const lockDir = path.join(baseBackupPath, 'in_progress_backups');
+        // Calculate storage pool base path correctly for all backup types
+        const cleanBackupPath = job.backupPath.replace(/\/$/, ''); // Remove trailing slash
+        let storagePoolBase;
+        
+        if (cleanBackupPath.includes('/archived/')) {
+          // Archived backup: go up 3 levels
+          storagePoolBase = path.dirname(path.dirname(path.dirname(cleanBackupPath)));
+        } else {
+          // Regular backup: go up 2 levels
+          storagePoolBase = path.dirname(path.dirname(cleanBackupPath));
+        }
+        
+        const lockDir = path.join(storagePoolBase, 'in_progress_backups');
         const lockFile = path.join(lockDir, `${job.vmName}_${job.method}_backup`);
         
+        console.log(`[Restore] Attempting to remove lock file: ${lockFile}`);
         await fs.unlink(lockFile);
-        console.log(`[Restore] Removed lock file: ${lockFile}`);
+        console.log(`[Restore] Successfully removed lock file: ${lockFile}`);
       } catch (lockError) {
         if (lockError.code !== 'ENOENT') {
           console.error(`[Restore] Failed to remove lock file:`, lockError.message);
+        } else {
+          console.log(`[Restore] Lock file already removed`);
         }
       }
       
