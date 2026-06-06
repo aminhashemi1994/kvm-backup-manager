@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { Select } from '@/components/ui/select'
-import { Eye, Loader2, Trash2, AlertTriangle, RefreshCw } from 'lucide-react'
+import { Eye, Loader2, Trash2, AlertTriangle, RefreshCw, Search, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useBackupHistory, useForceRemoveJob, useRetryBackup } from '@/hooks/useBackups'
 import { formatDate, formatDuration, getStatusColor } from '@/lib/utils'
 import LiveLogViewer from './LiveLogViewer'
@@ -20,12 +21,42 @@ export default function BackupHistory() {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
   const [selectedJobType, setSelectedJobType] = useState<'backup' | 'restore'>('backup')
   const [statusFilter, setStatusFilter] = useState<string>(initialStatus)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [currentPage, setCurrentPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
   const queryClient = useQueryClient()
   
-  const { data: history, isLoading } = useBackupHistory({ 
+  const { data: allHistory, isLoading } = useBackupHistory({ 
     status: statusFilter || undefined,
-    limit: 50 
+    limit: 1000 // Fetch up to 1000 records for search across all
   })
+  
+  // Filter history based on search query
+  const filteredHistory = allHistory?.filter(job => {
+    if (!searchQuery) return true
+    const query = searchQuery.toLowerCase()
+    return (
+      job.vmName?.toLowerCase().includes(query) ||
+      job.backupHostName?.toLowerCase().includes(query) ||
+      job.scheduleType?.toLowerCase().includes(query) ||
+      job.method?.toLowerCase().includes(query) ||
+      job.status?.toLowerCase().includes(query) ||
+      job.jobType?.toLowerCase().includes(query) ||
+      job.error?.toLowerCase().includes(query)
+    )
+  })
+
+  // Calculate pagination
+  const totalItems = filteredHistory?.length || 0
+  const totalPages = Math.ceil(totalItems / pageSize)
+  const startIndex = (currentPage - 1) * pageSize
+  const endIndex = startIndex + pageSize
+  const history = filteredHistory?.slice(startIndex, endIndex)
+
+  // Reset to page 1 when search query or filter changes
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [searchQuery, statusFilter])
   
   const forceRemoveJob = useForceRemoveJob()
   const retryBackup = useRetryBackup()
@@ -53,7 +84,7 @@ export default function BackupHistory() {
   useEffect(() => {
     const cleanupProgress = socketService.on('backup-progress', (data: any) => {
       // Update the specific job in cache
-      queryClient.setQueryData(['backups', 'history', { status: statusFilter || undefined, limit: 50 }], (old: any) => {
+      queryClient.setQueryData(['backups', 'history', { status: statusFilter || undefined, limit: 1000 }], (old: any) => {
         if (!old) return old
         return old.map((job: any) => 
           job.id === data.jobId 
@@ -64,7 +95,7 @@ export default function BackupHistory() {
     })
 
     const cleanupComplete = socketService.on('backup-complete', (data: any) => {
-      queryClient.setQueryData(['backups', 'history', { status: statusFilter || undefined, limit: 50 }], (old: any) => {
+      queryClient.setQueryData(['backups', 'history', { status: statusFilter || undefined, limit: 1000 }], (old: any) => {
         if (!old) return old
         return old.map((job: any) => 
           job.id === data.id 
@@ -75,7 +106,7 @@ export default function BackupHistory() {
     })
 
     const cleanupError = socketService.on('backup-error', (data: any) => {
-      queryClient.setQueryData(['backups', 'history', { status: statusFilter || undefined, limit: 50 }], (old: any) => {
+      queryClient.setQueryData(['backups', 'history', { status: statusFilter || undefined, limit: 1000 }], (old: any) => {
         if (!old) return old
         return old.map((job: any) => 
           job.id === data.id 
@@ -128,7 +159,17 @@ export default function BackupHistory() {
         <CardHeader>
           <div className="flex items-center justify-between">
             <CardTitle>Job History</CardTitle>
-            <div className="flex items-center space-x-2">
+            <div className="flex items-center gap-2">
+              <div className="relative w-64">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+                <Input
+                  type="text"
+                  placeholder="Search history..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-10"
+                />
+              </div>
               <Select
                 value={statusFilter}
                 onChange={(e) => setStatusFilter(e.target.value)}
@@ -149,7 +190,18 @@ export default function BackupHistory() {
               <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
             </div>
           ) : history && history.length > 0 ? (
-            <Table>
+            <>
+              {searchQuery && (
+                <div className="mb-4 text-sm text-gray-600">
+                  Found {totalItems} job{totalItems !== 1 ? 's' : ''} matching "{searchQuery}" (showing {startIndex + 1}-{Math.min(endIndex, totalItems)})
+                </div>
+              )}
+              {!searchQuery && totalItems > 0 && (
+                <div className="mb-4 text-sm text-gray-600">
+                  Showing {startIndex + 1}-{Math.min(endIndex, totalItems)} of {totalItems} job{totalItems !== 1 ? 's' : ''}
+                </div>
+              )}
+              <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Type</TableHead>
@@ -280,6 +332,117 @@ export default function BackupHistory() {
                 ))}
               </TableBody>
             </Table>
+
+            {/* Pagination Controls */}
+            {totalItems > 0 && (
+              <div className="mt-4 flex items-center justify-between border-t pt-4">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-gray-600">Items per page:</span>
+                  <Select
+                    value={pageSize.toString()}
+                    onChange={(e) => {
+                      setPageSize(Number(e.target.value))
+                      setCurrentPage(1) // Reset to first page when changing page size
+                    }}
+                    className="w-20"
+                  >
+                    <option value="10">10</option>
+                    <option value="20">20</option>
+                    <option value="50">50</option>
+                    <option value="100">100</option>
+                  </Select>
+                </div>
+
+                {totalPages > 1 && (
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                      disabled={currentPage === 1}
+                    >
+                      <ChevronLeft className="h-4 w-4 mr-1" />
+                      Previous
+                    </Button>
+
+                    <div className="flex items-center gap-1">
+                      {/* First page */}
+                      {currentPage > 3 && (
+                        <>
+                          <Button
+                            variant={currentPage === 1 ? "default" : "outline"}
+                            size="sm"
+                            onClick={() => setCurrentPage(1)}
+                            className="w-10"
+                          >
+                            1
+                          </Button>
+                          {currentPage > 4 && (
+                            <span className="px-2 text-gray-400">...</span>
+                          )}
+                        </>
+                      )}
+
+                      {/* Pages around current page */}
+                      {Array.from({ length: totalPages }, (_, i) => i + 1)
+                        .filter(page => {
+                          // Show pages within 2 of current page
+                          return page >= currentPage - 2 && page <= currentPage + 2
+                        })
+                        .map(page => (
+                          <Button
+                            key={page}
+                            variant={currentPage === page ? "default" : "outline"}
+                            size="sm"
+                            onClick={() => setCurrentPage(page)}
+                            className="w-10"
+                          >
+                            {page}
+                          </Button>
+                        ))}
+
+                      {/* Last page */}
+                      {currentPage < totalPages - 2 && (
+                        <>
+                          {currentPage < totalPages - 3 && (
+                            <span className="px-2 text-gray-400">...</span>
+                          )}
+                          <Button
+                            variant={currentPage === totalPages ? "default" : "outline"}
+                            size="sm"
+                            onClick={() => setCurrentPage(totalPages)}
+                            className="w-10"
+                          >
+                            {totalPages}
+                          </Button>
+                        </>
+                      )}
+                    </div>
+
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                      disabled={currentPage === totalPages}
+                    >
+                      Next
+                      <ChevronRight className="h-4 w-4 ml-1" />
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
+            </>
+          ) : searchQuery ? (
+            <div className="text-center py-12">
+              <div className="mx-auto w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mb-4">
+                <Search className="h-8 w-8 text-gray-400" />
+              </div>
+              <p className="text-gray-600 font-medium">No jobs found</p>
+              <p className="text-sm text-gray-500 mt-2">
+                No jobs in history match "{searchQuery}"
+              </p>
+            </div>
           ) : (
             <div className="text-center py-8">
               <p className="text-gray-500">No job history found</p>

@@ -1,9 +1,10 @@
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
-import { Eye, Loader2, XCircle, Download, Upload } from 'lucide-react'
+import { Eye, Loader2, XCircle, Download, Upload, Search } from 'lucide-react'
 import { useActiveBackups, useKillBackupJob } from '@/hooks/useBackups'
 import { useActiveRestores, useKillRestoreJob } from '@/hooks/useRestores'
 import { formatDuration } from '@/lib/utils'
@@ -17,6 +18,7 @@ import { useConfirm } from '@/components/ui/confirm-dialog'
 export default function ActiveBackups() {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
   const [selectedJobType, setSelectedJobType] = useState<'backup' | 'restore'>('backup')
+  const [searchQuery, setSearchQuery] = useState('')
   const queryClient = useQueryClient()
   const { data: activeBackups, isLoading: isLoadingBackups } = useActiveBackups()
   const { data: activeRestores, isLoading: isLoadingRestores } = useActiveRestores()
@@ -25,10 +27,24 @@ export default function ActiveBackups() {
   const confirm = useConfirm()
 
   // Combine backups and restores into a single list
-  const activeJobs = [
+  const allActiveJobs = [
     ...(activeBackups || []).map(job => ({ ...job, jobType: 'backup' as const })),
     ...(activeRestores || []).map(job => ({ ...job, jobType: 'restore' as const }))
   ].sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
+
+  // Filter jobs based on search query
+  const activeJobs = allActiveJobs.filter(job => {
+    if (!searchQuery) return true
+    const query = searchQuery.toLowerCase()
+    return (
+      job.vmName?.toLowerCase().includes(query) ||
+      job.backupHostName?.toLowerCase().includes(query) ||
+      job.scheduleType?.toLowerCase().includes(query) ||
+      job.method?.toLowerCase().includes(query) ||
+      job.status?.toLowerCase().includes(query) ||
+      job.jobType?.toLowerCase().includes(query)
+    )
+  })
 
   // Real-time countdown for retrying jobs
   const [, setTick] = useState(0)
@@ -194,7 +210,21 @@ export default function ActiveBackups() {
     <>
       <Card>
         <CardHeader>
-          <CardTitle>Active & Queued Jobs</CardTitle>
+          <div className="flex items-center justify-between">
+            <CardTitle>Active & Queued Jobs</CardTitle>
+            <div className="flex items-center gap-2">
+              <div className="relative w-64">
+                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+                <Input
+                  type="text"
+                  placeholder="Search jobs..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-10"
+                />
+              </div>
+            </div>
+          </div>
         </CardHeader>
         <CardContent>
           {isLoading ? (
@@ -202,7 +232,13 @@ export default function ActiveBackups() {
               <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
             </div>
           ) : activeJobs && activeJobs.length > 0 ? (
-            <Table>
+            <>
+              {searchQuery && (
+                <div className="mb-4 text-sm text-gray-600">
+                  Found {activeJobs.length} job{activeJobs.length !== 1 ? 's' : ''} matching "{searchQuery}"
+                </div>
+              )}
+              <Table>
               <TableHeader>
                 <TableRow>
                   <TableHead>Type</TableHead>
@@ -280,6 +316,17 @@ export default function ActiveBackups() {
                 ))}
               </TableBody>
             </Table>
+            </>
+          ) : searchQuery ? (
+            <div className="text-center py-12">
+              <div className="mx-auto w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mb-4">
+                <Search className="h-8 w-8 text-gray-400" />
+              </div>
+              <p className="text-gray-600 font-medium">No jobs found</p>
+              <p className="text-sm text-gray-500 mt-2">
+                No active jobs match "{searchQuery}"
+              </p>
+            </div>
           ) : (
             <div className="text-center py-12">
               <div className="mx-auto w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mb-4">
