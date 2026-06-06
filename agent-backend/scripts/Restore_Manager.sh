@@ -238,11 +238,29 @@ validate_inputs() {
 ###############################################################################
 
 create_lock_file() {
-    local lock_dir="$(dirname "$(dirname "$backup_path")")/in_progress_backups"
+    # Determine lock directory at storage pool base level
+    # Lock files should be at: /storage_pool_base/in_progress_backups/
+    # NOT at: /storage_pool_base/vmname/in_progress_backups/
+    
+    # Remove trailing slashes from backup_path for consistent dirname behavior
+    local clean_backup_path="${backup_path%/}"
+    local storage_pool_base
+    
+    if [[ "$clean_backup_path" =~ /archived/ ]]; then
+        # Archived backup path: /storage_pool_base/vmname/archived/ARCHIVE_NAME
+        # Need to go up 3 levels: ARCHIVE_NAME -> archived -> vmname -> storage_pool_base
+        storage_pool_base=$(dirname "$(dirname "$(dirname "$clean_backup_path")")")
+    else
+        # Regular backup path: /storage_pool_base/vmname/method
+        # Need to go up 2 levels: method -> vmname -> storage_pool_base
+        storage_pool_base=$(dirname "$(dirname "$clean_backup_path")")
+    fi
+    
+    local lock_dir="$storage_pool_base/in_progress_backups"
     mkdir -p "$lock_dir" 2>/dev/null || true
     local lock_file="$lock_dir/${vm_name}_${method}_backup"
     if [[ -f "$lock_file" ]]; then
-        die "A backup operation is already in progress for ${vm_name}/${method}. Cannot restore."
+        die "A backup operation is already in progress for ${vm_name}/${method} with Lock File : ${lock_file}. Cannot restore."
     fi
     # Write restore lock
     echo "restore:${restore_id}:$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"$lock_file"
