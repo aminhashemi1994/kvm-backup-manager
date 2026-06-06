@@ -780,6 +780,118 @@ verify_created_backups() {
 # BACKUP STATE HELPERS
 ###############################################################################
 
+has_any_backup_data() {
+	local dir="$1"
+	if [[ ! -d "$dir" ]]; then
+		return 1
+	fi
+	local content=""
+	content=$(find "$dir" -mindepth 1 -maxdepth 1 ! -name 'logs' 2>/dev/null | head -1)
+	if [[ -n "$content" ]]; then
+		return 0
+	fi
+	return 1
+}
+
+###############################################################################
+# VALIDATE AND REPAIR SCHEDULER FILE
+# Validates scheduler file against actual backup files and repairs if needed
+# Only runs once per script execution (cached)
+###############################################################################
+validate_scheduler() {
+	local backup_dir="$1"
+	local sched_file="$backup_dir/scheduler"
+	
+	# Use a flag file to track if validation was done in this script run
+	local validation_flag="/tmp/.backup_manager_scheduler_validated_$$"
+	
+	# If already validated in this script execution, skip
+	if [[ -f "$validation_flag" ]]; then
+		return 0
+	fi
+	
+	# Mark as validated for this script execution
+	touch "$validation_flag" 2>/dev/null || true
+	
+	# If scheduler doesn't exist, nothing to validate (silently skip)
+	[[ ! -f "$sched_file" ]] && return 0
+	
+	# Only validate if virtnbdrestore is available (silently skip if not)
+	command -v virtnbdrestore &>/dev/null || return 0
+	
+	# Check if backup directory has actual backup data (silently skip if not)
+	if ! has_any_backup_data "$backup_dir"; then
+		return 0
+	fi
+	
+	# Try to get actual backup state from virtnbdrestore (wrap in error handling)
+	local json_output=""
+	json_output=$(cd "$backup_dir" && virtnbdrestore -i . -o dump 2>/dev/null | sed -n '/^ *\[/,$p') || return 0
+	
+	# If virtnbdrestore failed or returned no data, skip validation silently
+	if [[ -z "$json_output" ]] || ! echo "$json_output" | jq empty 2>/dev/null; then
+		return 0
+	fi
+	
+	# Count actual full and inc backups from virtnbdrestore (with error handling)
+	local actual_full_count
+	local actual_inc_count
+	
+	actual_full_count=$(echo "$json_output" | jq '[.[] | select(.incremental == false)] | unique_by(.checkpointName) | length' 2>/dev/null) || return 0
+	actual_inc_count=$(echo "$json_output" | jq '[.[] | select(.incremental == true)] | unique_by(.checkpointName) | length' 2>/dev/null) || return 0
+	
+	# Ensure we got valid numbers
+	[[ -z "$actual_full_count" ]] && return 0
+	[[ -z "$actual_inc_count" ]] && return 0
+	
+	# Count entries in scheduler file (excluding headers and comments)
+	local sched_full_count
+	local sched_inc_count
+	sched_full_count=$(grep -ciE '\tfull$' "$sched_file" 2>/dev/null) || return 0
+	sched_inc_count=$(grep -ciE '\tinc$' "$sched_file" 2>/dev/null) || return 0
+	
+	# Convert all counts to decimal integers using awk to avoid octal interpretation
+	actual_full_count=$(echo "$actual_full_count" | awk '{print $1+0}' 2>/dev/null) || return 0
+	actual_inc_count=$(echo "$actual_inc_count" | awk '{print $1+0}' 2>/dev/null) || return 0
+	sched_full_count=$(echo "$sched_full_count" | awk '{print $1+0}' 2>/dev/null) || return 0
+	sched_inc_count=$(echo "$sched_inc_count" | awk '{print $1+0}' 2>/dev/null) || return 0
+	
+	# Check if counts match (allow full count difference since we may have 0 or 1 full)
+	if [[ "$sched_inc_count" -ne "$actual_inc_count" ]] || [[ "$sched_full_count" -gt 1 ]]; then
+		warn "Scheduler file inconsistent with actual backups"
+		info "Scheduler shows: ${sched_full_count} full, ${sched_inc_count} inc"
+		info "Actual backups: ${actual_full_count} full, ${actual_inc_count} inc"
+		info "Rebuilding scheduler file from actual backup data..."
+		
+		# Rebuild scheduler file (with error handling)
+		local temp_sched="${sched_file}.rebuilding"
+		if ! printf "Day\tDate\tMethod\n" >"$temp_sched" 2>/dev/null; then
+			return 0  # Can't write, skip silently
+		fi
+		printf "*******************************\n" >>"$temp_sched"
+		printf "# Rebuilt on $(date '+%Y-%m-%d %H:%M:%S')\n" >>"$temp_sched"
+		
+		# Add full backup entry (use current date if exists)
+		if [[ "$actual_full_count" -gt 0 ]]; then
+			printf "N/A\tN/A\tfull\n" >>"$temp_sched"
+		fi
+		
+		# Add inc backup entries
+		for ((i=1; i<=actual_inc_count; i++)); do
+			printf "N/A\tN/A\tinc\n" >>"$temp_sched"
+		done
+		
+		# Replace old scheduler with rebuilt one (with error handling)
+		if mv "$temp_sched" "$sched_file" 2>/dev/null; then
+			info "Scheduler file rebuilt successfully"
+		else
+			rm -f "$temp_sched" 2>/dev/null || true
+		fi
+	fi
+	
+	return 0
+}
+
 count_existing_backups() {
 	local dir="$1"
 	if [[ ! -d "$dir" ]]; then
@@ -792,9 +904,15 @@ count_existing_backups() {
 		echo 0
 		return
 	fi
+	
+	# Validate and repair scheduler file before reading it
+	validate_scheduler "$dir"
+	
 	if [[ -f "$dir/scheduler" ]]; then
 		local count=0
-		count=$(grep -cEv '^\s*$|^\*|^Day' "$dir/scheduler" 2>/dev/null)
+		count=$(grep -cEv '^\s*$|^\*|^Day|^#' "$dir/scheduler" 2>/dev/null)
+		# Convert to decimal to avoid octal interpretation
+		count=$(echo "$count" | awk '{print $1+0}')
 		echo "${count:-0}"
 	else
 		echo 0
@@ -807,19 +925,6 @@ has_full_backup() {
 		return 0
 	fi
 	if [[ -f "$dir/scheduler" ]] && grep -qi "full" "$dir/scheduler" 2>/dev/null; then
-		return 0
-	fi
-	return 1
-}
-
-has_any_backup_data() {
-	local dir="$1"
-	if [[ ! -d "$dir" ]]; then
-		return 1
-	fi
-	local content=""
-	content=$(find "$dir" -mindepth 1 -maxdepth 1 ! -name 'logs' 2>/dev/null | head -1)
-	if [[ -n "$content" ]]; then
 		return 0
 	fi
 	return 1
@@ -1541,10 +1646,25 @@ record_scheduler() {
 	wd=$(date +%d)
 	wm=$(date +%m)
 	wy=$(date +%Y)
+	
+	# Create scheduler file if it doesn't exist
 	if [[ ! -f "$sched_file" ]] || [[ ! -s "$sched_file" ]]; then
 		printf "Day\tDate\tMethod\n" >"$sched_file"
 		printf "*******************************\n" >>"$sched_file"
 	fi
+	
+	# Check if an entry for today already exists (to prevent duplicate entries on retry)
+	local today_entry="${weekday}\t${wd}/${wm}/${wy}"
+	if grep -qF "${today_entry}" "$sched_file" 2>/dev/null; then
+		# Entry already exists for today, update it instead of appending
+		# Remove the old entry and add the new one
+		local temp_file="${sched_file}.tmp"
+		grep -vF "${today_entry}" "$sched_file" > "$temp_file"
+		mv "$temp_file" "$sched_file"
+		info "Updating existing scheduler entry for today"
+	fi
+	
+	# Append the new entry
 	printf "%s\t%s/%s/%s\t%s\n" "$weekday" "$wd" "$wm" "$wy" "$level" >>"$sched_file"
 }
 
@@ -1568,6 +1688,8 @@ cleanup_old_logs() {
 	for ext in "*.log" "*.jsonl"; do
 		local file_count=0
 		file_count=$(find "$log_dir" -maxdepth 1 -name "$ext" -type f 2>/dev/null | wc -l)
+		# Convert to decimal to avoid octal interpretation
+		file_count=$(echo "$file_count" | awk '{print $1+0}')
 		if [[ "$file_count" -gt "$max_logs" ]]; then
 			local to_remove=$((file_count - max_logs))
 			find "$log_dir" -maxdepth 1 -name "$ext" -type f -printf '%T@ %p\n' 2>/dev/null |
@@ -2283,6 +2405,9 @@ cleanup_on_exit() {
 	local exit_code=$?
 
 	echo -e "${Yellow}Cleaning up backup resources...${NC}"
+	
+	# Clean up scheduler validation flag file
+	rm -f "/tmp/.backup_manager_scheduler_validated_$$" 2>/dev/null || true
 
 	# Kill any running virtnbdbackup processes for this VM
 	if [[ -n "$vm_name" && -n "$nbd_port" ]]; then

@@ -339,8 +339,27 @@ router.post('/trigger', async (req, res, next) => {
     }
     
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    // For archived backups, include archive name in restore path for clarity
-    const restorePathSuffix = method === 'archived' ? `${archiveName}_${timestamp}` : `${method}_${timestamp}`;
+    // For archived backups, use a shorter suffix with just the original schedule type
+    let restorePathSuffix;
+    
+    if (method === 'archived' && archiveName) {
+      // Archive name format: ARCHIVED_YYYY-MM-DD_HH-MM-SS_TIMESTAMP-ID_VMNAME_SCHEDULE
+      // Example: ARCHIVED_2026-06-05_02-00-10_20251229-153247501084355-55_OFFICE-GATEWAY-1-NET.PART5.PSG.NETWORK_DAILY
+      
+      // Extract the original schedule (last part after last underscore)
+      const lastUnderscoreIndex = archiveName.lastIndexOf('_');
+      const originalSchedule = archiveName.substring(lastUnderscoreIndex + 1).toLowerCase(); // e.g., "daily"
+      
+      // Extract the archive timestamp (parts after ARCHIVED_: YYYY-MM-DD_HH-MM-SS)
+      const afterArchived = archiveName.substring('ARCHIVED_'.length);
+      const firstParts = afterArchived.split('_').slice(0, 2); // Get date and time
+      const archiveTimestamp = firstParts.join('_'); // e.g., "2026-06-05_02-00-10"
+      
+      restorePathSuffix = `archived_${originalSchedule}_${archiveTimestamp}_${timestamp}`;
+    } else {
+      restorePathSuffix = `${method}_${timestamp}`;
+    }
+    
     const restorePath = `${restorePool.path}/${vmName}_${restorePathSuffix}`;
 
     // Generate restore ID
