@@ -6,19 +6,22 @@ interface VMCompactViewProps {
   vms: any[]
 }
 
-const formatBytes = (bytes: number): string => {
-  if (!bytes || bytes === 0) return '0 B'
-  const k = 1024
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(k))
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`
-}
-
-const formatDate = (dateString: string | null): string => {
-  if (!dateString) return 'Never'
-  const date = new Date(dateString)
+const getLastBackupDisplay = (vm: any): string => {
+  if (!Array.isArray(vm.schedules)) return 'Never'
+  
+  let latest: Date | null = null
+  vm.schedules.forEach((schedule: any) => {
+    const dateStr = schedule.dump_analysis?.last_backup_date
+    if (dateStr) {
+      const d = new Date(dateStr)
+      if (!latest || d > latest) latest = d
+    }
+  })
+  
+  if (!latest) return 'Never'
+  
   const now = new Date()
-  const diffMs = now.getTime() - date.getTime()
+  const diffMs = now.getTime() - (latest as Date).getTime()
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
   const diffHours = Math.floor(diffMs / (1000 * 60 * 60))
   
@@ -26,7 +29,7 @@ const formatDate = (dateString: string | null): string => {
   if (diffHours < 24) return `${diffHours}h ago`
   if (diffDays === 1) return '1d ago'
   if (diffDays < 30) return `${diffDays}d ago`
-  return date.toLocaleDateString()
+  return (latest as Date).toLocaleDateString()
 }
 
 const getHealthIcon = (health: string) => {
@@ -74,10 +77,10 @@ export default function VMCompactView({ vms }: VMCompactViewProps) {
   return (
     <div className="space-y-1.5">
       {vms.map((vm) => {
-        const activeSchedules = vm.schedules
-          ? Object.entries(vm.schedules)
-              .filter(([_, s]: any) => s.backup_count > 0)
-              .map(([name]: any) => name)
+        const activeSchedules = Array.isArray(vm.schedules)
+          ? vm.schedules
+              .filter((s: any) => s.available && !s.corrupted)
+              .map((s: any) => s.schedule)
           : []
 
         return (
@@ -117,11 +120,11 @@ export default function VMCompactView({ vms }: VMCompactViewProps) {
               )}
               
               <div className="text-xs text-gray-500 hidden sm:block whitespace-nowrap">
-                {formatDate(vm.last_backup_at)}
+                {getLastBackupDisplay(vm)}
               </div>
               
-              <div className="text-sm font-mono text-gray-700 min-w-[70px] text-right">
-                {formatBytes(vm.total_disk_usage_bytes || 0)}
+              <div className="text-sm font-mono text-gray-700 min-w-[80px] text-right">
+                {vm.total_disk_usage_gb || '0 GB'}
               </div>
             </div>
           </div>
