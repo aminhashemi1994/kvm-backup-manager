@@ -12,12 +12,21 @@ import { toast } from 'sonner'
 import { useNavigate } from 'react-router-dom'
 import VMReportCard from '@/components/reports/VMReportCard'
 import ReportDownloadMenu from '@/components/reports/ReportDownloadMenu'
+import ViewModeSelector, { type ViewMode } from '@/components/reports/ViewModeSelector'
+import VMTableView from '@/components/reports/VMTableView'
+import VMChartView from '@/components/reports/VMChartView'
+import VMCompactView from '@/components/reports/VMCompactView'
 
 export default function Reports() {
   const navigate = useNavigate()
   const [selectedHostId, setSelectedHostId] = useState<string>('')
   const [selectedPoolPath, setSelectedPoolPath] = useState<string>('all') // 'all' or specific pool path
   const [searchQuery, setSearchQuery] = useState<string>('') // Search query for VM names
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    // Persist view mode in localStorage
+    const saved = localStorage.getItem('reports-view-mode')
+    return (saved as ViewMode) || 'card'
+  })
   const [rateLimitInfo, setRateLimitInfo] = useState<{
     isLimited: boolean
     remainingSeconds: number
@@ -25,6 +34,11 @@ export default function Reports() {
   } | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false) // Track button loading state
+
+  // Persist view mode preference
+  React.useEffect(() => {
+    localStorage.setItem('reports-view-mode', viewMode)
+  }, [viewMode])
   
   const { data: hosts, isLoading: hostsLoading } = useBackupHosts()
 
@@ -563,23 +577,26 @@ export default function Reports() {
               {/* VM List */}
               <Card>
                 <CardHeader>
-                  <div className="flex items-center justify-between">
+                  <div className="flex items-center justify-between flex-wrap gap-3">
                     <CardTitle>
                       Virtual Machines ({filteredVMs.length}
                       {(selectedPoolPath !== 'all' || searchQuery) && ` of ${report.data.vms.length} total`})
                     </CardTitle>
-                    {(selectedPoolPath !== 'all' || searchQuery) && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => {
-                          setSelectedPoolPath('all')
-                          setSearchQuery('')
-                        }}
-                      >
-                        Clear Filters
-                      </Button>
-                    )}
+                    <div className="flex items-center gap-3 flex-wrap">
+                      <ViewModeSelector currentMode={viewMode} onChange={setViewMode} />
+                      {(selectedPoolPath !== 'all' || searchQuery) && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => {
+                            setSelectedPoolPath('all')
+                            setSearchQuery('')
+                          }}
+                        >
+                          Clear Filters
+                        </Button>
+                      )}
+                    </div>
                   </div>
                 </CardHeader>
                 <CardContent>
@@ -609,11 +626,18 @@ export default function Reports() {
                       )}
                     </div>
                   ) : (
-                    <div className="space-y-4">
-                      {filteredVMs.map((vm: any) => (
-                        <VMReportCard key={vm.vm_name} vm={vm} />
-                      ))}
-                    </div>
+                    <>
+                      {viewMode === 'card' && (
+                        <div className="space-y-4">
+                          {filteredVMs.map((vm: any) => (
+                            <VMReportCard key={vm.vm_name} vm={vm} />
+                          ))}
+                        </div>
+                      )}
+                      {viewMode === 'table' && <VMTableView vms={filteredVMs} />}
+                      {viewMode === 'chart' && <VMChartView vms={filteredVMs} />}
+                      {viewMode === 'compact' && <VMCompactView vms={filteredVMs} />}
+                    </>
                   )}
                 </CardContent>
               </Card>
