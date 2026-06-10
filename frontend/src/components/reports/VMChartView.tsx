@@ -1,5 +1,7 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
+import { Badge } from '@/components/ui/badge'
 import {
   PieChart,
   Pie,
@@ -13,7 +15,9 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts'
-import { CheckCircle, XCircle, AlertTriangle, HardDrive } from 'lucide-react'
+import { CheckCircle, XCircle, AlertTriangle, HardDrive, ChevronDown, ChevronRight, BarChart3 } from 'lucide-react'
+import VMCharts from '@/components/reports/VMCharts'
+import { cn } from '@/lib/utils'
 
 interface VMChartViewProps {
   vms: any[]
@@ -35,14 +39,6 @@ const HEALTH_LABELS: Record<string, string> = {
   no_backups: 'No Backups',
 }
 
-const SCHEDULE_COLORS: Record<string, string> = {
-  daily: '#3b82f6',
-  weekly: '#8b5cf6',
-  monthly: '#ec4899',
-  custom: '#f59e0b',
-  once: '#10b981',
-}
-
 const formatBytes = (bytes: number): string => {
   if (!bytes || bytes === 0) return '0 B'
   const k = 1024
@@ -51,8 +47,47 @@ const formatBytes = (bytes: number): string => {
   return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`
 }
 
+const getHealthIcon = (health: string) => {
+  switch (health) {
+    case 'healthy':
+      return <CheckCircle className="h-4 w-4 text-green-600" />
+    case 'in_progress':
+      return <HardDrive className="h-4 w-4 text-blue-600 animate-pulse" />
+    case 'partially_corrupted':
+      return <AlertTriangle className="h-4 w-4 text-yellow-600" />
+    case 'all_corrupted':
+    case 'no_backups':
+      return <XCircle className="h-4 w-4 text-red-600" />
+    default:
+      return <HardDrive className="h-4 w-4 text-gray-600" />
+  }
+}
+
 export default function VMChartView({ vms }: VMChartViewProps) {
-  // Health distribution data
+  const [showOverview, setShowOverview] = useState(true)
+  const [expandedVMs, setExpandedVMs] = useState<Set<string>>(new Set())
+  const [allExpanded, setAllExpanded] = useState(false)
+
+  const toggleVM = (vmName: string) => {
+    setExpandedVMs((prev) => {
+      const next = new Set(prev)
+      if (next.has(vmName)) next.delete(vmName)
+      else next.add(vmName)
+      return next
+    })
+  }
+
+  const toggleAllVMs = () => {
+    if (allExpanded) {
+      setExpandedVMs(new Set())
+      setAllExpanded(false)
+    } else {
+      setExpandedVMs(new Set(vms.map((vm: any) => vm.vm_name)))
+      setAllExpanded(true)
+    }
+  }
+
+  // Aggregate health distribution
   const healthData = useMemo(() => {
     const counts: Record<string, number> = {}
     vms.forEach((vm) => {
@@ -67,28 +102,6 @@ export default function VMChartView({ vms }: VMChartViewProps) {
     }))
   }, [vms])
 
-  // Storage pool distribution data
-  const storagePoolData = useMemo(() => {
-    const pools: Record<string, { count: number; size: number }> = {}
-    vms.forEach((vm) => {
-      const pool = vm.storage_pool_path || 'Unknown'
-      if (!pools[pool]) {
-        pools[pool] = { count: 0, size: 0 }
-      }
-      pools[pool].count += 1
-      pools[pool].size += vm.total_disk_usage_bytes || 0
-    })
-    return Object.entries(pools)
-      .map(([pool, data]) => ({
-        name: pool.length > 30 ? '...' + pool.slice(-27) : pool,
-        fullName: pool,
-        count: data.count,
-        sizeGB: parseFloat((data.size / (1024 * 1024 * 1024)).toFixed(2)),
-      }))
-      .sort((a, b) => b.sizeGB - a.sizeGB)
-      .slice(0, 10) // Top 10 storage pools
-  }, [vms])
-
   // Top VMs by size
   const topVMsBySize = useMemo(() => {
     return [...vms]
@@ -101,25 +114,6 @@ export default function VMChartView({ vms }: VMChartViewProps) {
         sizeGB: parseFloat(((vm.total_disk_usage_bytes || 0) / (1024 * 1024 * 1024)).toFixed(2)),
         health: vm.health,
       }))
-  }, [vms])
-
-  // Schedule type distribution
-  const scheduleData = useMemo(() => {
-    const schedules: Record<string, number> = {}
-    vms.forEach((vm) => {
-      if (vm.schedules) {
-        Object.entries(vm.schedules).forEach(([scheduleName, scheduleData]: any) => {
-          if (scheduleData.backup_count > 0) {
-            schedules[scheduleName] = (schedules[scheduleName] || 0) + 1
-          }
-        })
-      }
-    })
-    return Object.entries(schedules).map(([name, count]) => ({
-      name,
-      count,
-      color: SCHEDULE_COLORS[name] || '#9ca3af',
-    }))
   }, [vms])
 
   // Summary statistics
@@ -190,177 +184,161 @@ export default function VMChartView({ vms }: VMChartViewProps) {
   }
 
   return (
-    <div className="space-y-6">
-      {/* Quick Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-gray-600">Health Score</p>
-            <p className="text-3xl font-bold text-green-600">{stats.healthPercentage}%</p>
-            <p className="text-xs text-gray-500 mt-1">{stats.healthyCount}/{vms.length} healthy</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-gray-600">Total Storage</p>
-            <p className="text-2xl font-bold text-purple-600">{stats.totalSize}</p>
-            <p className="text-xs text-gray-500 mt-1">across all VMs</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-gray-600">Avg per VM</p>
-            <p className="text-2xl font-bold text-blue-600">{stats.avgSize}</p>
-            <p className="text-xs text-gray-500 mt-1">average size</p>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-sm text-gray-600">Issues</p>
-            <p className="text-3xl font-bold text-red-600">{stats.issueCount}</p>
-            <p className="text-xs text-gray-500 mt-1">need attention</p>
-          </CardContent>
-        </Card>
+    <div className="space-y-4">
+      {/* Toggle Aggregate Overview */}
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setShowOverview(!showOverview)}
+        >
+          {showOverview ? <ChevronDown className="h-4 w-4 mr-1" /> : <ChevronRight className="h-4 w-4 mr-1" />}
+          {showOverview ? 'Hide' : 'Show'} Overall Statistics
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={toggleAllVMs}
+        >
+          {allExpanded ? 'Collapse' : 'Expand'} All VM Charts
+        </Button>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Health Distribution Pie Chart */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">Health Distribution</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={300}>
-              <PieChart>
-                <Pie
-                  data={healthData}
-                  cx="50%"
-                  cy="50%"
-                  labelLine={false}
-                  label={({ name, percent }: any) => `${name}: ${(percent * 100).toFixed(0)}%`}
-                  outerRadius={100}
-                  fill="#8884d8"
-                  dataKey="value"
-                >
-                  {healthData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={entry.color} />
-                  ))}
-                </Pie>
-                <Tooltip content={<CustomPieTooltip />} />
-              </PieChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        {/* Schedule Type Distribution */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">Active Backup Schedules</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {scheduleData.length > 0 ? (
-              <ResponsiveContainer width="100%" height={300}>
-                <BarChart data={scheduleData}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                  <XAxis dataKey="name" />
-                  <YAxis allowDecimals={false} />
-                  <Tooltip content={<CustomBarTooltip />} />
-                  <Bar dataKey="count" name="VMs with this schedule">
-                    {scheduleData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="flex items-center justify-center h-[300px] text-gray-500">
-                <p>No active schedules</p>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Storage Pool Distribution */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">Storage Pool Usage (Top 10)</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {storagePoolData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={350}>
-              <BarChart data={storagePoolData} layout="vertical" margin={{ left: 20, right: 30 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                <XAxis type="number" />
-                <YAxis dataKey="name" type="category" width={150} tick={{ fontSize: 12 }} />
-                <Tooltip content={<CustomBarTooltip />} />
-                <Legend />
-                <Bar dataKey="sizeGB" name="Size (GB)" fill="#8b5cf6" />
-                <Bar dataKey="count" name="VM Count" fill="#3b82f6" />
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="flex items-center justify-center h-[350px] text-gray-500">
-              <p>No storage pool data</p>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Top VMs by Size */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-lg">Top 10 VMs by Backup Size</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {topVMsBySize.length > 0 ? (
-            <ResponsiveContainer width="100%" height={400}>
-              <BarChart data={topVMsBySize} layout="vertical" margin={{ left: 20, right: 30 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                <XAxis type="number" />
-                <YAxis dataKey="name" type="category" width={180} tick={{ fontSize: 11 }} />
-                <Tooltip content={<CustomBarTooltip />} />
-                <Bar dataKey="sizeGB" name="Size (GB)">
-                  {topVMsBySize.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={HEALTH_COLORS[entry.health] || '#3b82f6'} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="flex items-center justify-center h-[400px] text-gray-500">
-              <p>No VM size data</p>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Health Legend */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">Health Status Legend</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-            {Object.entries(HEALTH_LABELS).map(([key, label]) => {
-              const Icon = key === 'healthy' ? CheckCircle 
-                : key === 'in_progress' ? HardDrive
-                : key === 'partially_corrupted' ? AlertTriangle
-                : XCircle
-              return (
-                <div key={key} className="flex items-center space-x-2">
-                  <div 
-                    className="w-3 h-3 rounded-sm"
-                    style={{ backgroundColor: HEALTH_COLORS[key] }}
-                  />
-                  <Icon className="h-4 w-4" style={{ color: HEALTH_COLORS[key] }} />
-                  <span className="text-sm text-gray-700">{label}</span>
-                </div>
-              )
-            })}
+      {/* Aggregate Overview Section */}
+      {showOverview && (
+        <div className="space-y-4 pb-4 border-b border-gray-200">
+          {/* Quick Stats */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <Card>
+              <CardContent className="pt-6">
+                <p className="text-sm text-gray-600">Health Score</p>
+                <p className="text-3xl font-bold text-green-600">{stats.healthPercentage}%</p>
+                <p className="text-xs text-gray-500 mt-1">{stats.healthyCount}/{vms.length} healthy</p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <p className="text-sm text-gray-600">Total Storage</p>
+                <p className="text-2xl font-bold text-purple-600">{stats.totalSize}</p>
+                <p className="text-xs text-gray-500 mt-1">across all VMs</p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <p className="text-sm text-gray-600">Avg per VM</p>
+                <p className="text-2xl font-bold text-blue-600">{stats.avgSize}</p>
+                <p className="text-xs text-gray-500 mt-1">average size</p>
+              </CardContent>
+            </Card>
+            <Card>
+              <CardContent className="pt-6">
+                <p className="text-sm text-gray-600">Issues</p>
+                <p className="text-3xl font-bold text-red-600">{stats.issueCount}</p>
+                <p className="text-xs text-gray-500 mt-1">need attention</p>
+              </CardContent>
+            </Card>
           </div>
-        </CardContent>
-      </Card>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            {/* Health Distribution Pie */}
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-base">Overall Health Distribution</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ResponsiveContainer width="100%" height={250}>
+                  <PieChart>
+                    <Pie
+                      data={healthData}
+                      cx="50%"
+                      cy="50%"
+                      labelLine={false}
+                      label={({ name, percent }: any) => `${name}: ${(percent * 100).toFixed(0)}%`}
+                      outerRadius={85}
+                      dataKey="value"
+                    >
+                      {healthData.map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={entry.color} />
+                      ))}
+                    </Pie>
+                    <Tooltip content={<CustomPieTooltip />} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </CardContent>
+            </Card>
+
+            {/* Top VMs by Size */}
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="text-base">Top 10 VMs by Size</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <ResponsiveContainer width="100%" height={250}>
+                  <BarChart data={topVMsBySize} layout="vertical" margin={{ left: 10, right: 20 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                    <XAxis type="number" tick={{ fontSize: 11 }} />
+                    <YAxis dataKey="name" type="category" width={140} tick={{ fontSize: 10 }} />
+                    <Tooltip content={<CustomBarTooltip />} />
+                    <Bar dataKey="sizeGB" name="Size (GB)">
+                      {topVMsBySize.map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={HEALTH_COLORS[entry.health] || '#3b82f6'} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      )}
+
+      {/* Per-VM Charts Section */}
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h3 className="text-base font-semibold flex items-center gap-2">
+            <BarChart3 className="h-4 w-4 text-blue-600" />
+            Individual VM Charts
+            <span className="text-xs font-normal text-gray-500">(click any VM to expand)</span>
+          </h3>
+        </div>
+
+        <div className="space-y-2">
+          {vms.map((vm: any) => {
+            const isExpanded = expandedVMs.has(vm.vm_name)
+            return (
+              <Card key={vm.vm_name} className={cn(isExpanded && 'shadow-md')}>
+                <CardContent className="p-3">
+                  <button
+                    onClick={() => toggleVM(vm.vm_name)}
+                    className="w-full flex items-center justify-between gap-3 text-left hover:bg-gray-50 -m-3 p-3 rounded transition-colors"
+                  >
+                    <div className="flex items-center gap-3 flex-1 min-w-0">
+                      {isExpanded ? <ChevronDown className="h-4 w-4 flex-shrink-0" /> : <ChevronRight className="h-4 w-4 flex-shrink-0" />}
+                      {getHealthIcon(vm.health)}
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium text-sm truncate" title={vm.vm_name}>{vm.vm_name}</p>
+                        <p className="text-xs text-gray-500 truncate">{vm.storage_pool_path}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 flex-shrink-0">
+                      <Badge variant="outline" className="text-xs hidden sm:inline-flex">
+                        {vm.available_schedule_count} schedules
+                      </Badge>
+                      <span className="text-sm font-mono text-gray-700">{vm.total_disk_usage_gb}</span>
+                    </div>
+                  </button>
+
+                  {isExpanded && (
+                    <div className="mt-4 pt-4 border-t">
+                      <VMCharts vm={vm} />
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )
+          })}
+        </div>
+      </div>
     </div>
   )
 }

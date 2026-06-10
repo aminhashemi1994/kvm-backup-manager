@@ -2,17 +2,24 @@ import { useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { ChevronDown, ChevronRight, HardDrive, CheckCircle, XCircle, AlertTriangle } from 'lucide-react'
+import { ChevronDown, ChevronRight, HardDrive, CheckCircle, XCircle, AlertTriangle, FileText, BarChart3, Table } from 'lucide-react'
 import ScheduleDetails from '@/components/reports/ScheduleDetails'
 import ReportDownloadMenu from '@/components/reports/ReportDownloadMenu'
+import VMCharts from '@/components/reports/VMCharts'
+import VMScheduleTable from '@/components/reports/VMScheduleTable'
 import { useAllVMs } from '@/hooks/useBackupHosts'
+import { cn } from '@/lib/utils'
 
 interface VMReportCardProps {
   vm: any
+  defaultView?: 'details' | 'charts' | 'table'
 }
 
-export default function VMReportCard({ vm }: VMReportCardProps) {
+type VMView = 'details' | 'charts' | 'table'
+
+export default function VMReportCard({ vm, defaultView = 'details' }: VMReportCardProps) {
   const [expanded, setExpanded] = useState(false)
+  const [activeView, setActiveView] = useState<VMView>(defaultView)
   const { data: allVMs } = useAllVMs()
   // The report record only has vm_name. Look up the controller-side VM id
   // so the download endpoint (which keys on id) can find the right entry.
@@ -50,6 +57,12 @@ export default function VMReportCard({ vm }: VMReportCardProps) {
         return <HardDrive className="h-5 w-5 text-gray-600" />
     }
   }
+
+  const views: { id: VMView; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+    { id: 'details', label: 'Details', icon: FileText },
+    { id: 'charts', label: 'Charts', icon: BarChart3 },
+    { id: 'table', label: 'Table', icon: Table },
+  ]
 
   return (
     <Card>
@@ -100,33 +113,69 @@ export default function VMReportCard({ vm }: VMReportCardProps) {
 
         {expanded && (
           <div className="mt-4 pt-4 border-t space-y-4">
-            {/* Summary Stats */}
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-              <div>
-                <p className="text-gray-600">Available Schedules</p>
-                <p className="font-medium">{vm.available_schedule_count}</p>
-              </div>
-              <div>
-                <p className="text-gray-600">Corrupted</p>
-                <p className="font-medium text-red-600">{vm.corrupted_schedule_count}</p>
-              </div>
-              <div>
-                <p className="text-gray-600">Archived</p>
-                <p className="font-medium">{vm.archived_backup_count}</p>
-              </div>
-              <div>
-                <p className="text-gray-600">Total Size</p>
-                <p className="font-medium">{vm.total_disk_usage_gb}</p>
+            {/* View Mode Tabs */}
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="inline-flex items-center rounded-lg border border-gray-200 bg-gray-50 p-1">
+                {views.map((view) => {
+                  const Icon = view.icon
+                  const isActive = activeView === view.id
+                  return (
+                    <button
+                      key={view.id}
+                      onClick={() => setActiveView(view.id)}
+                      className={cn(
+                        'inline-flex items-center space-x-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-all',
+                        isActive
+                          ? 'bg-white text-blue-600 shadow-sm'
+                          : 'text-gray-600 hover:bg-white/50 hover:text-gray-900'
+                      )}
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      <span>{view.label}</span>
+                    </button>
+                  )
+                })}
               </div>
             </div>
 
-            {/* Schedules */}
-            <div className="space-y-2">
-              <h5 className="font-medium text-sm">Backup Schedules</h5>
-              {vm.schedules.map((schedule: any, index: number) => (
-                <ScheduleDetails key={index} schedule={schedule} />
-              ))}
-            </div>
+            {/* Details View */}
+            {activeView === 'details' && (
+              <div className="space-y-4">
+                {/* Summary Stats */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                  <div>
+                    <p className="text-gray-600">Available Schedules</p>
+                    <p className="font-medium">{vm.available_schedule_count}</p>
+                  </div>
+                  <div>
+                    <p className="text-gray-600">Corrupted</p>
+                    <p className="font-medium text-red-600">{vm.corrupted_schedule_count}</p>
+                  </div>
+                  <div>
+                    <p className="text-gray-600">Archived</p>
+                    <p className="font-medium">{vm.archived_backup_count}</p>
+                  </div>
+                  <div>
+                    <p className="text-gray-600">Total Size</p>
+                    <p className="font-medium">{vm.total_disk_usage_gb}</p>
+                  </div>
+                </div>
+
+                {/* Schedules */}
+                <div className="space-y-2">
+                  <h5 className="font-medium text-sm">Backup Schedules</h5>
+                  {vm.schedules.map((schedule: any, index: number) => (
+                    <ScheduleDetails key={index} schedule={schedule} />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Charts View */}
+            {activeView === 'charts' && <VMCharts vm={vm} />}
+
+            {/* Table View */}
+            {activeView === 'table' && <VMScheduleTable vm={vm} />}
           </div>
         )}
       </CardContent>

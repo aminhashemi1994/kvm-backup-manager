@@ -7,7 +7,7 @@ interface VMTableViewProps {
   vms: any[]
 }
 
-type SortField = 'vm_name' | 'health' | 'total_disk_usage_bytes' | 'last_backup_at' | 'storage_pool_path'
+type SortField = 'vm_name' | 'health' | 'total_disk_usage_bytes' | 'last_backup_date' | 'storage_pool_path' | 'schedule_count'
 type SortDirection = 'asc' | 'desc'
 
 const formatBytes = (bytes: number): string => {
@@ -18,17 +18,33 @@ const formatBytes = (bytes: number): string => {
   return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`
 }
 
-const formatDate = (dateString: string | null): string => {
-  if (!dateString) return 'Never'
-  const date = new Date(dateString)
+const getLastBackupDate = (vm: any): { date: Date | null; display: string } => {
+  if (!Array.isArray(vm.schedules)) return { date: null, display: 'Never' }
+  
+  let latest: Date | null = null
+  vm.schedules.forEach((schedule: any) => {
+    const dateStr = schedule.dump_analysis?.last_backup_date
+    if (dateStr) {
+      const d = new Date(dateStr)
+      if (!latest || d > latest) {
+        latest = d
+      }
+    }
+  })
+  
+  if (!latest) return { date: null, display: 'Never' }
+  
   const now = new Date()
-  const diffMs = now.getTime() - date.getTime()
+  const diffMs = now.getTime() - (latest as Date).getTime()
   const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24))
   
-  if (diffDays === 0) return 'Today'
-  if (diffDays === 1) return 'Yesterday'
-  if (diffDays < 7) return `${diffDays} days ago`
-  return date.toLocaleDateString()
+  let display: string
+  if (diffDays === 0) display = 'Today'
+  else if (diffDays === 1) display = 'Yesterday'
+  else if (diffDays < 7) display = `${diffDays} days ago`
+  else display = (latest as Date).toLocaleDateString()
+  
+  return { date: latest, display }
 }
 
 const getHealthBadge = (health: string) => {
@@ -65,8 +81,19 @@ export default function VMTableView({ vms }: VMTableViewProps) {
   }
 
   const sortedVMs = [...vms].sort((a, b) => {
-    let aVal = a[sortField]
-    let bVal = b[sortField]
+    let aVal: any
+    let bVal: any
+    
+    if (sortField === 'last_backup_date') {
+      aVal = getLastBackupDate(a).date?.getTime() || 0
+      bVal = getLastBackupDate(b).date?.getTime() || 0
+    } else if (sortField === 'schedule_count') {
+      aVal = a.available_schedule_count || 0
+      bVal = b.available_schedule_count || 0
+    } else {
+      aVal = a[sortField]
+      bVal = b[sortField]
+    }
     
     if (aVal === null || aVal === undefined) aVal = ''
     if (bVal === null || bVal === undefined) bVal = ''
@@ -106,21 +133,19 @@ export default function VMTableView({ vms }: VMTableViewProps) {
             <SortableHeader field="vm_name">VM Name</SortableHeader>
             <SortableHeader field="health">Health</SortableHeader>
             <SortableHeader field="total_disk_usage_bytes">Total Size</SortableHeader>
-            <SortableHeader field="last_backup_at">Last Backup</SortableHeader>
+            <SortableHeader field="last_backup_date">Last Backup</SortableHeader>
             <SortableHeader field="storage_pool_path">Storage Pool</SortableHeader>
-            <th className="px-4 py-3 text-left text-xs font-semibold text-gray-700 uppercase tracking-wider">
-              Schedules
-            </th>
+            <SortableHeader field="schedule_count">Schedules</SortableHeader>
           </tr>
         </thead>
         <tbody className="bg-white divide-y divide-gray-200">
           {sortedVMs.map((vm) => {
-            const scheduleCount = vm.schedules ? Object.keys(vm.schedules).length : 0
-            const activeSchedules = vm.schedules 
-              ? Object.entries(vm.schedules)
-                  .filter(([_, s]: any) => s.backup_count > 0)
-                  .map(([name]: any) => name)
+            const activeSchedules = Array.isArray(vm.schedules)
+              ? vm.schedules
+                  .filter((s: any) => s.available && !s.corrupted)
+                  .map((s: any) => s.schedule)
               : []
+            const lastBackup = getLastBackupDate(vm)
             
             return (
               <tr key={vm.vm_name} className="hover:bg-gray-50 transition-colors">
@@ -133,10 +158,10 @@ export default function VMTableView({ vms }: VMTableViewProps) {
                   {getHealthBadge(vm.health)}
                 </td>
                 <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-700 font-mono">
-                  {formatBytes(vm.total_disk_usage_bytes || 0)}
+                  {vm.total_disk_usage_gb || formatBytes(vm.total_disk_usage_bytes || 0)}
                 </td>
                 <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-700">
-                  {formatDate(vm.last_backup_at)}
+                  {lastBackup.display}
                 </td>
                 <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-600 font-mono text-xs">
                   <div className="truncate max-w-xs" title={vm.storage_pool_path}>
@@ -146,13 +171,16 @@ export default function VMTableView({ vms }: VMTableViewProps) {
                 <td className="px-4 py-3 whitespace-nowrap text-sm text-gray-700">
                   <div className="flex flex-wrap gap-1">
                     {activeSchedules.length > 0 ? (
-                      activeSchedules.map((schedule: string) => (
+                      activeSchedules.slice(0, 4).map((schedule: string) => (
                         <Badge key={schedule} variant="outline" className="text-xs">
                           {schedule}
                         </Badge>
                       ))
                     ) : (
                       <span className="text-gray-400 text-xs">No active</span>
+                    )}
+                    {activeSchedules.length > 4 && (
+                      <span className="text-xs text-gray-500">+{activeSchedules.length - 4}</span>
                     )}
                   </div>
                 </td>
