@@ -42,7 +42,6 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
     
     // Weekly
     daysOfWeek: [] as number[],
-    fullBackupDay: 1,
     
     // Custom Days
     customDates: [] as CustomDate[],
@@ -195,7 +194,7 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
           case 'weekly':
             data.time = formData.time
             data.daysOfWeek = formData.daysOfWeek
-            data.fullBackupDay = formData.fullBackupDay
+            data.incrementalCount = formData.incrementalCount
             break
           
           case 'custom-days':
@@ -394,20 +393,18 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="fullBackupDay">Full Backup Day *</Label>
-                  <Select
-                    id="fullBackupDay"
-                    value={formData.fullBackupDay.toString()}
-                    onChange={(e) => setFormData({ ...formData, fullBackupDay: parseInt(e.target.value) })}
-                  >
-                    {dayNames.map((day, index) => (
-                      <option key={index} value={index}>
-                        {day}
-                      </option>
-                    ))}
-                  </Select>
+                  <Label htmlFor="incrementalCount">Incremental Count *</Label>
+                  <Input
+                    id="incrementalCount"
+                    type="number"
+                    min="1"
+                    max="30"
+                    value={formData.incrementalCount}
+                    onChange={(e) => setFormData({ ...formData, incrementalCount: parseInt(e.target.value) || 1 })}
+                    required
+                  />
                   <p className="text-xs text-gray-500">
-                    This day will run full backup, others will run incremental
+                    Number of incremental backups before a new full backup. After this many incrementals, the chain is archived and a new full backup starts.
                   </p>
                 </div>
               </div>

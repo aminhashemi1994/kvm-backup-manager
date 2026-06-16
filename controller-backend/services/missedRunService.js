@@ -206,8 +206,10 @@ class MissedRunService {
         if (cursor.getTime() < fromMs) cursor.setDate(cursor.getDate() + 1);
         while (cursor.getTime() <= toMs) {
           if (days.includes(cursor.getDay())) {
-            const isFullDay = cursor.getDay() === schedule.fullBackupDay;
-            pushIfInWindow(new Date(cursor), { method: isFullDay ? 'full' : 'inc' });
+            // Method is determined at runtime by backupCycleService based on
+            // incrementalCount, just like daily. Use 'inc' as default since
+            // most backups in a chain are incremental.
+            pushIfInWindow(new Date(cursor), { method: 'inc' });
           }
           cursor.setDate(cursor.getDate() + 1);
         }

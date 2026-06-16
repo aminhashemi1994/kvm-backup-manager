@@ -46,7 +46,6 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     
     // Weekly
     daysOfWeek: [] as number[],
-    fullBackupDay: 1,
     
     // Custom Days
     customDates: [] as CustomDate[],
@@ -190,7 +189,6 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
         daysOfWeek: schedule.daysOfWeek || [],
-        fullBackupDay: schedule.fullBackupDay !== undefined ? schedule.fullBackupDay : 1,
         customDates: schedule.customDates || [],
         retentionCount: schedule.retentionCount || 5,
         intervalValue: schedule.intervalValue || 12,
@@ -319,7 +317,7 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         case 'weekly':
           data.time = formData.time
           data.daysOfWeek = formData.daysOfWeek
-          data.fullBackupDay = formData.fullBackupDay
+          data.incrementalCount = formData.incrementalCount
           break
         case 'custom-days':
           data.customDates = formData.customDates
@@ -772,20 +770,18 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                   </div>
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="fullBackupDay">Full Backup Day *</Label>
-                  <Select
-                    id="fullBackupDay"
-                    value={formData.fullBackupDay.toString()}
-                    onChange={(e) => setFormData({ ...formData, fullBackupDay: parseInt(e.target.value) })}
-                  >
-                    {dayNames.map((day, index) => (
-                      <option key={index} value={index}>
-                        {day}
-                      </option>
-                    ))}
-                  </Select>
+                  <Label htmlFor="incrementalCount">Incremental Count *</Label>
+                  <Input
+                    id="incrementalCount"
+                    type="number"
+                    min="1"
+                    max="30"
+                    value={formData.incrementalCount}
+                    onChange={(e) => setFormData({ ...formData, incrementalCount: parseInt(e.target.value) || 1 })}
+                    required
+                  />
                   <p className="text-xs text-gray-500">
-                    This day will run full backup, others will run incremental
+                    Number of incremental backups before a new full backup. After this many incrementals, the chain is archived and a new full backup starts.
                   </p>
                 </div>
               </div>

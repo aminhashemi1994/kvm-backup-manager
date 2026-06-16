@@ -215,7 +215,7 @@ class SchedulerService {
           };
 
           // Check if this was a scheduled backup with cycle management
-          if (schedule && (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron')) {
+          if (schedule && (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly')) {
             await agentService.triggerScheduledBackup(host.url, {
               ...backupData,
               vmId: skippedJob.vmId,
@@ -462,7 +462,7 @@ class SchedulerService {
         verbose: schedule.verbose || false,
         method: job.method, // Use same method as original
         isRetry: true, // NEW: Flag to indicate this is a retry
-        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron'
+        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
           : {}),
       });
@@ -634,7 +634,7 @@ class SchedulerService {
         noVerify: schedule.noVerify || false,
         offsiteHosts: offsiteHostIps,
         verbose: schedule.verbose || false,
-        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron'
+        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
           : {}),
       });
@@ -804,14 +804,10 @@ class SchedulerService {
       // Determine backup method based on schedule type
       let method = 'full';
       
-      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron') {
-        // Use backup cycle service to determine method
+      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly') {
+        // Use backup cycle service to determine method (same logic as daily)
         const cycleStatus = await backupCycleService.getBackupCycleStatus(vm.id);
         method = cycleStatus.nextMethod;
-      } else if (schedule.scheduleType === 'weekly') {
-        // Check if today is the full backup day
-        const today = new Date().getDay();
-        method = (today === schedule.fullBackupDay) ? 'full' : 'inc';
       }
 
       if (host.status !== 'online') {
@@ -903,14 +899,10 @@ class SchedulerService {
         return;
       }
       
-      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron') {
-        // Use backup cycle service to determine method
+      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly') {
+        // Use backup cycle service to determine method (same logic as daily)
         const cycleStatus = await backupCycleService.getBackupCycleStatus(vm.id);
         method = cycleStatus.nextMethod;
-      } else if (schedule.scheduleType === 'weekly') {
-        // Check if today is the full backup day
-        const today = new Date().getDay();
-        method = (today === schedule.fullBackupDay) ? 'full' : 'inc';
       }
 
       const job = {
@@ -1044,7 +1036,7 @@ class SchedulerService {
         noVerify: schedule.noVerify || false,
         offsiteHosts: offsiteHostIps,
         verbose: schedule.verbose || false,
-        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron'
+        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
           : {}),
       };
