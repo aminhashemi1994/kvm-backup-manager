@@ -75,8 +75,8 @@ const validateSchedule = (data) => {
       } else if (!data.daysOfWeek.every(d => d >= 0 && d <= 6)) {
         errors.push('Days of week must be between 0 (Sunday) and 6 (Saturday)');
       }
-      if (!data.fullBackupDay || typeof data.fullBackupDay !== 'number' || data.fullBackupDay < 0 || data.fullBackupDay > 6) {
-        errors.push('Full backup day must be specified (0-6) for weekly schedules');
+      if (!data.incrementalCount || typeof data.incrementalCount !== 'number' || data.incrementalCount < 1) {
+        errors.push('Incremental count must be a positive number for weekly schedules');
       }
       break;
 

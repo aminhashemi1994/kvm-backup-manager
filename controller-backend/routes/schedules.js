@@ -120,6 +120,35 @@ router.post('/', requireUser, async (req, res, next) => {
       });
     }
 
+    // Controller-side schedule conflict check:
+    // Prevent creating conflicting schedules for the same VM. The chain-based
+    // schedule types (daily/interval/cron/weekly/custom-days) all share the
+    // same full/inc backup chain, so only ONE can exist per VM at a time.
+    // The copy-based schedule types (once/monthly) are independent and can
+    // coexist freely.
+    const CHAIN_SCHEDULE_TYPES = ['daily', 'weekly', 'interval', 'cron', 'custom-days'];
+    if (CHAIN_SCHEDULE_TYPES.includes(req.body.scheduleType)) {
+      const existingSchedules = await getBackupSchedules();
+      const conflictingSchedule = existingSchedules.find(s =>
+        s.vmId === req.body.vmId &&
+        CHAIN_SCHEDULE_TYPES.includes(s.scheduleType) &&
+        s.scheduleType !== req.body.scheduleType
+      );
+
+      if (conflictingSchedule) {
+        return res.status(409).json({
+          success: false,
+          error: `Cannot create ${req.body.scheduleType} schedule. VM already has a ${conflictingSchedule.scheduleType} schedule. Only one chain-based schedule (daily/weekly/interval/cron/custom-days) is allowed per VM. Delete the existing schedule first or use 'once' or 'monthly' which can coexist.`,
+          conflictDetails: {
+            existingScheduleId: conflictingSchedule.id,
+            existingScheduleType: conflictingSchedule.scheduleType,
+            existingScheduleName: conflictingSchedule.name,
+            requestedScheduleType: req.body.scheduleType,
+          }
+        });
+      }
+    }
+
     // Check for schedule type conflicts (daily/interval/custom vs weekly)
     const agentService = require('../services/agentService');
     try {
@@ -198,7 +227,7 @@ router.post('/', requireUser, async (req, res, next) => {
       ...(req.body.scheduleType === 'weekly' && {
         time: req.body.time,
         daysOfWeek: req.body.daysOfWeek,
-        fullBackupDay: req.body.fullBackupDay,
+        incrementalCount: req.body.incrementalCount,
         cronExpression,
       }),
       
@@ -260,6 +289,32 @@ router.put('/:id', requireUser, async (req, res, next) => {
 
     // If schedule type is changing, check for conflicts
     if (req.body.scheduleType && req.body.scheduleType !== existingSchedule.scheduleType) {
+      // Controller-side conflict check: prevent changing to a chain-based
+      // schedule type when another chain-based schedule already exists for
+      // the same VM (excluding the schedule being edited).
+      const CHAIN_SCHEDULE_TYPES = ['daily', 'weekly', 'interval', 'cron', 'custom-days'];
+      if (CHAIN_SCHEDULE_TYPES.includes(req.body.scheduleType)) {
+        const conflictingSchedule = schedules.find(s =>
+          s.id !== existingSchedule.id &&
+          s.vmId === existingSchedule.vmId &&
+          CHAIN_SCHEDULE_TYPES.includes(s.scheduleType) &&
+          s.scheduleType !== req.body.scheduleType
+        );
+
+        if (conflictingSchedule) {
+          return res.status(409).json({
+            success: false,
+            error: `Cannot change schedule to ${req.body.scheduleType}. VM already has a ${conflictingSchedule.scheduleType} schedule. Only one chain-based schedule (daily/weekly/interval/cron/custom-days) is allowed per VM.`,
+            conflictDetails: {
+              existingScheduleId: conflictingSchedule.id,
+              existingScheduleType: conflictingSchedule.scheduleType,
+              existingScheduleName: conflictingSchedule.name,
+              requestedScheduleType: req.body.scheduleType,
+            }
+          });
+        }
+      }
+
       const vms = await getVirtualMachines();
       const vm = vms.find(v => v.id === existingSchedule.vmId);
       
@@ -356,7 +411,7 @@ router.put('/:id', requireUser, async (req, res, next) => {
       ...(scheduleType === 'weekly' && {
         time: req.body.time || existingSchedule.time,
         daysOfWeek: req.body.daysOfWeek || existingSchedule.daysOfWeek,
-        fullBackupDay: req.body.fullBackupDay !== undefined ? req.body.fullBackupDay : existingSchedule.fullBackupDay,
+        incrementalCount: req.body.incrementalCount || existingSchedule.incrementalCount,
         cronExpression,
       }),
       
