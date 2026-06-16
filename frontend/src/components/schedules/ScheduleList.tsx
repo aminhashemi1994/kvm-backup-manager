@@ -1,12 +1,13 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { Badge } from '@/components/ui/badge'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Select } from '@/components/ui/select'
 import {
   Plus, Trash2, Edit, Power, Loader2, CheckSquare, Search, XCircle,
-  Filter, ChevronDown, ChevronUp, Play,
+  Filter, ChevronDown, ChevronUp, Play, ChevronLeft, ChevronRight,
 } from 'lucide-react'
 import ScheduleForm from './ScheduleForm'
 import BulkEditScheduleDialog from './BulkEditScheduleDialog'
@@ -44,6 +45,18 @@ export default function ScheduleList() {
   const [showBulkEditDialog, setShowBulkEditDialog] = useState(false)
   const [filters, setFilters] = useState<FilterState>(initialFilters)
   const [filtersExpanded, setFiltersExpanded] = useState(false)
+  
+  // Pagination state. Defaults to 10/page; user can pick from 10/20/50/100.
+  // Persist preference in localStorage so it survives reloads.
+  const [currentPage, setCurrentPage] = useState(1)
+  const [pageSize, setPageSize] = useState<number>(() => {
+    const saved = parseInt(localStorage.getItem('schedules-page-size') || '10', 10)
+    return [10, 20, 50, 100].includes(saved) ? saved : 10
+  })
+
+  useEffect(() => {
+    localStorage.setItem('schedules-page-size', String(pageSize))
+  }, [pageSize])
 
   const { data: schedules, isLoading } = useSchedules()
   const deleteSchedule = useDeleteSchedule()
@@ -131,6 +144,27 @@ export default function ScheduleList() {
     return n
   }, [filters])
 
+  // Reset to page 1 whenever filters change so the user isn't stranded on
+  // a now-out-of-range page after narrowing the result set.
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [filters])
+
+  // Pagination math. Always run after filtering.
+  const totalItems = filteredSchedules.length
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
+  const startIndex = (currentPage - 1) * pageSize
+  const endIndex = startIndex + pageSize
+  const paginatedSchedules = filteredSchedules.slice(startIndex, endIndex)
+
+  // Clamp current page if total shrinks below current page (e.g. after deletion
+  // or filter change reduces result count).
+  useEffect(() => {
+    if (currentPage > totalPages) {
+      setCurrentPage(totalPages)
+    }
+  }, [currentPage, totalPages])
+
   const resetFilters = () => setFilters(initialFilters)
 
   const handleDelete = async (id: string, name: string) => {
@@ -162,8 +196,21 @@ export default function ScheduleList() {
     })
   }
   const handleSelectAll = () => {
-    if (selectedScheduleIds.size === filteredSchedules.length) setSelectedScheduleIds(new Set())
-    else setSelectedScheduleIds(new Set(filteredSchedules.map(s => s.id)))
+    if (selectedScheduleIds.size === paginatedSchedules.length && paginatedSchedules.length > 0) {
+      // Currently all visible items are selected → deselect them
+      setSelectedScheduleIds(prev => {
+        const next = new Set(prev)
+        paginatedSchedules.forEach(s => next.delete(s.id))
+        return next
+      })
+    } else {
+      // Select all visible items (additive across pages)
+      setSelectedScheduleIds(prev => {
+        const next = new Set(prev)
+        paginatedSchedules.forEach(s => next.add(s.id))
+        return next
+      })
+    }
   }
   const handleBulkDelete = async () => {
     if (selectedScheduleIds.size === 0) return
@@ -423,8 +470,12 @@ export default function ScheduleList() {
 
               {/* Results count */}
               <p className="text-xs text-gray-500 mb-3">
-                Showing {filteredSchedules.length} of {schedules.length} schedules
-                {activeFilterCount > 0 && ` (${activeFilterCount} filter${activeFilterCount === 1 ? '' : 's'} active)`}
+                {totalItems > 0
+                  ? `Showing ${startIndex + 1}–${Math.min(endIndex, totalItems)} of ${totalItems}`
+                  : 'Showing 0'}
+                {' '}schedules
+                {schedules.length !== totalItems && ` (filtered from ${schedules.length})`}
+                {activeFilterCount > 0 && ` • ${activeFilterCount} filter${activeFilterCount === 1 ? '' : 's'} active`}
               </p>
 
               {filteredSchedules.length === 0 ? (
@@ -441,13 +492,14 @@ export default function ScheduleList() {
                   <div className="mb-4 flex items-center gap-2">
                     <Button variant="outline" size="sm" onClick={handleSelectAll}>
                       <CheckSquare className="h-4 w-4 mr-2" />
-                      {selectedScheduleIds.size === filteredSchedules.length && filteredSchedules.length > 0
-                        ? 'Deselect All'
-                        : 'Select All'}
+                      {paginatedSchedules.length > 0 && paginatedSchedules.every(s => selectedScheduleIds.has(s.id))
+                        ? 'Deselect Page'
+                        : 'Select Page'}
                     </Button>
                     {selectedScheduleIds.size > 0 && (
                       <span className="text-sm text-gray-600">
-                        {selectedScheduleIds.size} of {filteredSchedules.length} selected
+                        {selectedScheduleIds.size} selected
+                        {selectedScheduleIds.size > paginatedSchedules.length && ' (across pages)'}
                       </span>
                     )}
                   </div>
@@ -457,7 +509,7 @@ export default function ScheduleList() {
                       <TableRow>
                         <TableHead className="w-12">
                           <Checkbox
-                            checked={selectedScheduleIds.size === filteredSchedules.length && filteredSchedules.length > 0}
+                            checked={paginatedSchedules.length > 0 && paginatedSchedules.every(s => selectedScheduleIds.has(s.id))}
                             onChange={handleSelectAll}
                           />
                         </TableHead>
@@ -472,7 +524,7 @@ export default function ScheduleList() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {filteredSchedules.map((schedule: any) => {
+                      {paginatedSchedules.map((schedule: any) => {
                         const getScheduleInfo = () => {
                           switch (schedule.scheduleType) {
                             case 'daily': return `Daily at ${schedule.time || '00:00'}`
@@ -578,6 +630,110 @@ export default function ScheduleList() {
                       })}
                     </TableBody>
                   </Table>
+
+                  {/* Pagination Controls. The page-size selector is shown
+                      whenever there are items so users can switch between
+                      sizes (10/20/50/100) even if the result fits in one
+                      page. The page navigation only renders when there's
+                      more than one page. */}
+                  {totalItems > 0 && (
+                    <div className="mt-4 flex items-center justify-between flex-wrap gap-3 border-t pt-4">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm text-gray-600">Items per page:</span>
+                        <Select
+                          value={pageSize.toString()}
+                          onChange={(e) => {
+                            setPageSize(Number(e.target.value))
+                            setCurrentPage(1) // Reset to first page when changing page size
+                          }}
+                          className="w-20"
+                        >
+                          <option value="10">10</option>
+                          <option value="20">20</option>
+                          <option value="50">50</option>
+                          <option value="100">100</option>
+                        </Select>
+                        <span className="text-sm text-gray-500 hidden sm:inline">
+                          Page {currentPage} of {totalPages}
+                        </span>
+                      </div>
+
+                      {totalPages > 1 && (
+                        <div className="flex items-center gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                            disabled={currentPage === 1}
+                          >
+                            <ChevronLeft className="h-4 w-4 mr-1" />
+                            Previous
+                          </Button>
+
+                          <div className="flex items-center gap-1">
+                            {/* First page + ellipsis when far from start */}
+                            {currentPage > 3 && (
+                              <>
+                                <Button
+                                  variant={currentPage === 1 ? 'default' : 'outline'}
+                                  size="sm"
+                                  onClick={() => setCurrentPage(1)}
+                                  className="w-10"
+                                >
+                                  1
+                                </Button>
+                                {currentPage > 4 && (
+                                  <span className="px-2 text-gray-400">…</span>
+                                )}
+                              </>
+                            )}
+
+                            {/* Pages around current page (±2) */}
+                            {Array.from({ length: totalPages }, (_, i) => i + 1)
+                              .filter(page => page >= currentPage - 2 && page <= currentPage + 2)
+                              .map(page => (
+                                <Button
+                                  key={page}
+                                  variant={currentPage === page ? 'default' : 'outline'}
+                                  size="sm"
+                                  onClick={() => setCurrentPage(page)}
+                                  className="w-10"
+                                >
+                                  {page}
+                                </Button>
+                              ))}
+
+                            {/* Last page + ellipsis when far from end */}
+                            {currentPage < totalPages - 2 && (
+                              <>
+                                {currentPage < totalPages - 3 && (
+                                  <span className="px-2 text-gray-400">…</span>
+                                )}
+                                <Button
+                                  variant={currentPage === totalPages ? 'default' : 'outline'}
+                                  size="sm"
+                                  onClick={() => setCurrentPage(totalPages)}
+                                  className="w-10"
+                                >
+                                  {totalPages}
+                                </Button>
+                              </>
+                            )}
+                          </div>
+
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                            disabled={currentPage === totalPages}
+                          >
+                            Next
+                            <ChevronRight className="h-4 w-4 ml-1" />
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
             </>
