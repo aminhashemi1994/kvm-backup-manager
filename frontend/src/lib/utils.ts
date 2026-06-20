@@ -6,6 +6,35 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+/**
+ * Parse a VM name of the form "<uuid>_<readable-name>" into its parts.
+ * VM names in this system are prefixed with a generated id like
+ * "20251229-153547887023267-58_office-database-1-net.part5.psg.network".
+ * The portion after the FIRST underscore is the human-readable name.
+ *
+ * Returns:
+ *   - uuid:  the id prefix (everything before the first "_"), or "" if none
+ *   - title: the readable name (everything after the first "_"); falls back
+ *            to the whole string if there is no underscore
+ *   - full:  the original unmodified string
+ */
+export function parseVmName(vmName: string | null | undefined): {
+  uuid: string
+  title: string
+  full: string
+} {
+  const full = vmName || ''
+  const idx = full.indexOf('_')
+  if (idx === -1) {
+    return { uuid: '', title: full, full }
+  }
+  return {
+    uuid: full.slice(0, idx),
+    title: full.slice(idx + 1),
+    full,
+  }
+}
+
 // Toast wrapper to ensure all toasts have close button
 const defaultToastOptions = {
   closeButton: true,

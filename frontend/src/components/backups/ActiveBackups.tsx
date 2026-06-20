@@ -11,6 +11,8 @@ import { formatDuration } from '@/lib/utils'
 import LiveLogViewer from './LiveLogViewer'
 import JobStatusBadge from './JobStatusBadge'
 import JobProgressBar from './JobProgressBar'
+import VmNameCell from '@/components/common/VmNameCell'
+import VmNameToggle from '@/components/common/VmNameToggle'
 import socketService from '@/services/socket'
 import { useQueryClient } from '@tanstack/react-query'
 import { useConfirm } from '@/components/ui/confirm-dialog'
@@ -19,6 +21,12 @@ export default function ActiveBackups() {
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null)
   const [selectedJobType, setSelectedJobType] = useState<'backup' | 'restore'>('backup')
   const [searchQuery, setSearchQuery] = useState('')
+  const [showFullVmNames, setShowFullVmNames] = useState<boolean>(() => {
+    return localStorage.getItem('vm-name-display') === 'full'
+  })
+  useEffect(() => {
+    localStorage.setItem('vm-name-display', showFullVmNames ? 'full' : 'short')
+  }, [showFullVmNames])
   const queryClient = useQueryClient()
   const { data: activeBackups, isLoading: isLoadingBackups } = useActiveBackups()
   const { data: activeRestores, isLoading: isLoadingRestores } = useActiveRestores()
@@ -213,6 +221,7 @@ export default function ActiveBackups() {
           <div className="flex items-center justify-between">
             <CardTitle>Active & Queued Jobs</CardTitle>
             <div className="flex items-center gap-2">
+              <VmNameToggle showFull={showFullVmNames} onToggle={setShowFullVmNames} />
               <div className="relative w-64">
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
                 <Input
@@ -265,9 +274,7 @@ export default function ActiveBackups() {
                       </div>
                     </TableCell>
                     <TableCell className="font-medium">
-                      <div className="truncate max-w-[280px]" title={job.vmName}>
-                        {job.vmName}
-                      </div>
+                      <VmNameCell vmName={job.vmName} showFull={showFullVmNames} />
                     </TableCell>
                     <TableCell>
                       <Badge variant="outline">{(job.scheduleType || job.method || job.jobType).toUpperCase()}</Badge>

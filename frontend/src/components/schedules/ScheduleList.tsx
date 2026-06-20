@@ -11,6 +11,8 @@ import {
 } from 'lucide-react'
 import ScheduleForm from './ScheduleForm'
 import BulkEditScheduleDialog from './BulkEditScheduleDialog'
+import VmNameCell from '@/components/common/VmNameCell'
+import VmNameToggle from '@/components/common/VmNameToggle'
 import { useSchedules, useDeleteSchedule, useToggleSchedule, useRunScheduleNow } from '@/hooks/useBackups'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { getStatusColor } from '@/lib/utils'
@@ -57,6 +59,15 @@ export default function ScheduleList() {
   useEffect(() => {
     localStorage.setItem('schedules-page-size', String(pageSize))
   }, [pageSize])
+
+  // VM name display mode (short readable name vs full raw name). Shared
+  // preference key across tabs so it stays consistent app-wide.
+  const [showFullVmNames, setShowFullVmNames] = useState<boolean>(() => {
+    return localStorage.getItem('vm-name-display') === 'full'
+  })
+  useEffect(() => {
+    localStorage.setItem('vm-name-display', showFullVmNames ? 'full' : 'short')
+  }, [showFullVmNames])
 
   const { data: schedules, isLoading } = useSchedules()
   const deleteSchedule = useDeleteSchedule()
@@ -344,6 +355,10 @@ export default function ScheduleList() {
                     Reset
                   </Button>
                 )}
+
+                <div className="ml-auto">
+                  <VmNameToggle showFull={showFullVmNames} onToggle={setShowFullVmNames} />
+                </div>
               </div>
 
               {/* Expanded filters */}
@@ -571,14 +586,12 @@ export default function ScheduleList() {
                               </div>
                             </TableCell>
                             <TableCell>
-                              <div className="text-sm truncate max-w-[240px]" title={schedule.vmName}>
-                                {schedule.vmName}
-                              </div>
-                              {schedule.hypervisorName && (
-                                <div className="text-xs text-gray-400 truncate max-w-[240px]" title={schedule.hypervisorName}>
-                                  {schedule.hypervisorName}
-                                </div>
-                              )}
+                              <VmNameCell
+                                vmName={schedule.vmName}
+                                showFull={showFullVmNames}
+                                subtitle={schedule.hypervisorName}
+                                maxWidthClass="max-w-[240px]"
+                              />
                             </TableCell>
                             <TableCell className="text-sm text-gray-600">
                               {schedule.backupHostName || '—'}
