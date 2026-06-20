@@ -223,7 +223,11 @@ export default function BackupHistory() {
                         {job.jobType === 'restore' ? 'RESTORE' : 'BACKUP'}
                       </Badge>
                     </TableCell>
-                    <TableCell className="font-medium">{job.vmName}</TableCell>
+                    <TableCell className="font-medium">
+                      <div className="truncate max-w-[280px]" title={job.vmName}>
+                        {job.vmName}
+                      </div>
+                    </TableCell>
                     <TableCell>
                       <Badge variant="outline">{(job.scheduleType || job.method || 'backup').toUpperCase()}</Badge>
                     </TableCell>

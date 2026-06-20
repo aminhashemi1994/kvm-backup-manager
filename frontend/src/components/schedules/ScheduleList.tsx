@@ -565,11 +565,19 @@ export default function ScheduleList() {
                                 onChange={() => handleToggleScheduleSelection(schedule.id)}
                               />
                             </TableCell>
-                            <TableCell className="font-medium">{schedule.name}</TableCell>
+                            <TableCell className="font-medium">
+                              <div className="truncate max-w-[240px]" title={schedule.name}>
+                                {schedule.name}
+                              </div>
+                            </TableCell>
                             <TableCell>
-                              <div className="text-sm">{schedule.vmName}</div>
+                              <div className="text-sm truncate max-w-[240px]" title={schedule.vmName}>
+                                {schedule.vmName}
+                              </div>
                               {schedule.hypervisorName && (
-                                <div className="text-xs text-gray-400">{schedule.hypervisorName}</div>
+                                <div className="text-xs text-gray-400 truncate max-w-[240px]" title={schedule.hypervisorName}>
+                                  {schedule.hypervisorName}
+                                </div>
                               )}
                             </TableCell>
                             <TableCell className="text-sm text-gray-600">
