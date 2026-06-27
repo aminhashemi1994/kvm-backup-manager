@@ -6,7 +6,12 @@ const { writeJSON } = require('./fileStorage');
 
 const USERS_FILE = path.join(__dirname, '../data/users.json');
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '24h';
+// User session tokens use a short, sliding expiry. Each authenticated request
+// mints a fresh token (see middleware/auth.js), so an active session keeps
+// extending. After ~30 minutes of inactivity the token expires and the
+// frontend auto-logs-out. This ONLY affects frontend↔controller user tokens;
+// agent tokens (static + agent JWT) are separate and unaffected.
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30m';
 
 /**
  * Ensure users file exists and has default admin user

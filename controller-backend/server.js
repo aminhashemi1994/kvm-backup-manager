@@ -87,7 +87,9 @@ const io = new Server(server, {
 // Middleware
 app.use(cors({
   origin: config.frontendUrl,
-  credentials: true
+  credentials: true,
+  // Allow the browser to read the sliding-session refresh token header.
+  exposedHeaders: ['X-Refresh-Token']
 }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));

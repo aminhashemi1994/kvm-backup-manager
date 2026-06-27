@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react'
 import axios from 'axios'
+import { initActivityTracking, getLastActivity, clearActivity, IDLE_LIMIT_MS } from '@/lib/activity'
 
 interface AuthContextType {
   isAuthenticated: boolean
@@ -34,6 +35,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       verifyToken(storedToken)
     }
   }, [])
+
+  // Idle-session watcher. While authenticated, track real user activity and
+  // log out after IDLE_LIMIT_MS of no interaction. This is the authoritative
+  // idle clock; the server token expiry is a backstop for closed tabs.
+  useEffect(() => {
+    if (!isAuthenticated) return
+
+    initActivityTracking()
+
+    const interval = setInterval(() => {
+      const last = getLastActivity()
+      // If we somehow have no activity timestamp yet, seed handled by init.
+      if (last && Date.now() - last > IDLE_LIMIT_MS) {
+        console.info('[Auth] Session idle for 30 minutes — logging out')
+        logout()
+      }
+    }, 30 * 1000) // check every 30s
+
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated])
 
   const verifyToken = async (token: string) => {
     try {
@@ -120,6 +142,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem('authToken')
     localStorage.removeItem('user')
     localStorage.removeItem('userPassword') // Remove old client-side password
+    clearActivity()
   }
 
   return (
