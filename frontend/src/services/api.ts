@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { isUserActive } from '@/lib/activity'
 
 // Simple backend URL configuration
 // Just set VITE_BACKEND_URL to the full API base URL
@@ -17,6 +18,13 @@ api.interceptors.request.use(
     if (token) {
       config.headers.Authorization = `Bearer ${token}`
     }
+    // Tell the controller whether this request follows real user activity.
+    // The controller only extends (refreshes) the session token when the
+    // user is actually active, so background polling alone won't keep an
+    // unattended session alive forever.
+    if (isUserActive()) {
+      config.headers['X-Session-Active'] = '1'
+    }
     return config
   },
   (error) => {
@@ -26,7 +34,17 @@ api.interceptors.request.use(
 
 // Response interceptor to handle errors
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    // Sliding-session refresh: the controller returns a fresh token on every
+    // authenticated user request. Swap our stored token for it so an active
+    // session keeps extending. After ~30 min idle no requests are made, the
+    // token expires, and the next call 401s → auto-logout below.
+    const refreshed = response.headers?.['x-refresh-token']
+    if (refreshed) {
+      localStorage.setItem('authToken', refreshed)
+    }
+    return response
+  },
   (error) => {
     // If we get a 401 Unauthorized, clear auth state
     // Do NOT do window.location.href — let React Router handle the redirect

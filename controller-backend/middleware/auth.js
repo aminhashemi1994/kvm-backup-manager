@@ -71,6 +71,38 @@ const authenticateUser = (req, res, next) => {
     
     req.user = decoded;
     req.tokenType = tokenType;
+
+    // Sliding-window session refresh — USER tokens only, and only when the
+    // request follows real user activity (X-Session-Active header set by the
+    // frontend). Background polling without user interaction does NOT extend
+    // the session, so an unattended tab still expires after the idle window.
+    //
+    // This is deliberately NOT applied to agent tokens (static or agent JWT):
+    // agent↔controller and controller↔agent communication must never be
+    // affected by user-session timeouts.
+    const userIsActive = req.headers['x-session-active'] === '1';
+    if (tokenType === 'user' && decoded && decoded.id && userIsActive) {
+      try {
+        const expiresIn = process.env.JWT_EXPIRES_IN || '30m';
+        const freshToken = jwt.sign(
+          {
+            id: decoded.id,
+            username: decoded.username,
+            role: decoded.role,
+            accessGrants: decoded.accessGrants || { backupHostIds: [] },
+            ...(decoded.disabled !== undefined ? { disabled: decoded.disabled } : {}),
+          },
+          userSecret,
+          { expiresIn }
+        );
+        res.setHeader('X-Refresh-Token', freshToken);
+      } catch (refreshErr) {
+        // If refresh minting fails for any reason, don't block the request —
+        // the existing token is still valid until its own expiry.
+        console.error('[Auth] Failed to mint refresh token:', refreshErr.message);
+      }
+    }
+
     next();
   } catch (error) {
     if (error.name === 'TokenExpiredError') {
