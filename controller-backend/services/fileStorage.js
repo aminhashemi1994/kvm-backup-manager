@@ -1,8 +1,36 @@
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
-const lockfile = require('proper-lockfile');
 const config = require('../config/config');
+
+// In-process serialization for JSON data-file access.
+//
+// The controller runs as a single PM2 fork-mode process, so every read/write
+// of these JSON files happens inside ONE Node process. The only real source
+// of contention is this process racing against itself — e.g. dozens of
+// scheduled backups all firing at 02:00, each doing getBackupJobs() +
+// saveBackupJobs() on the same backupJobs.json.
+//
+// We previously used proper-lockfile (an on-disk, cross-process lock) for
+// this. Under that same-process burst it exhausted its retries and threw
+// "Lock file is already being held", failing backups BEFORE the agent was
+// ever contacted (hence no tmux session and no VM lock file on the server).
+//
+// Since there is only one process, an in-memory promise queue per file is
+// both sufficient and reliable: it serializes all access within the process,
+// and combined with the atomic temp-file + rename write below, it fully
+// prevents torn or interleaved writes. No on-disk lock needed.
+const _fileQueues = new Map();
+
+function _runExclusive(filePath, fn) {
+  const prev = _fileQueues.get(filePath) || Promise.resolve();
+  // Chain this operation after whatever is currently queued for this file.
+  const next = prev.then(fn, fn);
+  // Keep the queue alive but swallow errors so one failure doesn't poison
+  // the chain for subsequent callers.
+  _fileQueues.set(filePath, next.catch(() => {}));
+  return next;
+}
 
 class FileStorage {
   async initializeDataFiles() {
@@ -93,52 +121,48 @@ class FileStorage {
   }
 
   async readJSON(filePath) {
-    let release;
+    return _runExclusive(filePath, () => this._readJSONLocked(filePath));
+  }
+
+  async _readJSONLocked(filePath) {
+    let data;
     try {
-      release = await lockfile.lock(filePath, { retries: 5, stale: 10000 });
-      let data;
-      try {
-        data = await fs.readFile(filePath, 'utf8');
-      } catch (readErr) {
-        if (readErr.code === 'ENOENT') return [];
-        throw readErr;
-      }
+      data = await fs.readFile(filePath, 'utf8');
+    } catch (readErr) {
+      if (readErr.code === 'ENOENT') return [];
+      throw readErr;
+    }
 
-      // Empty / whitespace-only file: treat as corrupt and try to recover
-      if (!data || !data.trim()) {
-        console.error(`[fileStorage] ${filePath} is empty — attempting recovery from .bak`);
-        const recovered = await this._tryReadBackup(filePath);
-        if (recovered !== null) return recovered;
-        return [];
-      }
+    // Empty / whitespace-only file: treat as corrupt and try to recover
+    if (!data || !data.trim()) {
+      console.error(`[fileStorage] ${filePath} is empty — attempting recovery from .bak`);
+      const recovered = await this._tryReadBackup(filePath);
+      if (recovered !== null) return recovered;
+      return [];
+    }
 
-      try {
-        return JSON.parse(data);
-      } catch (parseErr) {
-        // Corrupt JSON — most likely a truncated write from a crash.
-        // Try the backup copy before giving up so we never silently lose data.
-        console.error(`[fileStorage] Failed to parse ${filePath}: ${parseErr.message}. Attempting recovery from .bak`);
-        const recovered = await this._tryReadBackup(filePath);
-        if (recovered !== null) {
-          // Restore the main file from the backup so the next read is clean.
-          try {
-            const bakPath = `${filePath}.bak`;
-            await fs.copyFile(bakPath, filePath);
-            console.error(`[fileStorage] Restored ${filePath} from ${bakPath}`);
-          } catch (restoreErr) {
-            console.error(`[fileStorage] Could not restore ${filePath} from .bak: ${restoreErr.message}`);
-          }
-          return recovered;
+    try {
+      return JSON.parse(data);
+    } catch (parseErr) {
+      // Corrupt JSON — most likely a truncated write from a crash.
+      // Try the backup copy before giving up so we never silently lose data.
+      console.error(`[fileStorage] Failed to parse ${filePath}: ${parseErr.message}. Attempting recovery from .bak`);
+      const recovered = await this._tryReadBackup(filePath);
+      if (recovered !== null) {
+        // Restore the main file from the backup so the next read is clean.
+        try {
+          const bakPath = `${filePath}.bak`;
+          await fs.copyFile(bakPath, filePath);
+          console.error(`[fileStorage] Restored ${filePath} from ${bakPath}`);
+        } catch (restoreErr) {
+          console.error(`[fileStorage] Could not restore ${filePath} from .bak: ${restoreErr.message}`);
         }
-        // No usable backup — return empty array so callers don't crash.
-        // (Throwing here would 500 every API endpoint that touches this file.)
-        console.error(`[fileStorage] No usable backup for ${filePath}; returning empty array. Manual intervention may be required.`);
-        return [];
+        return recovered;
       }
-    } finally {
-      if (release) {
-        try { await release(); } catch (_) { /* lock may already be gone */ }
-      }
+      // No usable backup — return empty array so callers don't crash.
+      // (Throwing here would 500 every API endpoint that touches this file.)
+      console.error(`[fileStorage] No usable backup for ${filePath}; returning empty array. Manual intervention may be required.`);
+      return [];
     }
   }
 
@@ -156,39 +180,35 @@ class FileStorage {
   }
 
   async writeJSON(filePath, data) {
-    let release;
+    return _runExclusive(filePath, () => this._writeJSONLocked(filePath, data));
+  }
+
+  async _writeJSONLocked(filePath, data) {
+    const json = JSON.stringify(data, null, 2);
+    const tmpPath = `${filePath}.tmp`;
+    const bakPath = `${filePath}.bak`;
+
+    // Write to a temp file, fsync, then atomically rename into place.
+    // This prevents truncation/corruption if the process is killed mid-write.
+    const fh = await fs.open(tmpPath, 'w');
     try {
-      release = await lockfile.lock(filePath, { retries: 5, stale: 10000, realpath: false });
-      const json = JSON.stringify(data, null, 2);
-      const tmpPath = `${filePath}.tmp`;
-      const bakPath = `${filePath}.bak`;
-
-      // Write to a temp file, fsync, then atomically rename into place.
-      // This prevents truncation/corruption if the process is killed mid-write.
-      const fh = await fs.open(tmpPath, 'w');
-      try {
-        await fh.writeFile(json, 'utf8');
-        try { await fh.sync(); } catch (_) { /* sync may not be supported on some FS */ }
-      } finally {
-        await fh.close();
-      }
-
-      // Rotate previous version to .bak (so a corrupted next-write is recoverable)
-      try {
-        await fs.copyFile(filePath, bakPath);
-      } catch (copyErr) {
-        // Original may not exist on first write — that's fine.
-        if (copyErr.code !== 'ENOENT') {
-          console.error(`[fileStorage] Could not refresh backup ${bakPath}: ${copyErr.message}`);
-        }
-      }
-
-      await fs.rename(tmpPath, filePath);
+      await fh.writeFile(json, 'utf8');
+      try { await fh.sync(); } catch (_) { /* sync may not be supported on some FS */ }
     } finally {
-      if (release) {
-        try { await release(); } catch (_) { /* lock may already be gone */ }
+      await fh.close();
+    }
+
+    // Rotate previous version to .bak (so a corrupted next-write is recoverable)
+    try {
+      await fs.copyFile(filePath, bakPath);
+    } catch (copyErr) {
+      // Original may not exist on first write — that's fine.
+      if (copyErr.code !== 'ENOENT') {
+        console.error(`[fileStorage] Could not refresh backup ${bakPath}: ${copyErr.message}`);
       }
     }
+
+    await fs.rename(tmpPath, filePath);
   }
 
   // Backup Hosts
