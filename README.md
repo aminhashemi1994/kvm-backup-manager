@@ -61,11 +61,14 @@ Trigger manual backups with full control over compression, verification, and tar
 
 ### Reliability & Recovery
 - **Missed Schedule Recovery**: When the controller is down during a scheduled backup, missed runs are automatically replayed when it comes back online. Configurable per-schedule policy (immediate/most-recent/skip) with grace period.
+- **Self-Healing Scheduler File**: The agent backup script validates its `scheduler` tracking file against the actual backup state (via `virtnbdrestore -o dump`) and auto-repairs it if inconsistent. Runs once per script execution to avoid overhead.
 - **Active Job Recovery**: If the agent crashes mid-backup, the controller reconciles job states by querying the agent's live-status endpoint (inspects tmux sessions, processes, lock files, progress files).
 - **Accurate Exit Code Handling**: Killed/interrupted jobs are correctly reported as failed (not success). Exit codes written to file for reliable detection.
 - **Automatic Cleanup**: Stale lock files, orphaned tmux sessions, and leftover progress files are cleaned on agent startup, periodically (every 10 min), and lazily before new jobs.
 - **Health-Check Debounce**: Requires 2 consecutive failures before marking a host offline, preventing false-offline from transient network blips.
 - **Fresh-on-Open**: When the panel is opened, a health check is triggered immediately so users always see current status.
+- **Real Server State as Source of Truth**: Backup-in-progress detection relies on the actual server state (tmux sessions + lock files in `in_progress_backups`), not a separate controller-side tracker, preventing unsynced/phantom-lock situations.
+- **Crash-Safe Controller Storage**: The controller's JSON data store serializes access via an in-process queue and writes atomically (temp file + rename + `.bak` recovery), eliminating lock-contention failures under bursts of simultaneous scheduled backups.
 
 ### Management Features
 - **Centralized Dashboard**: Web-based UI for managing all backups
@@ -74,6 +77,8 @@ Trigger manual backups with full control over compression, verification, and tar
 - **Health Monitoring**: Real-time agent health checks with debounce
 - **Resource Metrics**: CPU, memory, and disk usage monitoring
 - **Backup Reports**: Comprehensive enriched reports with per-VM rollups, success rates, trending, and downloadable formats (PDF, JSON, CSV)
+- **Multiple Report Views**: Switch reports between Card, Table, Chart, and Compact views, with per-VM charts (schedule sizes, full/inc chain composition, backup history timeline) and per-VM detail tables
+- **Missed Backups (Schedule Adherence)**: Detects gaps in the backup timeline — expected scheduled runs that produced no successful backup (power loss, network failure, agent offline). Surfaces per-VM/per-schedule missed dates with reasons, even when backup health is 100%.
 
 ### Security & Access Control (RBAC)
 - **Three Roles**: Admin (full access), User (read all, write on granted hosts), Viewer (read-only)
@@ -81,6 +86,7 @@ Trigger manual backups with full control over compression, verification, and tar
 - **Comprehensive Audit Trail**: All significant actions logged with actor, timestamp, target, and IP. Rotated at 5MB, retained 90 days.
 - **Disabled User Support**: Accounts can be disabled without deletion
 - **Login Auditing**: Successful and failed login attempts recorded
+- **Idle Session Timeout**: User sessions use a 30-minute sliding window — active use keeps the session alive, 30 minutes of inactivity auto-logs-out the user. Agent↔controller communication is unaffected (it uses separate, long-lived tokens).
 
 ### Modern UI
 - **Glass Morphism Design**: Backdrop-blur cards, gradient borders, hover-shine effects
@@ -92,11 +98,14 @@ Trigger manual backups with full control over compression, verification, and tar
 
 ### Advanced Features
 - **Concurrent Backup Control**: Per-host concurrent backup limits
-- **Schedule Conflict Detection**: Prevents conflicting backup schedules
+- **Schedule Conflict Detection**: Only one chain-based schedule (daily/weekly/interval/cron/custom-days) is allowed per VM; copy-based schedules (once/monthly) can coexist. Enforced both controller-side (schedule definitions) and agent-side (existing backup files on disk).
+- **Unified Weekly/Daily Chains**: Weekly schedules use the same full/inc chain logic as daily — you set an incremental count, and after that many incrementals the chain is archived and a new full begins (no more "full backup day" picker).
 - **Automatic Job Recovery**: Recovers stuck jobs on service restart
 - **Live Log Streaming**: Real-time backup/restore log viewing
 - **RocketChat Integration**: Notifications for critical events
-- **Retention Management**: Automatic backup retention and cleanup
+- **Retention Management**: Automatic backup retention and cleanup (retention = chain size before archiving; keep-archive = number of archived chains to retain)
+- **Schedule List Pagination**: Paginated schedule list with selectable page sizes (10/20/50/100), persisted per user
+- **Readable VM Names**: Long `<id>_<name>` VM names are shown with the readable name prominent and the id muted, with a Short/Full toggle and hover tooltips, keeping action buttons always visible without horizontal scrolling
 
 ## 🏗 Architecture
 
@@ -778,6 +787,8 @@ curl -X GET https://your-domain.com/api-backup/backups/jobs \
   -H "Authorization: Bearer <token>"
 ```
 
+> **Session expiry**: User tokens use a sliding 30-minute idle window (configurable via `JWT_EXPIRES_IN`). Each authenticated request made during real user activity extends the session; after 30 minutes of inactivity the token expires and the frontend automatically logs out. This applies only to frontend↔controller user sessions — agent tokens are separate and long-lived.
+
 ### Key Endpoints
 
 #### Backup Management
@@ -796,6 +807,14 @@ curl -X GET https://your-domain.com/api-backup/backups/jobs \
 - `GET /api/storage-pools` - List storage pools
 - `POST /api/storage-pools` - Create storage pool
 - `PUT /api/storage-pools/:id` - Update storage pool
+
+#### Reports & Analytics
+- `GET /api/reports/:backupHostId` - Get backup report for a host
+- `POST /api/reports/:backupHostId/generate` - Trigger report generation
+- `GET /api/reports/enriched/:backupHostId` - Enriched report with rollups
+- `GET /api/reports/global` - Cross-host global rollup
+- `GET /api/reports/download/:format` - Download report (json/csv/txt/md/xlsx/pdf)
+- `GET /api/missed-backups` - Missed backups (schedule adherence). Query params: `days` (default 30, max 365), `backupHostId`, `vmId`
 
 #### Metrics
 - `GET /api/metrics/backup-hosts` - Get backup host metrics

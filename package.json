@@ -1,6 +1,6 @@
 {
   "name": "kvm-backup-manager",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Enterprise-grade backup and restore solution for KVM/QEMU virtual machines with incremental backups, centralized management, real-time monitoring, RBAC, audit trail, and automated recovery. Powered by virtnbdbackup.",
   "keywords": [
     "kvm",
