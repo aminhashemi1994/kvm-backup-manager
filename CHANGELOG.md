@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-29
+
+### Added
+
+#### Reports & Analytics
+- **Missed Backups (Schedule Adherence)**: New `GET /api/missed-backups` endpoint and Reports panel that detects expected scheduled runs which produced no successful backup (timeline gaps from power loss, network failure, or agent offline). Reuses the schedule occurrence generator to enumerate expected runs and compares against completed jobs. Window start is clamped to `schedule.createdAt`; a 2-hour grace prevents flagging just-due/in-progress runs. Each gap is annotated with a reason (`no_run`, `failed`, `skipped`). Tracks daily/weekly/monthly/interval/cron/custom-days; `once` is intentionally excluded.
+- **Report View Modes**: Reports can be viewed as Card, Table, Chart, or Compact, with the preference persisted per user.
+- **Per-VM Charts & Tables**: Each VM exposes its own charts (schedule size comparison, status distribution, full/inc chain composition per disk, virtual-vs-actual disk size, recent backup history timeline) and detailed tables (schedules, disks, recent runs).
+
+#### Security
+- **Idle Session Timeout**: User sessions use a sliding 30-minute window (`JWT_EXPIRES_IN` default changed `24h` → `30m`). The controller re-issues a fresh token via an `X-Refresh-Token` response header on requests made during real user activity; the frontend swaps it in. After 30 minutes of inactivity the token expires and the frontend auto-logs-out. A frontend activity tracker (`lib/activity.ts`) gates the refresh so background polling alone does not keep an unattended session alive. Agent↔controller and controller↔agent communication are unaffected.
+
+#### UI & UX
+- **Browser Favicon**: Added a backup-themed SVG favicon.
+- **Schedule List Pagination**: Selectable page sizes (10/20/50/100), persisted per user, with first/last + ellipsis navigation.
+- **Readable VM Names in Tables**: Long `<id>_<name>` VM names show the readable name prominently with the id muted, a Short/Full toggle (shared across Active Jobs, Schedules, History tabs), and hover tooltips — action buttons stay visible without horizontal scrolling.
+
+### Changed
+- **Weekly schedules now use full/inc chains like daily**: replaced the "full backup day" picker with an `incrementalCount` field. Method selection is driven by `backupCycleService`, and after `incrementalCount` incrementals the chain is archived and a new full begins.
+- **One chain-based schedule per VM**: daily/weekly/interval/cron/custom-days are mutually exclusive per VM (copy-based once/monthly can coexist). Enforced controller-side on create/update in addition to the existing agent-side file check.
+- **Controller JSON storage hardened**: removed `proper-lockfile` cross-process locking (the controller is a single fork-mode process) in favor of an in-process serialization queue plus atomic temp-file + rename writes with `.bak` recovery.
+
+### Fixed
+- **"Lock file is already being held" phantom backup failures**: Bursts of simultaneously-scheduled backups no longer exhaust file-lock retries on the controller's `backupJobs.json`, which previously failed jobs before the agent was ever contacted (no tmux session / no VM lock created).
+- **Octal parse errors in the agent backup script**: count values like `08`/`09` from `grep -c`/`wc -l` are now coerced to decimal via `awk`, fixing `syntax error in expression` failures at backup start.
+- **Self-healing scheduler validation**: the agent script validates and repairs its `scheduler` tracking file against actual backup state, runs once per execution, and no longer overrides the global exit trap.
+- **Duplicate scheduler entries on retry**: a failed-then-retried backup no longer appends a second entry for the same day.
+- **Archived-backup restore lock/log paths**: lock files and logs for archived backups are now computed at the correct storage-pool base (`in_progress_backups` / `.logs`), so rollback on cancel removes the lock and logs remain available after completion/cancellation.
+- **Archived restore directory naming**: restore directories use a concise `vmname_archived_{schedule}_{archiveDate}_{restoreTimestamp}` format instead of a long, duplicated name.
+- **Schedule list page-size dropdown**: no longer disappears when the chosen page size exceeds the number of available items.
+
 ## [1.1.0] - 2026-05-20
 
 ### Added
