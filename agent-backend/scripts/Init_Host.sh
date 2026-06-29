@@ -133,9 +133,30 @@ function main() {
 		fi
 	}
 
-	set_sshd "TCPKeepAlive" "yes"
-	set_sshd "ClientAliveInterval" "30"
-	set_sshd "ClientAliveCountMax" "10"
+cando-bot
+2:00
+✨ Backup Update ✨
+
+
+🧩 Entity: Backup
+
+⚙️ State: daily schedule
+
+📊 Status: Failed
+
+💾 Image: 20251115-122215713287806-99_farashenasamellat-public-1-test.part5.psg.network
+
+🏷️ Version: 1.0.0
+
+📘 Details: Error: Lock file is already being held
+
+🕒 Time: 2026-06-26T22:30:38.891Z
+
+
+
+
+
+
 
 	# =========================
 	# Client config (ssh)

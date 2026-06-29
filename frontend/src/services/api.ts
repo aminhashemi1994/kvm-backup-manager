@@ -157,6 +157,10 @@ export const reportsApi = {
   generate: (backupHostId: string) => api.post(`/reports/${backupHostId}/generate`),
   getEnriched: (backupHostId: string) => api.get(`/reports/enriched/${backupHostId}`),
   getGlobal: () => api.get('/reports/global'),
+  // Missed backups (schedule adherence): expected scheduled runs that
+  // produced no successful backup within the given lookback window.
+  getMissedBackups: (params?: { days?: number; backupHostId?: string; vmId?: string }) =>
+    api.get('/missed-backups', { params }),
   // Force fresh generation across the relevant agents (bypasses per-agent
   // 2-minute manual cooldown). Returns when all targeted agents have
   // finished or errored.

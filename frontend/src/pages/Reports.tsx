@@ -12,6 +12,7 @@ import { toast } from 'sonner'
 import { useNavigate } from 'react-router-dom'
 import VMReportCard from '@/components/reports/VMReportCard'
 import ReportDownloadMenu from '@/components/reports/ReportDownloadMenu'
+import MissedBackupsPanel from '@/components/reports/MissedBackupsPanel'
 import ViewModeSelector, { type ViewMode } from '@/components/reports/ViewModeSelector'
 import VMTableView from '@/components/reports/VMTableView'
 import VMChartView from '@/components/reports/VMChartView'
@@ -573,6 +574,9 @@ export default function Reports() {
                   </div>
                 </CardContent>
               </Card>
+
+              {/* Missed Backups (schedule adherence) */}
+              <MissedBackupsPanel backupHostId={selectedHostId} />
 
               {/* VM List */}
               <Card>
