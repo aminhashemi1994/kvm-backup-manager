@@ -27,9 +27,13 @@ class StartupRecoveryService {
     try {
       const jobs = await getBackupJobs();
       const runningJobs = jobs.filter(j => 
-        j.status === 'running' || 
+        (j.status === 'running' || 
         j.status === 'queued' || 
-        j.status === 'initializing'
+        j.status === 'initializing') &&
+        // Controller-side queued jobs waiting for a slot were never sent to
+        // the agent. Don't "recover" (fail) them on startup — the scheduler's
+        // drainer will promote them to running when a slot frees.
+        !(j.status === 'queued' && j.pendingStart)
       );
 
       if (runningJobs.length === 0) {

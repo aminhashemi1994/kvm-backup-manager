@@ -21,7 +21,9 @@ class SchedulerService {
     this.customDaysTasks = new Map(); // For custom-days schedules
     this.io = null;
     this.healthCheckInterval = null;
+    this.queueReconcilerInterval = null;
     this._retryTimers = new Map(); // Map of jobId -> setTimeout handle for pending retries
+    this._hostLocks = new Map(); // Map of hostId -> promise chain (serializes slot decisions)
   }
 
   async initialize(io) {
@@ -29,6 +31,7 @@ class SchedulerService {
     console.log('Initializing backup scheduler...');
     await this.loadSchedules();
     this.startHealthChecks();
+    this.startQueueReconciler();
     console.log(`✓ Loaded ${this.tasks.size} scheduled tasks`);
   }
 
@@ -36,6 +39,223 @@ class SchedulerService {
     this.healthCheckInterval = setInterval(async () => {
       await this.checkHostsHealth();
     }, 60000); // Check every minute
+  }
+
+  /**
+   * Periodic concurrency reconciler + queue drainer.
+   *
+   * This is the safety net that guarantees scheduled backups always make
+   * progress, even when completion callbacks are lost (controller restart,
+   * network blip, agent never reported "done"). Every couple of minutes, for
+   * each online host it:
+   *   1. Reconciles unfinished jobs against the agent's REAL state
+   *      (tmux/process/lock/progress) so finished jobs are finalized and
+   *      their concurrency slots are freed.
+   *   2. Fails genuinely-stuck jobs (queued but never started, or running far
+   *      past any sane runtime) so a lost event can't permanently occupy a
+   *      slot and starve every other VM.
+   *   3. Drains the concurrent-limit queue into any freed slots.
+   *
+   * Without this, phantom "running"/"queued" jobs accumulate and eventually
+   * consume all concurrency slots — so only a handful of VMs back up each
+   * night and the rest silently miss their schedule.
+   */
+  startQueueReconciler() {
+    // Run shortly after startup, then on a fixed interval.
+    setTimeout(() => this.periodicMaintenance().catch(() => {}), 15 * 1000);
+    this.queueReconcilerInterval = setInterval(() => {
+      this.periodicMaintenance().catch(err =>
+        console.error('[Scheduler] periodic maintenance error:', err.message)
+      );
+    }, SchedulerService.QUEUE_RECONCILE_INTERVAL_MS);
+  }
+
+  /**
+   * One periodic pass that guarantees forward progress for schedules:
+   *   1. Catch-up: fire any recently-expected run that has no job record
+   *      (node-cron missed the tick, or the controller was briefly down/busy
+   *      around the scheduled time). Bounded to a short recent window so it
+   *      never replays ancient runs (that's missedRunService's job on startup).
+   *   2. Reconcile + drain per host: finalize finished/stuck jobs and start
+   *      queued/concurrency-skipped backups in freed slots.
+   */
+  async periodicMaintenance() {
+    await this.catchUpRecentMisses();
+    await this.reconcileAndDrainAllHosts();
+  }
+
+  /**
+   * Active catch-up for missed cron fires. For each enabled recurring
+   * schedule, if its most recent expected occurrence within the catch-up
+   * window produced NO job record at all, fire it now. Guards on "does a job
+   * already exist?" so it never double-fires a run node-cron already handled.
+   */
+  async catchUpRecentMisses() {
+    try {
+      const now = Date.now();
+      const windowStart = now - SchedulerService.CATCHUP_WINDOW_MS;
+      // Ignore occurrences in the very recent past — node-cron is expected to
+      // handle those itself; we only step in once they're clearly overdue.
+      const settleCutoff = now - SchedulerService.CATCHUP_SETTLE_MS;
+      if (settleCutoff <= windowStart) return;
+
+      const recurring = new Set(['daily', 'weekly', 'monthly', 'interval', 'cron', 'custom-days']);
+      const missedRunService = require('./missedRunService');
+      const schedules = await getBackupSchedules();
+      const jobs = await getBackupJobs();
+      const tolMs = 60 * 60 * 1000; // 1h match tolerance
+
+      for (const schedule of schedules) {
+        if (schedule.enabled === false) continue;
+        if (!recurring.has(schedule.scheduleType)) continue;
+
+        // Don't catch up before the schedule existed.
+        const createdMs = schedule.createdAt ? new Date(schedule.createdAt).getTime() : 0;
+        const from = new Date(Math.max(windowStart, createdMs || windowStart));
+        const to = new Date(settleCutoff);
+        if (from.getTime() >= to.getTime()) continue;
+
+        let occ;
+        try {
+          occ = missedRunService.computeMissedRuns(schedule, from, to) || [];
+        } catch {
+          continue;
+        }
+        if (occ.length === 0) continue;
+
+        const lastOccMs = occ[occ.length - 1].scheduledAt.getTime();
+
+        // Has ANY job for this schedule been recorded around that occurrence?
+        // (any status — running/queued/completed/failed/skipped means it fired)
+        const alreadyFired = jobs.some(j =>
+          j.scheduleId === schedule.id &&
+          new Date(j.startTime).getTime() >= lastOccMs - tolMs
+        );
+        if (alreadyFired) continue;
+
+        console.log(`[Scheduler] Catch-up: firing schedule ${schedule.id} (${schedule.scheduleType}) for overdue occurrence at ${new Date(lastOccMs).toISOString()}`);
+        // Fire it. Slot management (concurrency) is handled inside.
+        this.executeScheduledBackup(schedule, {
+          replay: true,
+          scheduledAt: new Date(lastOccMs),
+          reason: 'catch-up: missed scheduled fire',
+          actor: 'system:catchup',
+          triggeredBy: 'system',
+        }).catch(err =>
+          console.error(`[Scheduler] catch-up fire failed for ${schedule.id}:`, err.message)
+        );
+      }
+    } catch (err) {
+      console.error('[Scheduler] catchUpRecentMisses error:', err.message);
+    }
+  }
+
+  async reconcileAndDrainAllHosts() {
+    const hosts = await getBackupHosts();
+    for (const host of hosts) {
+      if (host.status && host.status !== 'online') continue;
+      try {
+        // 1. Reconcile real state (frees completed/failed/orphaned jobs).
+        const agentSyncService = require('./agentSyncService');
+        await agentSyncService.syncHost(host);
+        // 2. Fail genuinely-stuck jobs to free leaked slots.
+        await this.failStuckJobsOnHost(host.id);
+        // 3. Drain the concurrent-limit queue into free slots.
+        await this.releaseConcurrentSlotsOnHost(host.id);
+      } catch (err) {
+        console.error(`[Scheduler] reconcile/drain error for ${host.name}:`, err.message);
+      }
+    }
+  }
+
+  /**
+   * Mark jobs that are stuck in a non-terminal state as failed so their
+   * concurrency slot is released. A 'queued' job that never started within
+   * QUEUE_STUCK_MS is dead; a 'running' job older than RUNNING_MAX_MS is far
+   * past any reasonable backup runtime and is treated as dead. agentSync runs
+   * first, so anything the agent could finalize already has been — this only
+   * catches jobs the agent has no record of.
+   */
+  async failStuckJobsOnHost(backupHostId) {
+    const jobs = await getBackupJobs();
+    const now = Date.now();
+    let changed = false;
+
+    for (const j of jobs) {
+      if (j.backupHostId !== backupHostId) continue;
+      if (j.status !== 'running' && j.status !== 'queued') continue;
+      // A job intentionally waiting in the concurrency queue is NOT stuck —
+      // it will be promoted when a slot frees. Never fail these.
+      if (j.status === 'queued' && j.pendingStart) continue;
+
+      const startedMs = new Date(j.startTime).getTime();
+      const ageMs = now - (Number.isFinite(startedMs) ? startedMs : now);
+
+      // If the agent confirmed this job alive very recently (syncHost runs
+      // just before this sweep and refreshes lastSyncedAt for live jobs),
+      // don't treat it as stuck even if it's a long-running large-VM backup.
+      const syncedMs = j.lastSyncedAt ? new Date(j.lastSyncedAt).getTime() : 0;
+      const recentlyConfirmed = syncedMs && (now - syncedMs) < SchedulerService.RECENT_SYNC_MS;
+
+      const queuedStuck = j.status === 'queued' && ageMs > SchedulerService.QUEUE_STUCK_MS;
+      const runningStuck = j.status === 'running'
+        && ageMs > SchedulerService.RUNNING_MAX_MS
+        && !recentlyConfirmed;
+
+      if (queuedStuck || runningStuck) {
+        j.status = 'failed';
+        j.endTime = new Date().toISOString();
+        j.error = queuedStuck
+          ? `Job never started within ${Math.round(SchedulerService.QUEUE_STUCK_MS / 60000)} minutes (queue stuck) — releasing slot`
+          : `Job exceeded maximum runtime of ${Math.round(SchedulerService.RUNNING_MAX_MS / 3600000)}h with no completion — releasing slot`;
+        j.failureReason = 'stuck';
+        changed = true;
+        try { appendLog(j.id, j.error); } catch {}
+        if (this.io) this.io.emit('job-updated', j);
+        console.log(`[Scheduler] Freed stuck slot: ${j.vmName} (${j.status === 'failed' ? 'was ' : ''}${queuedStuck ? 'queued' : 'running'}, age ${Math.round(ageMs / 60000)}m)`);
+      }
+    }
+
+    if (changed) await saveBackupJobs(jobs);
+  }
+
+  /**
+   * Serialize a critical section per backup host. All slot decisions (a cron
+   * fire deciding run-vs-queue, and the drainer promoting queued jobs) run
+   * through this so the "count active → decide → reserve slot" sequence is
+   * atomic. Without it, 20 schedules firing at 02:00 could all read "<limit
+   * active" before any writes its running job, and all start at once.
+   */
+  _withHostLock(hostId, fn) {
+    const key = hostId || '_global';
+    const prev = this._hostLocks.get(key) || Promise.resolve();
+    const run = prev.then(() => fn());
+    // Keep the chain alive but swallow errors so one failure doesn't break
+    // the lock for subsequent callers.
+    this._hostLocks.set(key, run.then(() => {}, () => {}));
+    return run;
+  }
+
+  /**
+   * Count jobs currently occupying a concurrency slot on a host. Jobs that
+   * have been running/queued longer than STALE_SLOT_MS are excluded: they are
+   * almost certainly dead (a daily backup that's been "running" >24h has been
+   * superseded), and counting them would let phantom jobs block every new run.
+   * Jobs still waiting in the concurrency queue (pendingStart) do not count.
+   */
+  countActiveJobsOnHost(jobs, hostId, now = Date.now()) {
+    return jobs.filter(j => {
+      if (j.backupHostId !== hostId) return false;
+      if (j.status !== 'running' && j.status !== 'queued') return false;
+      // Jobs waiting in the concurrency queue (not yet sent to the agent) do
+      // NOT occupy a slot — otherwise they would block themselves.
+      if (j.status === 'queued' && j.pendingStart) return false;
+      const startedMs = new Date(j.startTime).getTime();
+      if (Number.isFinite(startedMs) && now - startedMs > SchedulerService.STALE_SLOT_MS) {
+        return false; // stale — don't let it hold a slot
+      }
+      return true;
+    });
   }
 
   async checkHostsHealth() {
@@ -506,23 +726,40 @@ class SchedulerService {
   async releaseConcurrentSlotsOnHost(backupHostId) {
     if (!backupHostId) return;
     try {
+      // Serialize with scheduled-fire slot decisions so promotion and new
+      // fires can't both claim the same freed slot and exceed the limit.
+      await this._withHostLock(backupHostId, async () => {
       const hosts = await getBackupHosts();
       const host = hosts.find(h => h.id === backupHostId);
       if (!host) return;
 
       const jobs = await getBackupJobs();
-      const running = jobs.filter(j =>
-        j.backupHostId === backupHostId &&
-        (j.status === 'running' || j.status === 'queued')
-      );
-      const max = host.maxConcurrentBackups || 20;
-      const free = max - running.length;
+      const running = this.countActiveJobsOnHost(jobs, backupHostId);
+      const rawMax = host.maxConcurrentBackups;
+      const max = (rawMax === undefined || rawMax === null) ? 20 : Number(rawMax);
+      const unlimited = max === 0;
+      // 0 = unlimited: release every queued/skipped-concurrent candidate.
+      const free = unlimited ? Number.MAX_SAFE_INTEGER : max - running.length;
       if (free <= 0) return;
 
       // Only consider jobs from the last 24h to avoid replaying ancient
-      // skipped runs the operator may have intentionally abandoned.
+      // runs the operator may have intentionally abandoned.
       const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-      const candidates = jobs
+
+      // Primary path: real QUEUED jobs waiting for a slot (pendingStart).
+      // These are promoted IN PLACE (same job id) — true FIFO queueing.
+      const queuedWaiting = jobs
+        .filter(j =>
+          j.backupHostId === backupHostId &&
+          j.status === 'queued' &&
+          j.pendingStart === true &&
+          new Date(j.startTime).getTime() > oneDayAgo
+        )
+        .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+
+      // Legacy/back-compat path: jobs previously recorded as skipped due to
+      // the concurrent limit (older records before queueing was introduced).
+      const skippedLegacy = jobs
         .filter(j =>
           j.backupHostId === backupHostId &&
           j.status === 'skipped' &&
@@ -530,19 +767,126 @@ class SchedulerService {
           j.skippedReason === 'concurrent_limit' &&
           new Date(j.startTime).getTime() > oneDayAgo
         )
-        .sort((a, b) => new Date(a.startTime) - new Date(b.startTime))
-        .slice(0, free);
+        .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
-      if (candidates.length === 0) return;
+      // Fill free slots: prefer queued-waiting (oldest first), then legacy.
+      const toStart = [...queuedWaiting, ...skippedLegacy].slice(0, free);
+      if (toStart.length === 0) return;
 
-      console.log(`[Scheduler] Releasing ${candidates.length} skipped-by-concurrent-limit job(s) on ${host.name} (free slots: ${free}/${max})`);
+      console.log(`[Scheduler] Starting ${toStart.length} queued backup(s) on ${host.name} (free slots: ${unlimited ? '∞' : free}/${unlimited ? '∞' : max})`);
 
       const schedules = await getBackupSchedules();
-      for (const skipped of candidates) {
-        await this._retrySkippedJob(skipped, host, schedules, jobs);
+      for (const job of toStart) {
+        if (job.status === 'queued' && job.pendingStart) {
+          await this._startQueuedJob(job, host, schedules, jobs);
+        } else {
+          await this._retrySkippedJob(job, host, schedules, jobs);
+        }
       }
+      });
     } catch (err) {
       console.error('[Scheduler] releaseConcurrentSlotsOnHost error:', err.message);
+    }
+  }
+
+  /**
+   * Promote a waiting (pendingStart) queued job to running IN PLACE: resolve
+   * its payload from the schedule and trigger the agent, keeping the same job
+   * id so the UI shows a clean queued → running transition.
+   */
+  async _startQueuedJob(job, host, schedules, jobs) {
+    const schedule = schedules.find(s => s.id === job.scheduleId);
+    if (!schedule) {
+      // Schedule gone — can't resolve payload. Fail so the slot isn't held.
+      job.status = 'failed';
+      job.pendingStart = false;
+      job.endTime = new Date().toISOString();
+      job.error = `Cannot start queued backup: schedule ${job.scheduleId} no longer exists`;
+      await saveBackupJobs(jobs);
+      if (this.io) this.io.emit('job-updated', job);
+      return;
+    }
+
+    // Mark running first so it occupies a slot and won't be double-started.
+    job.status = 'running';
+    job.pendingStart = false;
+    job.startTime = new Date().toISOString();
+    job.progress = 0;
+    job.progressText = 'Starting (slot freed)...';
+    await saveBackupJobs(jobs);
+    await appendLog(job.id, 'Slot freed — starting queued backup');
+    if (this.io) this.io.emit('backup-started', job);
+
+    try {
+      const vms = await getVirtualMachines();
+      const vm = vms.find(v => v.id === job.vmId);
+      if (!vm) throw new Error(`VM ${job.vmId} not found`);
+      const hypervisors = await getHypervisors();
+      const hypervisor = hypervisors.find(h => h.id === vm.hypervisorId);
+      if (!hypervisor) throw new Error(`Hypervisor ${vm.hypervisorId} not found`);
+
+      const pools = await getStoragePools();
+      const pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
+      if (!pool) throw new Error('Storage pool for schedule not found on backup host');
+
+      let offsiteHostIps = [];
+      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
+        ? schedule.offsiteHostIds
+        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
+      if (offsiteIds.length > 0) {
+        const allOffsiteHosts = await getOffsiteHosts();
+        offsiteHostIps = offsiteIds
+          .map(id => allOffsiteHosts.find(h => h.id === id))
+          .filter(Boolean)
+          .map(h => h.ip);
+      }
+
+      const agentScheduleType = (() => {
+        switch (schedule.scheduleType) {
+          case 'once':
+          case 'monthly':
+          case 'daily':
+          case 'weekly': return schedule.scheduleType;
+          case 'interval':
+          case 'cron': return 'daily';
+          case 'custom-days': return 'custom';
+          default: return 'once';
+        }
+      })();
+
+      let url = host.url;
+      if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'http://' + url;
+
+      await agentService.triggerBackup(url, {
+        jobId: job.id,
+        vmName: vm.name,
+        hypervisorId: hypervisor.id,
+        hypervisorIp: hypervisor.ip,
+        scheduleType: agentScheduleType,
+        storagePoolId: pool.id,
+        storagePoolPath: pool.path,
+        retention: schedule.retention || 7,
+        keepArchive: schedule.keepArchive || 2,
+        compression: schedule.compression || 2,
+        noCompression: schedule.noCompression || false,
+        noVerify: schedule.noVerify || false,
+        offsiteHosts: offsiteHostIps,
+        verbose: schedule.verbose || false,
+        ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
+          ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
+          : {}),
+      });
+
+      await saveBackupJobs(jobs);
+      console.log(`[Scheduler] ✓ Started queued backup for ${job.vmName} on ${host.name}`);
+    } catch (err) {
+      job.status = 'failed';
+      job.error = `Failed to start queued backup: ${err.message}`;
+      job.endTime = new Date().toISOString();
+      await saveBackupJobs(jobs);
+      await appendLog(job.id, job.error);
+      if (this.io) this.io.emit('backup-error', job);
+      console.error(`[Scheduler] ✗ Failed to start queued backup for ${job.vmName}: ${err.message}`);
     }
   }
 
@@ -851,19 +1195,63 @@ class SchedulerService {
         return;
       }
 
-      // Check concurrent backup limit
-      const jobs = await getBackupJobs();
-      const runningJobsOnHost = jobs.filter(j => 
-        j.backupHostId === host.id && 
-        (j.status === 'running' || j.status === 'queued')
-      );
-      
-      const maxConcurrent = host.maxConcurrentBackups || 20;
-      if (runningJobsOnHost.length >= maxConcurrent) {
-        console.error(`Maximum concurrent backups (${maxConcurrent}) reached for ${host.name}, skipping backup`);
-        
-        // Create a skipped job record
-        const skippedJob = {
+      // Reserve a concurrency slot atomically. All scheduled fires for this
+      // host serialize here so the count→decide→create sequence can't race
+      // (otherwise 20 backups firing at 02:00 could all start at once). A
+      // limit of 0 means UNLIMITED — every backup starts immediately.
+      let job = null;
+      let didQueue = false;
+      await this._withHostLock(host.id, async () => {
+        const jobs = await getBackupJobs();
+        const runningJobsOnHost = this.countActiveJobsOnHost(jobs, host.id);
+
+        const rawMax = host.maxConcurrentBackups;
+        const maxConcurrent = (rawMax === undefined || rawMax === null) ? 20 : Number(rawMax);
+        const unlimited = maxConcurrent === 0;
+
+        if (!unlimited && runningJobsOnHost.length >= maxConcurrent) {
+          console.log(`Concurrent limit (${maxConcurrent}) reached for ${host.name}; queueing backup for ${vm.name}`);
+
+          // Create a real QUEUED job (waiting for a free slot). It is NOT sent
+          // to the agent yet and does NOT occupy a concurrency slot
+          // (pendingStart). The drainer promotes it to running in place as
+          // soon as a slot frees up.
+          const queuedJob = {
+            id: jobId,
+            scheduleId: schedule.id,
+            vmId: vm.id,
+            vmName: vm.name,
+            hypervisorIp: hypervisor.ip,
+            backupHostId: host.id,
+            backupHostName: host.name,
+            method,
+            noCompression: schedule.noCompression || false,
+            noVerify: schedule.noVerify || false,
+            status: 'queued',
+            pendingStart: true,
+            queuedReason: 'concurrent_limit',
+            startTime: new Date().toISOString(),
+            endTime: null,
+            exitCode: null,
+            error: null,
+            progress: 0,
+            progressText: `Queued — waiting for a free slot (limit ${maxConcurrent})`,
+            scheduled: true,
+            canRetry: true,
+            ...(replayMeta ? { replay: true, originallyScheduledAt: replayMeta.scheduledAt, replayReason: replayMeta.reason } : {}),
+          };
+
+          jobs.push(queuedJob);
+          await saveBackupJobs(jobs);
+          await appendLog(jobId, `Backup queued: concurrent limit ${maxConcurrent} reached (currently ${runningJobsOnHost.length} active). Will start automatically when a slot frees.`);
+          if (this.io) this.io.emit('backup-queued', queuedJob);
+          didQueue = true;
+          return;
+        }
+
+        // Slot available — create the running job and persist it INSIDE the
+        // lock so sibling fires immediately count it against the limit.
+        job = {
           id: jobId,
           scheduleId: schedule.id,
           vmId: vm.id,
@@ -874,78 +1262,40 @@ class SchedulerService {
           method,
           noCompression: schedule.noCompression || false,
           noVerify: schedule.noVerify || false,
-          status: 'skipped',
+          status: 'running',
           startTime: new Date().toISOString(),
-          endTime: new Date().toISOString(),
+          endTime: null,
           exitCode: null,
-          error: `Maximum concurrent backups (${maxConcurrent}) reached. Currently running: ${runningJobsOnHost.length}`,
+          error: null,
           scheduled: true,
-          skippedReason: 'concurrent_limit',
-          canRetry: true,
+          attemptNumber: replayMeta && replayMeta.attemptNumber ? replayMeta.attemptNumber : 1,
+          maxAttempts: (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3) + 1,
+          retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
+          ...(replayMeta ? {
+            replay: true,
+            originallyScheduledAt: replayMeta.scheduledAt
+              ? new Date(replayMeta.scheduledAt).toISOString()
+              : null,
+            replayReason: replayMeta.reason || 'replay',
+            actor: replayMeta.actor || 'system:replay',
+            triggeredBy: replayMeta.triggeredBy || 'system',
+          } : {
+            actor: 'system:scheduler',
+            triggeredBy: 'system',
+          }),
         };
-
-        jobs.push(skippedJob);
+        jobs.push(job);
         await saveBackupJobs(jobs);
-        
-        await appendLog(jobId, `Backup skipped: ${skippedJob.error}`);
-        
-        // Notify RocketChat
-        rocketChatService.notifyBackupSkipped(vm.name, host.name, skippedJob.error);
-        
-        if (this.io) {
-          this.io.emit('backup-skipped', skippedJob);
-        }
-        
+      });
+
+      // Queued for later — a freed slot will promote it. Try an immediate
+      // drain in case a slot opened up since we counted.
+      if (didQueue) {
+        this.releaseConcurrentSlotsOnHost(host.id).catch(() => {});
         return;
       }
-      
-      if (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly') {
-        // Use backup cycle service to determine method (same logic as daily)
-        const cycleStatus = await backupCycleService.getBackupCycleStatus(vm.id);
-        method = cycleStatus.nextMethod;
-      }
-
-      const job = {
-        id: jobId,
-        scheduleId: schedule.id,
-        vmId: vm.id,
-        vmName: vm.name,
-        hypervisorIp: hypervisor.ip,
-        backupHostId: host.id,
-        backupHostName: host.name,
-        method,
-        noCompression: schedule.noCompression || false,
-        noVerify: schedule.noVerify || false,
-        status: 'running',
-        startTime: new Date().toISOString(),
-        endTime: null,
-        exitCode: null,
-        error: null,
-        scheduled: true,
-        // Retry tracking. attemptNumber is 1 for the first run. When a
-        // scheduled backup fails, the job-completion handler schedules
-        // another attempt up to schedule.retryCount, with this job's
-        // config carried forward via these fields.
-        attemptNumber: replayMeta && replayMeta.attemptNumber ? replayMeta.attemptNumber : 1,
-        maxAttempts: (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3) + 1,
-        retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
-        ...(replayMeta ? {
-          replay: true,
-          originallyScheduledAt: replayMeta.scheduledAt
-            ? new Date(replayMeta.scheduledAt).toISOString()
-            : null,
-          replayReason: replayMeta.reason || 'replay',
-          actor: replayMeta.actor || 'system:replay',
-          triggeredBy: replayMeta.triggeredBy || 'system',
-        } : {
-          actor: 'system:scheduler',
-          triggeredBy: 'system',
-        }),
-      };
-
-      // jobs already loaded above for concurrent check
-      jobs.push(job);
-      await saveBackupJobs(jobs);
+      // Defensive: if no job was created for any reason, stop here.
+      if (!job) return;
 
       this.io.emit('backup-started', job);
       const replayPrefix = replayMeta ? '[MISSED-REPLAY] ' : '';
@@ -1433,6 +1783,27 @@ class SchedulerService {
     this.customDaysTasks.clear();
   }
 }
+
+// ── Concurrency reconciler tuning ────────────────────────────────────────────
+// How often the periodic reconcile + queue drain runs.
+SchedulerService.QUEUE_RECONCILE_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+// Running/queued jobs older than this no longer occupy a concurrency slot
+// (treated as dead/superseded so phantom jobs can't starve the scheduler).
+SchedulerService.STALE_SLOT_MS = 24 * 60 * 60 * 1000; // 24 hours
+// A 'queued' job that never transitions to 'running' within this window is
+// considered stuck and is failed to release its slot.
+SchedulerService.QUEUE_STUCK_MS = 20 * 60 * 1000; // 20 minutes
+// A 'running' job older than this (with no completion) is treated as dead and
+// failed to release its slot. Generous so real large-VM backups aren't killed.
+SchedulerService.RUNNING_MAX_MS = 24 * 60 * 60 * 1000; // 24 hours
+// If the agent confirmed a job alive within this window, never treat it as
+// stuck (protects legitimately long-running large-VM backups).
+SchedulerService.RECENT_SYNC_MS = 10 * 60 * 1000; // 10 minutes
+// Catch-up: how far back to look for an overdue scheduled run that produced
+// no job record (node-cron missed the tick / controller was briefly down).
+SchedulerService.CATCHUP_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
+// Grace before catch-up steps in, leaving on-time firing to node-cron.
+SchedulerService.CATCHUP_SETTLE_MS = 5 * 60 * 1000; // 5 minutes
 
 const schedulerService = new SchedulerService();
 module.exports = schedulerService;

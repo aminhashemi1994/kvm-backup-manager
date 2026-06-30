@@ -51,7 +51,10 @@ class AgentSyncService {
 
     const liveBackupJobs = backupJobs.filter(j =>
       j.backupHostId === host.id &&
-      ['running', 'queued', 'initializing'].includes(j.status)
+      ['running', 'queued', 'initializing'].includes(j.status) &&
+      // Skip controller-side queued jobs waiting for a slot — they were never
+      // sent to the agent, so the agent has no record of them.
+      !(j.status === 'queued' && j.pendingStart)
     );
     const liveRestoreJobs = restoreJobs.filter(j =>
       j.backupHostId === host.id &&

@@ -37,8 +37,9 @@ function validate(payload) {
   const errors = [];
   if (payload.defaultMaxConcurrentBackups !== undefined) {
     const n = Number(payload.defaultMaxConcurrentBackups);
-    if (!Number.isFinite(n) || n < 1 || n > 200) {
-      errors.push('defaultMaxConcurrentBackups must be a number between 1 and 200');
+    // 0 = unlimited (no concurrency cap). Otherwise 1–200.
+    if (!Number.isFinite(n) || n < 0 || n > 200) {
+      errors.push('defaultMaxConcurrentBackups must be a number between 0 and 200 (0 = unlimited)');
     }
   }
   if (payload.healthCheckIntervalSeconds !== undefined) {

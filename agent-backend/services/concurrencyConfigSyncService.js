@@ -116,7 +116,8 @@ class ConcurrencyConfigSyncService {
         return { success: false, error: response.data?.error || 'Empty response' };
       }
       const incoming = Number(response.data.data.maxConcurrentBackups);
-      if (!Number.isFinite(incoming) || incoming < 1) {
+      // Accept 0 (= unlimited). Reject only non-numbers and negatives.
+      if (!Number.isFinite(incoming) || incoming < 0) {
         return { success: false, error: `Invalid maxConcurrentBackups: ${incoming}` };
       }
 

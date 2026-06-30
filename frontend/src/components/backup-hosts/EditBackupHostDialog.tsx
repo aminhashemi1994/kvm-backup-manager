@@ -18,7 +18,7 @@ export default function EditBackupHostDialog({ open, onOpenChange, backupHost }:
   const [name, setName] = useState(backupHost.name)
   const [url, setUrl] = useState(backupHost.url)
   const [description, setDescription] = useState(backupHost.description || '')
-  const [maxConcurrentBackups, setMaxConcurrentBackups] = useState(backupHost.maxConcurrentBackups || 2)
+  const [maxConcurrentBackups, setMaxConcurrentBackups] = useState(backupHost.maxConcurrentBackups ?? 2)
   
   const updateHost = useUpdateBackupHost()
 
@@ -27,7 +27,7 @@ export default function EditBackupHostDialog({ open, onOpenChange, backupHost }:
       setName(backupHost.name)
       setUrl(backupHost.url)
       setDescription(backupHost.description || '')
-      setMaxConcurrentBackups(backupHost.maxConcurrentBackups || 2)
+      setMaxConcurrentBackups(backupHost.maxConcurrentBackups ?? 2)
     }
   }, [open, backupHost])
 
@@ -94,13 +94,17 @@ export default function EditBackupHostDialog({ open, onOpenChange, backupHost }:
             <Input
               id="maxConcurrentBackups"
               type="number"
-              min="1"
-              max="10"
+              min="0"
+              max="200"
               value={maxConcurrentBackups}
-              onChange={(e) => setMaxConcurrentBackups(parseInt(e.target.value) || 2)}
+              onChange={(e) => {
+                const n = parseInt(e.target.value)
+                setMaxConcurrentBackups(Number.isFinite(n) && n >= 0 ? n : 2)
+              }}
             />
             <p className="text-xs text-gray-500 mt-1">
-              Maximum number of backups that can run simultaneously on this host
+              Maximum number of backups that can run simultaneously on this host.
+              Set to <strong>0 for unlimited</strong> (all scheduled backups start at once — may heavily load the host).
             </p>
           </div>
 
