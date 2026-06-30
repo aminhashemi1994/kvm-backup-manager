@@ -1,0 +1,47 @@
+[
+  {
+    "id": "3cde42e7-c305-4871-b24e-d971187b1441",
+    "backupHostId": "9eb0cad4-3465-4866-8436-b94d894d48e7",
+    "name": "Restore_Server_1_Local_HDD_1",
+    "path": "/opt/kvm_pool/local/hdd/1/restore",
+    "mountPoint": "/opt/kvm_pool/local/hdd/1",
+    "device": "/dev/mapper/KVM_vg_SSD-KVM_pool_SSD",
+    "totalGB": 3300,
+    "usedGB": 2588,
+    "availableGB": 545,
+    "usagePercent": 83,
+    "status": "active",
+    "createdAt": "2026-05-10T14:16:52.420Z",
+    "updatedAt": "2026-06-30T05:07:28.945Z"
+  },
+  {
+    "id": "9ffe8f36-e958-4612-b87f-c48f510411e8",
+    "backupHostId": "36ffe36c-b167-42bf-bad6-b78fc3864559",
+    "name": "Restore_Server_1_Local_SSD_1",
+    "path": "/opt/kvm_pool/local/ssd/1/restore",
+    "mountPoint": "/opt/kvm_pool/local/ssd/1",
+    "device": "/dev/mapper/KVM_vg_SSD-KVM_pool_SSD",
+    "totalGB": 8317,
+    "usedGB": 5348,
+    "availableGB": 2550,
+    "usagePercent": 68,
+    "status": "active",
+    "createdAt": "2026-05-10T14:17:11.018Z",
+    "updatedAt": "2026-06-30T05:07:28.988Z"
+  },
+  {
+    "id": "9c7fb30e-abb3-496e-bcb0-a05f93b8435c",
+    "backupHostId": "c729ced6-d932-41e4-8f9d-30f20ca862ae",
+    "name": "Restore_Server_1_Local_HDD_1",
+    "path": "/opt/kvm_pool/local/hdd/1/restore",
+    "mountPoint": "/opt/kvm_pool/local/hdd/1",
+    "device": "/dev/mapper/KVM_vg_HDD-KVM_pool_HDD",
+    "totalGB": 6653,
+    "usedGB": 591,
+    "availableGB": 5727,
+    "usagePercent": 10,
+    "status": "active",
+    "createdAt": "2026-05-10T14:17:25.657Z",
+    "updatedAt": "2026-06-30T05:07:18.996Z"
+  }
+]

@@ -1,0 +1,13 @@
+{
+  "rocketChat": {
+    "enabled": true,
+    "mode": "webhook",
+    "webhookUrl": "https://chat.partcorp.ir/hooks/x4zYq3exkeYtBmHtv/NPWNBmMNhYwck2bwaJkBXd4FM7NiHwqKxBbpsNwmDyZA8Pt6",
+    "url": "",
+    "authToken": "NPWNBmMNhYwck2bwaJkBXd4FM7NiHwqKxBbpsNwmDyZA8Pt6",
+    "userId": "",
+    "channel": "",
+    "entity": "",
+    "version": ""
+  }
+}

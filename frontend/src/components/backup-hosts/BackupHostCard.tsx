@@ -197,7 +197,7 @@ export default function BackupHostCard({ backupHost }: BackupHostCardProps) {
                   <span className="font-medium">{backupHost.vmCount || 0}</span> VMs
                 </p>
                 <p className="text-xs text-gray-500 mt-1">
-                  Max: <span className="font-medium">{backupHost.maxConcurrentBackups || 2}</span> concurrent
+                  Max: <span className="font-medium">{backupHost.maxConcurrentBackups === 0 ? 'Unlimited' : (backupHost.maxConcurrentBackups ?? 2)}</span>{backupHost.maxConcurrentBackups === 0 ? '' : ' concurrent'}
                 </p>
               </div>
 

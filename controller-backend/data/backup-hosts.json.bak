@@ -1,0 +1,41 @@
+[
+  {
+    "id": "9eb0cad4-3465-4866-8436-b94d894d48e7",
+    "name": "Backup Server Part5 (hv238)",
+    "url": "http://172.30.88.9:3001",
+    "description": "",
+    "status": "online",
+    "lastHealthCheck": "2026-06-30T05:07:55.857Z",
+    "hypervisorCount": 0,
+    "vmCount": 0,
+    "createdAt": "2026-05-10T14:14:21.889Z",
+    "updatedAt": "2026-05-10T14:14:21.889Z",
+    "_consecutiveFailures": 0
+  },
+  {
+    "id": "36ffe36c-b167-42bf-bad6-b78fc3864559",
+    "name": "Backup Server Part5 (HV87)",
+    "url": "http://172.30.88.87:3001",
+    "description": "",
+    "status": "online",
+    "lastHealthCheck": "2026-06-30T05:07:55.903Z",
+    "hypervisorCount": 0,
+    "vmCount": 0,
+    "createdAt": "2026-05-10T14:15:34.080Z",
+    "updatedAt": "2026-05-10T14:15:34.080Z",
+    "_consecutiveFailures": 0
+  },
+  {
+    "id": "c729ced6-d932-41e4-8f9d-30f20ca862ae",
+    "name": "Backup Server Part3 (HV241)",
+    "url": "http://172.30.48.19:3001",
+    "description": "",
+    "status": "online",
+    "lastHealthCheck": "2026-06-30T05:06:55.895Z",
+    "hypervisorCount": 0,
+    "vmCount": 0,
+    "createdAt": "2026-05-10T14:16:31.291Z",
+    "updatedAt": "2026-05-10T14:16:31.291Z",
+    "_consecutiveFailures": 0
+  }
+]

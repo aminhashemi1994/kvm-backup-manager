@@ -1,0 +1,26 @@
+[
+  {
+    "id": "c9e3e1bf-7f05-4315-8bc7-b39a483f5f9d",
+    "backupHostId": "9eb0cad4-3465-4866-8436-b94d894d48e7",
+    "name": "Offsite-1-Part5",
+    "ip": "172.50.0.100",
+    "username": "root",
+    "status": "online",
+    "lastSync": null,
+    "createdAt": "2026-05-10T14:26:57.428Z",
+    "updatedAt": "2026-05-10T14:26:57.428Z",
+    "lastHealthCheck": "2026-06-30T05:06:55.936Z"
+  },
+  {
+    "id": "332b2001-1c8b-4393-8f69-c4fdda04af73",
+    "backupHostId": "9eb0cad4-3465-4866-8436-b94d894d48e7",
+    "name": "Offsite-2-Part5",
+    "ip": "172.50.0.200",
+    "username": "root",
+    "status": "online",
+    "lastSync": null,
+    "createdAt": "2026-05-10T14:27:16.831Z",
+    "updatedAt": "2026-05-10T14:27:16.831Z",
+    "lastHealthCheck": "2026-06-30T05:05:55.942Z"
+  }
+]

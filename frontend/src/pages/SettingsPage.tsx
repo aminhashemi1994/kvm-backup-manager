@@ -96,7 +96,9 @@ function GeneralSettings() {
         const data = res.data?.data
         if (data) {
           setSettings({
-            defaultMaxConcurrentBackups: Number(data.defaultMaxConcurrentBackups) || 20,
+            defaultMaxConcurrentBackups: data.defaultMaxConcurrentBackups != null
+              ? Number(data.defaultMaxConcurrentBackups)
+              : 20,
             healthCheckIntervalSeconds: Number(data.healthCheckIntervalSeconds) || 60,
             defaultMissedRunPolicy: data.defaultMissedRunPolicy || 'immediate',
           })
@@ -198,14 +200,19 @@ function GeneralSettings() {
           <input
             type="number"
             value={settings.defaultMaxConcurrentBackups}
-            onChange={(e) => updateField('defaultMaxConcurrentBackups', Number(e.target.value) || 1)}
-            min={1}
+            onChange={(e) => {
+              const n = Number(e.target.value)
+              updateField('defaultMaxConcurrentBackups', Number.isFinite(n) && n >= 0 ? n : 0)
+            }}
+            min={0}
             max={200}
             className={inputCls}
           />
           <p className="text-xs text-gray-500">
             Default value applied to newly-created backup hosts. Existing hosts keep their current
-            value unless you tick "Apply to all existing backup hosts" below.
+            value unless you tick "Apply to all existing backup hosts" below.{' '}
+            <strong>Set to 0 for unlimited</strong> — every scheduled backup starts at its scheduled
+            time with no concurrency cap (may heavily load the backup host).
           </p>
           <label className="flex items-center gap-2 text-xs cursor-pointer pt-1">
             <input

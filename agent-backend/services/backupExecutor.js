@@ -29,8 +29,16 @@ class BackupExecutor {
    */
   getMaxConcurrent() {
     const v = concurrencyConfigSyncService.getMaxConcurrent();
-    if (Number.isFinite(v) && v >= 1) return v;
+    // 0 = unlimited (no concurrency cap). Pass it through so processQueue
+    // can start every queued job immediately. Any other finite, non-negative
+    // value is used as-is; fall back to 15 only when the value is invalid.
+    if (Number.isFinite(v) && v >= 0) return v;
     return 15;
+  }
+
+  /** True when concurrency is unlimited (limit configured as 0). */
+  isUnlimitedConcurrency() {
+    return this.getMaxConcurrent() === 0;
   }
 
   /**
@@ -792,7 +800,8 @@ class BackupExecutor {
    * Process backup queue
    */
   async processQueue() {
-    if (this.activeJobs.size >= this.getMaxConcurrent()) {
+    // 0 = unlimited: never gate on active count.
+    if (!this.isUnlimitedConcurrency() && this.activeJobs.size >= this.getMaxConcurrent()) {
       return;
     }
 

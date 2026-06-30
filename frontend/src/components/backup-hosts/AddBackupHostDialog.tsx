@@ -90,14 +90,18 @@ export default function AddBackupHostDialog({ open, onOpenChange }: AddBackupHos
               <Input
                 id="maxConcurrentBackups"
                 type="number"
-                min="1"
-                max="10"
+                min="0"
+                max="200"
                 placeholder="2"
                 value={formData.maxConcurrentBackups}
-                onChange={(e) => setFormData({ ...formData, maxConcurrentBackups: parseInt(e.target.value) || 2 })}
+                onChange={(e) => {
+                  const n = parseInt(e.target.value)
+                  setFormData({ ...formData, maxConcurrentBackups: Number.isFinite(n) && n >= 0 ? n : 2 })
+                }}
               />
               <p className="text-xs text-gray-500">
-                Maximum number of backups that can run simultaneously on this host (default: 2)
+                Maximum number of backups that can run simultaneously on this host (default: 2).
+                Set to <strong>0 for unlimited</strong> (all scheduled backups start at once — may heavily load the host).
               </p>
             </div>
           </div>

@@ -81,7 +81,11 @@ router.post('/', async (req, res, next) => {
       name: req.body.name,
       url: req.body.url,
       description: req.body.description || '',
-      maxConcurrentBackups: req.body.maxConcurrentBackups || systemDefault,
+      // Allow 0 (= unlimited). Only fall back to the system default when the
+      // field is genuinely absent.
+      maxConcurrentBackups: (req.body.maxConcurrentBackups === undefined || req.body.maxConcurrentBackups === null)
+        ? systemDefault
+        : Number(req.body.maxConcurrentBackups),
       status: healthResult.success ? 'online' : 'offline',
       lastHealthCheck: new Date().toISOString(),
       hypervisorCount: 0,
@@ -191,7 +195,10 @@ router.get('/:id/concurrent-config', async (req, res, next) => {
       success: true,
       data: {
         backupHostId: host.id,
-        maxConcurrentBackups: host.maxConcurrentBackups || 20,
+        // Pass 0 through unchanged — 0 means "unlimited concurrency".
+        maxConcurrentBackups: (host.maxConcurrentBackups === undefined || host.maxConcurrentBackups === null)
+          ? 20
+          : Number(host.maxConcurrentBackups),
         updatedAt: host.updatedAt || null,
       },
     });

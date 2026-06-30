@@ -1,0 +1,6 @@
+{
+  "defaultMaxConcurrentBackups": 20,
+  "healthCheckIntervalSeconds": 60,
+  "defaultMissedRunPolicy": "immediate",
+  "updatedAt": "2026-05-31T07:36:13.654Z"
+}

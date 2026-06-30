@@ -30,6 +30,14 @@ async function syncJobStatusWithAgent(job, hosts) {
   if (job.status !== 'running' && job.status !== 'queued') {
     return false; // Already finished
   }
+
+  // Controller-side queued jobs waiting for a free slot were never sent to
+  // the agent, so the agent won't know about them. Don't reconcile these
+  // against the agent (that would wrongly mark them completed) — the
+  // scheduler's drainer promotes them to running when a slot frees.
+  if (job.status === 'queued' && job.pendingStart) {
+    return false;
+  }
   
   const host = hosts.find(h => h.id === job.backupHostId);
   if (!host) return false;
@@ -381,8 +389,10 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       (j.status === 'running' || j.status === 'queued')
     );
     
-    const maxConcurrent = host.maxConcurrentBackups || 20;
-    if (runningJobsOnHost.length >= maxConcurrent) {
+    const rawMax = host.maxConcurrentBackups;
+    const maxConcurrent = (rawMax === undefined || rawMax === null) ? 20 : Number(rawMax);
+    // 0 = unlimited: never block manual triggers on concurrency.
+    if (maxConcurrent !== 0 && runningJobsOnHost.length >= maxConcurrent) {
       return res.status(429).json({ 
         success: false, 
         error: `Maximum concurrent backups (${maxConcurrent}) reached for this backup host. Please wait for a backup to complete.`,
@@ -1050,8 +1060,9 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
     const runningOnHost = jobs.filter(j =>
       j.backupHostId === host.id && (j.status === 'running' || j.status === 'queued')
     );
-    const maxConcurrent = host.maxConcurrentBackups || 20;
-    if (runningOnHost.length >= maxConcurrent) {
+    const rawMax = host.maxConcurrentBackups;
+    const maxConcurrent = (rawMax === undefined || rawMax === null) ? 20 : Number(rawMax);
+    if (maxConcurrent !== 0 && runningOnHost.length >= maxConcurrent) {
       return res.status(429).json({
         success: false,
         error: `Backup host is at concurrent limit (${runningOnHost.length}/${maxConcurrent}). The retry will run automatically when a slot frees up.`,

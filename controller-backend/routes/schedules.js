@@ -216,6 +216,14 @@ router.post('/', requireUser, async (req, res, next) => {
       // intact regardless of the outcome.
       retryCount: typeof req.body.retryCount === 'number' ? req.body.retryCount : 3,
       retryDelayMinutes: typeof req.body.retryDelayMinutes === 'number' ? req.body.retryDelayMinutes : 5,
+
+      // Retention / archive settings for chain backups (daily/weekly/interval/
+      // cron). Stored for all types for simplicity; copy-based types
+      // (once/monthly) ignore them at backup time. These are read by the
+      // scheduler when triggering the agent — if they aren't persisted here
+      // the agent silently falls back to 7/2.
+      retention: typeof req.body.retention === 'number' ? req.body.retention : 7,
+      keepArchive: typeof req.body.keepArchive === 'number' ? req.body.keepArchive : 2,
       
       // Type-specific fields
       ...(req.body.scheduleType === 'daily' && {
@@ -400,6 +408,16 @@ router.put('/:id', requireUser, async (req, res, next) => {
       retryDelayMinutes: typeof req.body.retryDelayMinutes === 'number'
         ? req.body.retryDelayMinutes
         : (existingSchedule.retryDelayMinutes ?? 5),
+
+      // Retention / archive settings (updatable for chain backups). Without
+      // these the bulk/edit changes were silently dropped and the agent
+      // always used the 7/2 defaults.
+      retention: typeof req.body.retention === 'number'
+        ? req.body.retention
+        : (existingSchedule.retention ?? 7),
+      keepArchive: typeof req.body.keepArchive === 'number'
+        ? req.body.keepArchive
+        : (existingSchedule.keepArchive ?? 2),
       
       // Type-specific updates
       ...(scheduleType === 'daily' && {
