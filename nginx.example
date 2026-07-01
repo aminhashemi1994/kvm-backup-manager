@@ -1,0 +1,73 @@
+# Complete Nginx Configuration for KVM Backup Manager
+
+# HTTP -> HTTPS Redirect
+server {
+    listen 80;
+    server_name example.domain.com;
+    return 301 https://$host$request_uri;
+}
+
+# HTTPS Server
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name example.domain.com;
+    
+    # SSL Configuration
+    ssl_certificate     /path/to/cert/certificate.crt;
+    ssl_certificate_key /path/to/cert/privateKey.pem;
+    
+    # SSL Security Settings (optional but recommended)
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    
+    # Frontend Build Files
+    root /var/www/html/backup-manager-panel/dist;
+    index index.html;
+    
+    client_max_body_size 100M;
+    
+    # Logs
+    access_log /var/log/nginx/service-backup-access.log;
+    error_log  /var/log/nginx/service-backup-error.log;
+    
+    # Frontend (React/Vite SPA)
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+    
+   # Backend API
+location /api-backup/ {
+    rewrite ^/api-backup/(.*) /api/$1 break;
+    proxy_pass https://127.0.0.1:3000;
+    proxy_ssl_verify off;                 # controller uses internal/self-signed cert
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+
+# Socket.IO WebSocket
+location /socket.io/ {
+    proxy_pass https://127.0.0.1:3000/socket.io/;
+    proxy_ssl_verify off;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_buffering off;
+}
+}
