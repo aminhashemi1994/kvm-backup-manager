@@ -31,7 +31,7 @@ apt_update_repo_check() {
 function install_virtnbdbackup {
 	current_dir=$(pwd)
 	SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-	VIRTNBD_DIR="${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup"
+	VIRTNBD_DIR="${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup/virtnbdbackup"
 
 	virtnbdbackup -V >/dev/null 2>&1
 	if [[ $? -ne 0 ]]; then
@@ -44,7 +44,9 @@ function install_virtnbdbackup {
 			echo -e "${Yellow}Please ensure virtnbdbackup directory is located in agent-backend/virtnbdbackup/.${NC}"
 			exit 1
 		fi
-
+		mkdir -p /opt/backup-manager/agent-backend/scripts/../virtnbdbackup/virtnbdbackup
+		tar -xf /opt/backup-manager/agent-backend/scripts/../virtnbdbackup/virtnbdbackup.tar \
+			-C /opt/backup-manager/agent-backend/scripts/../virtnbdbackup/virtnbdbackup
 		# Check Debian version compatibility
 		[[ $VERSION_ID -eq "10" ]] && echo "Debian Version is 10 (Buster) Does not support Virtnbd Backup Feature" && exit 1
 
@@ -69,6 +71,7 @@ function install_virtnbdbackup {
 		done
 
 		# Install virtnbdbackup
+
 		cd ${VIRTNBD_DIR}/
 		if ! python3 setup.py install &>/dev/null; then
 			echo -e "${Red}${CROSS}Failed to install virtnbdbackup ${NC}"
@@ -132,31 +135,6 @@ function main() {
 			echo "➕ sshd: added $key"
 		fi
 	}
-
-cando-bot
-2:00
-✨ Backup Update ✨
-
-
-🧩 Entity: Backup
-
-⚙️ State: daily schedule
-
-📊 Status: Failed
-
-💾 Image: 20251115-122215713287806-99_farashenasamellat-public-1-test.part5.psg.network
-
-🏷️ Version: 1.0.0
-
-📘 Details: Error: Lock file is already being held
-
-🕒 Time: 2026-06-26T22:30:38.891Z
-
-
-
-
-
-
 
 	# =========================
 	# Client config (ssh)
