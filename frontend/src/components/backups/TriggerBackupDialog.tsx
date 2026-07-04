@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -64,8 +64,12 @@ export default function TriggerBackupDialog({
     noVerify: false,
     syncToOffsite: false,
     offsiteHostIds: [] as string[],
+    // Per-offsite-host destination pool: offsiteHostId -> offsitePoolId
+    offsitePoolByHost: {} as Record<string, string>,
     verbose: false,
   })
+
+  const [offsiteValidationAttempted, setOffsiteValidationAttempted] = useState(false)
 
   const triggerBackup = useTriggerBackup()
 
@@ -73,24 +77,51 @@ export default function TriggerBackupDialog({
     e.preventDefault()
     
     if (!vm) return
-    
+
+    // Offsite validation (mirrors server Req 4.3): each checked offsite host
+    // must have a destination pool selected.
+    if (formData.syncToOffsite && formData.offsiteHostIds.length > 0) {
+      const missing = formData.offsiteHostIds.filter(id => !formData.offsitePoolByHost[id])
+      if (missing.length > 0) {
+        setOffsiteValidationAttempted(true)
+        return
+      }
+    }
+
+    const offsiteTargets = formData.offsiteHostIds
+      .map(id => ({ offsiteHostId: id, offsitePoolId: formData.offsitePoolByHost[id] }))
+      .filter(t => !!t.offsitePoolId)
+
     await triggerBackup.mutateAsync({
       vmId: vm.id,
       vmName: vm.name,
       backupHostId: vm.backupHostId,
-      hypervisorIp: vm.hypervisorIp,
+      // hypervisorIp is optional - backend will fetch it from VM record if not provided
       ...formData,
+      // Primary field: one { offsiteHostId, offsitePoolId } per checked host.
+      offsiteTargets: formData.syncToOffsite && offsiteTargets.length > 0 ? offsiteTargets : undefined,
+      offsiteHostIds: formData.syncToOffsite && formData.offsiteHostIds.length > 0 ? formData.offsiteHostIds : undefined,
     })
     
     onClose()
   }
 
   const handleOffsiteHostToggle = (hostId: string) => {
-    setFormData(prev => ({
-      ...prev,
-      offsiteHostIds: prev.offsiteHostIds.includes(hostId)
+    setFormData(prev => {
+      const isChecked = prev.offsiteHostIds.includes(hostId)
+      const nextHostIds = isChecked
         ? prev.offsiteHostIds.filter(id => id !== hostId)
         : [...prev.offsiteHostIds, hostId]
+      const nextPools = { ...prev.offsitePoolByHost }
+      if (isChecked) delete nextPools[hostId]
+      return { ...prev, offsiteHostIds: nextHostIds, offsitePoolByHost: nextPools }
+    })
+  }
+
+  const handleOffsitePoolChange = (hostId: string, poolId: string) => {
+    setFormData(prev => ({
+      ...prev,
+      offsitePoolByHost: { ...prev.offsitePoolByHost, [hostId]: poolId },
     }))
   }
 
@@ -297,31 +328,83 @@ export default function TriggerBackupDialog({
                         </p>
                       </div>
                     ) : (
-                      offsiteHosts.map((host: any) => (
-                        <div key={host.id} className="flex items-center space-x-2">
-                          <Checkbox
-                            id={`offsite-${host.id}`}
-                            checked={formData.offsiteHostIds.includes(host.id)}
-                            onChange={() => handleOffsiteHostToggle(host.id)}
-                          />
-                          <Label htmlFor={`offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
-                            {host.name} ({host.ip})
-                          </Label>
-                          {host.status === 'online' ? (
-                            <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
-                              Connected
-                            </Badge>
-                          ) : (
-                            <Badge variant="outline" className="text-xs bg-yellow-50 text-yellow-700 border-yellow-200">
-                              {host.status === 'offline' ? 'Disconnected' : (host.status || 'Unknown')}
-                            </Badge>
-                          )}
-                        </div>
-                      ))
+                      offsiteHosts.map((host: any) => {
+                        const checked = formData.offsiteHostIds.includes(host.id)
+                        const selectedPoolId = formData.offsitePoolByHost[host.id] || ''
+                        const pools: any[] = host.storagePools || []
+                        const selectedPool = pools.find((p: any) => p.id === selectedPoolId)
+                        const missingPool = checked && !selectedPoolId
+                        const poolTooFull = !!selectedPool &&
+                          typeof selectedPool.usagePercent === 'number' &&
+                          selectedPool.usagePercent >= 80
+                        return (
+                          <div key={host.id} className="space-y-2 border-b border-gray-100 pb-2 last:border-b-0 last:pb-0">
+                            <div className="flex items-center space-x-2">
+                              <Checkbox
+                                id={`offsite-${host.id}`}
+                                checked={checked}
+                                onChange={() => handleOffsiteHostToggle(host.id)}
+                              />
+                              <Label htmlFor={`offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
+                                {host.name} ({host.ip})
+                              </Label>
+                              {host.status === 'online' ? (
+                                <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
+                                  Connected
+                                </Badge>
+                              ) : (
+                                <Badge variant="outline" className="text-xs bg-yellow-50 text-yellow-700 border-yellow-200">
+                                  {host.status === 'offline' ? 'Disconnected' : (host.status || 'Unknown')}
+                                </Badge>
+                              )}
+                            </div>
+                            {checked && (
+                              <div className="ml-6 space-y-1">
+                                <Label htmlFor={`offsite-pool-${host.id}`} className="text-xs">
+                                  Destination Pool *
+                                </Label>
+                                <Select
+                                  id={`offsite-pool-${host.id}`}
+                                  value={selectedPoolId}
+                                  onChange={(e) => handleOffsitePoolChange(host.id, e.target.value)}
+                                  className={missingPool && offsiteValidationAttempted ? 'border-red-500' : ''}
+                                >
+                                  <option value="">Select pool...</option>
+                                  {pools.length === 0 ? (
+                                    <option disabled>No pools configured</option>
+                                  ) : (
+                                    pools.map((p: any) => (
+                                      <option key={p.id} value={p.id}>
+                                        {p.name}
+                                        {typeof p.usagePercent === 'number' ? ` (${p.usagePercent}% used)` : ''}
+                                      </option>
+                                    ))
+                                  )}
+                                </Select>
+                                {pools.length === 0 && (
+                                  <p className="text-xs text-red-600">
+                                    This offsite host has no storage pools. Add one before selecting it.
+                                  </p>
+                                )}
+                                {missingPool && offsiteValidationAttempted && pools.length > 0 && (
+                                  <p className="text-xs text-red-600">
+                                    Select a destination pool for this offsite host.
+                                  </p>
+                                )}
+                                {poolTooFull && (
+                                  <p className="text-xs text-amber-600">
+                                    Selected pool is {selectedPool.usagePercent}% full (≥80%); the server may reject this target.
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })
                     )}
                   </div>
                   <p className="text-xs text-gray-500">
-                    Select one or more offsite hosts to sync backup after completion
+                    Select one or more offsite hosts and a destination pool for each to sync backup after completion
                   </p>
                 </div>
               )}

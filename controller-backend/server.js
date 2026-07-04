@@ -39,6 +39,7 @@ const { router: settingsRoutes } = require('./routes/settings');
 
 // Import services
 const schedulerService = require('./services/schedulerService');
+const offsiteMigrationService = require('./services/offsiteMigrationService');
 const monitoringService = require('./services/monitoringService');
 const remoteMetricsService = require('./services/remoteMetricsService');
 const healthCheckService = require('./services/healthCheckService');
@@ -186,7 +187,23 @@ io.on('connection', (socket) => {
 });
 
 // Start scheduler
-schedulerService.initialize(io);
+// IMPORTANT sequencing: the offsite migration pass disables invalid schedules
+// (offsite host selected but no resolvable pool) and must run BEFORE the
+// scheduler loads/arms schedules, so those invalid schedules are never armed.
+// A migration failure is logged but must NOT prevent the scheduler from
+// starting.
+(async () => {
+  try {
+    await offsiteMigrationService.runOffsiteMigration();
+  } catch (err) {
+    console.error('[Startup] Offsite migration failed:', err && err.message ? err.message : err);
+  }
+  try {
+    await schedulerService.initialize(io);
+  } catch (err) {
+    console.error('[Startup] Scheduler initialization failed:', err && err.message ? err.message : err);
+  }
+})();
 
 // Start heartbeat service (reads previous heartbeat for missed-run recovery)
 let bootSnapshot = null;

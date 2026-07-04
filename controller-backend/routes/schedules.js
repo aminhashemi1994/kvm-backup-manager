@@ -8,6 +8,184 @@ const { validateSchedule } = require('../utils/validator');
 const { generateCronExpression, parseCronToHuman } = require('../utils/helpers');
 const { requireUser } = require('../middleware/rbac');
 
+// Ensure an agent URL carries a protocol so axios can reach it. Mirrors the
+// helper used in routes/offsiteHosts.js.
+function ensureProtocol(url) {
+  if (!url) return url;
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    return 'http://' + url;
+  }
+  return url;
+}
+
+// Disk-usage limit above which an offsite pool is considered too full to
+// safely receive backups (Req 5.2).
+const OFFSITE_USAGE_LIMIT = 80;
+
+/**
+ * Validate + normalize a schedule's offsite target selection at save time.
+ *
+ * Enforces the required per-offsite-host pool selection rules (Req 4.1, 4.2,
+ * 4.3, 4.5, 4.6): when a schedule specifies offsite replication it must carry
+ * exactly ONE destination pool per selected offsite host. The offsite pool is
+ * chosen freely from that host's own `storagePools` and is not tied to the
+ * source (backup-host) pool (Req 4.6).
+ *
+ * "Selected offsite hosts" are determined as follows:
+ *   - If the request provides `offsiteTargets`, those are the selection and are
+ *     validated per host+pool.
+ *   - If the request provides only legacy `offsiteHostIds`/`offsiteHostId`
+ *     (hosts selected, no pools), that is the missing-pool case and is rejected.
+ *   - Empty/no offsite selection is allowed (no offsite replication).
+ *
+ * Rejection cases (returned as `{ ok: false, error }`, mapped to HTTP 400 by
+ * the caller):
+ *   - a selected offsite host lacks a pool selection,
+ *   - more than one target references the same offsite host (exactly-one rule),
+ *   - a referenced offsite host does not exist,
+ *   - a referenced offsite pool does not exist within that host's storagePools.
+ *
+ * On success returns the normalized `offsiteTargets` (each `{ offsiteHostId,
+ * offsitePoolId }`, deduped to one per host) plus a mirrored `offsiteHostIds`
+ * derived from the targets so downstream enrichment/scheduler code keeps
+ * working.
+ *
+ * The per-target loop resolves each target's host + pool object and then
+ * performs live SSH validation of the selected pool via the offsite host's
+ * owning online backup host (task 7.2):
+ *   - the owning backup host must be online/reachable, else the host is
+ *     reported as unreachable (Req 5.4),
+ *   - the pool path must exist and be writable (Req 5.3),
+ *   - the pool filesystem usage must be below the 80% limit (Req 5.2).
+ * Any failure rejects the save (HTTP 400 via the caller) with an error naming
+ * the offsite host, pool, path, and reason (Req 5.5).
+ *
+ * This is async because it issues SSH-backed validation calls through the
+ * agent; both the create (POST) and update (PUT) call sites `await` it, so the
+ * validation lives in exactly one place and cannot be bypassed on either path.
+ *
+ * @param {object} body - request body (may carry offsiteTargets and/or offsiteHostIds)
+ * @param {Array} offsiteHosts - all offsite host records (with embedded storagePools)
+ * @returns {Promise<{ ok: true, offsiteTargets: Array, offsiteHostIds: Array } | { ok: false, error: string }>}
+ */
+async function validateOffsiteSelection(body, offsiteHosts) {
+  const { getBackupHosts } = require('../services/fileStorage');
+  const agentService = require('../services/agentService');
+  const rawTargets = Array.isArray(body.offsiteTargets) ? body.offsiteTargets : null;
+  const legacyIds = Array.isArray(body.offsiteHostIds)
+    ? body.offsiteHostIds
+    : (body.offsiteHostId ? [body.offsiteHostId] : []);
+
+  // No offsite selection at all -> allowed (schedule has no offsite replication).
+  if ((!rawTargets || rawTargets.length === 0) && legacyIds.length === 0) {
+    return { ok: true, offsiteTargets: [], offsiteHostIds: [] };
+  }
+
+  // Legacy offsite hosts selected but no per-pool targets => missing pool
+  // selection. This is the reject-the-save case (Req 4.3).
+  if (!rawTargets || rawTargets.length === 0) {
+    return {
+      ok: false,
+      error: 'Offsite pool selection required: select one destination pool for each selected offsite host',
+    };
+  }
+
+  // Owning backup hosts are needed to perform the SSH validation of each
+  // selected offsite pool (each offsite host resolves its agent via
+  // backupHostId). Fetched once up front since there is at least one target.
+  const backupHosts = await getBackupHosts();
+
+  const seenHosts = new Set();
+  const normalized = [];
+
+  for (const target of rawTargets) {
+    if (!target || !target.offsiteHostId) {
+      return { ok: false, error: 'Invalid offsite target: offsiteHostId is required' };
+    }
+
+    const host = (offsiteHosts || []).find(h => h.id === target.offsiteHostId);
+    if (!host) {
+      return { ok: false, error: `Offsite host not found: ${target.offsiteHostId}` };
+    }
+
+    // Exactly one target per offsite host (Req 4.1, 4.2).
+    if (seenHosts.has(target.offsiteHostId)) {
+      return {
+        ok: false,
+        error: `Only one destination pool may be selected per offsite host (duplicate selection for host "${host.name}")`,
+      };
+    }
+
+    // A selected host must carry a pool selection (Req 4.3).
+    if (!target.offsitePoolId) {
+      return { ok: false, error: `Offsite pool selection required for host "${host.name}"` };
+    }
+
+    const pool = (host.storagePools || []).find(p => p.id === target.offsitePoolId);
+    if (!pool) {
+      return {
+        ok: false,
+        error: `Offsite pool not found on host "${host.name}": ${target.offsitePoolId}`,
+      };
+    }
+
+    // Per-target SSH validation (task 7.2). Resolve the offsite host's owning
+    // online backup host and validate the selected pool over SSH: path exists +
+    // writable (Req 5.3) and filesystem usage below the 80% limit (Req 5.2).
+    const owningBackupHost = backupHosts.find(h => h.id === host.backupHostId);
+    if (!owningBackupHost || owningBackupHost.status !== 'online') {
+      // The offsite host cannot be reached because its owning backup host is
+      // offline/missing (Req 5.4).
+      return {
+        ok: false,
+        error: `Offsite host "${host.name}" is unreachable: its owning backup host is offline, so pool "${pool.name}" (${pool.path}) could not be validated`,
+      };
+    }
+
+    const hostUrl = ensureProtocol(owningBackupHost.url);
+    const validation = await agentService.validateOffsiteStoragePool(
+      hostUrl,
+      pool.path,
+      host.ip,
+      host.username || 'root'
+    );
+
+    if (!validation || !validation.success) {
+      // SSH failure / path missing / not writable / not mounted. Treat an
+      // outright failure to reach the offsite host as unreachable (Req 5.4)
+      // and surface the specific host/pool/path/reason (Req 5.5).
+      const reason = (validation && validation.error) ||
+        'path validation failed (missing, not writable, or not mounted)';
+      return {
+        ok: false,
+        error: `Offsite pool validation failed for host "${host.name}", pool "${pool.name}" (${pool.path}): ${reason}`,
+      };
+    }
+
+    // Enforce the disk-usage limit using the returned stats (Req 5.2). Uses the
+    // same validation.data stats shape as the offsite pool CRUD (task 2.2).
+    const stats = validation.data || {};
+    const usagePercent = stats.usagePercent;
+    if (usagePercent != null && usagePercent >= OFFSITE_USAGE_LIMIT) {
+      return {
+        ok: false,
+        error: `Offsite pool is too full for host "${host.name}", pool "${pool.name}" (${pool.path}): filesystem usage ${usagePercent}% is at or above the ${OFFSITE_USAGE_LIMIT}% limit`,
+      };
+    }
+
+    seenHosts.add(target.offsiteHostId);
+    normalized.push({ offsiteHostId: host.id, offsitePoolId: pool.id });
+  }
+
+  return {
+    ok: true,
+    offsiteTargets: normalized,
+    // Mirror offsiteHostIds from the targets so GET enrichment + legacy readers
+    // keep working (Req 4.4 derivation).
+    offsiteHostIds: normalized.map(t => t.offsiteHostId),
+  };
+}
+
 // GET /api/schedules - List all schedules
 router.get('/', async (req, res, next) => {
   try {
@@ -32,6 +210,23 @@ router.get('/', async (req, res, next) => {
         .filter(Boolean)
         .map(o => o.name);
 
+      // Resolve each offsite target to its display names (Req 4.4). Each target
+      // is `{ offsiteHostId, offsitePoolId }`; look up the offsite host and then
+      // the pool within that host's embedded storagePools. Unresolvable
+      // hosts/pools are surfaced with null names so the UI can flag them rather
+      // than silently dropping the target.
+      const offsiteTargets = Array.isArray(s.offsiteTargets) ? s.offsiteTargets : [];
+      const offsiteTargetNames = offsiteTargets.map(t => {
+        const oh = offsiteHosts.find(o => o.id === t.offsiteHostId);
+        const op = oh && Array.isArray(oh.storagePools)
+          ? oh.storagePools.find(p => p.id === t.offsitePoolId)
+          : null;
+        return {
+          offsiteHostName: oh ? oh.name : null,
+          offsitePoolName: op ? op.name : null,
+        };
+      });
+
       return {
         ...s,
         vmName: vm ? vm.name : 'Unknown',
@@ -43,6 +238,11 @@ router.get('/', async (req, res, next) => {
         storagePoolName: pool ? pool.name : null,
         offsiteHostIds: offsiteIds,
         offsiteHostNames: offsiteNames,
+        offsiteTargetNames,
+        // Migration/validation state (Req 8.3): normalize to a boolean and a
+        // string|null so the UI can reliably render invalid schedules red.
+        invalid: s.invalid === true,
+        invalidReason: s.invalid === true ? (s.invalidReason || null) : null,
         cronHuman: parseCronToHuman(s.cronExpression),
       };
     });
@@ -73,8 +273,32 @@ router.get('/:id', async (req, res, next) => {
     if (!schedule) {
       return res.status(404).json({ success: false, error: 'Schedule not found' });
     }
-    
-    res.json({ success: true, data: schedule });
+
+    // Lightweight enrichment for consistency with the list route (Req 4.4, 8.3):
+    // resolve offsite target display names and normalize the invalid state.
+    const { getOffsiteHosts } = require('../services/fileStorage');
+    const offsiteHosts = await getOffsiteHosts();
+
+    const offsiteTargets = Array.isArray(schedule.offsiteTargets) ? schedule.offsiteTargets : [];
+    const offsiteTargetNames = offsiteTargets.map(t => {
+      const oh = offsiteHosts.find(o => o.id === t.offsiteHostId);
+      const op = oh && Array.isArray(oh.storagePools)
+        ? oh.storagePools.find(p => p.id === t.offsitePoolId)
+        : null;
+      return {
+        offsiteHostName: oh ? oh.name : null,
+        offsitePoolName: op ? op.name : null,
+      };
+    });
+
+    const enriched = {
+      ...schedule,
+      offsiteTargetNames,
+      invalid: schedule.invalid === true,
+      invalidReason: schedule.invalid === true ? (schedule.invalidReason || null) : null,
+    };
+
+    res.json({ success: true, data: enriched });
   } catch (error) {
     next(error);
   }
@@ -118,6 +342,17 @@ router.post('/', requireUser, async (req, res, next) => {
         success: false, 
         error: 'Storage pool must belong to the VM\'s backup host' 
       });
+    }
+
+    // Offsite replication: enforce required per-host pool selection (Req 4).
+    // When offsiteTargets/offsiteHostIds are present, require exactly one
+    // destination pool per selected offsite host and reject unresolvable
+    // hosts/pools. No offsite selection is allowed (no offsite replication).
+    const { getOffsiteHosts } = require('../services/fileStorage');
+    const offsiteHosts = await getOffsiteHosts();
+    const offsiteSelection = await validateOffsiteSelection(req.body, offsiteHosts);
+    if (!offsiteSelection.ok) {
+      return res.status(400).json({ success: false, error: offsiteSelection.error });
     }
 
     // Controller-side schedule conflict check:
@@ -224,7 +459,12 @@ router.post('/', requireUser, async (req, res, next) => {
       // the agent silently falls back to 7/2.
       retention: typeof req.body.retention === 'number' ? req.body.retention : 7,
       keepArchive: typeof req.body.keepArchive === 'number' ? req.body.keepArchive : 2,
-      
+
+      // Offsite replication targets (Req 4.4): one destination pool per
+      // selected offsite host. offsiteHostIds is mirrored from the targets.
+      offsiteTargets: offsiteSelection.offsiteTargets,
+      offsiteHostIds: offsiteSelection.offsiteHostIds,
+
       // Type-specific fields
       ...(req.body.scheduleType === 'daily' && {
         time: req.body.time,
@@ -372,6 +612,35 @@ router.put('/:id', requireUser, async (req, res, next) => {
       return res.status(400).json({ success: false, errors: validation.errors });
     }
 
+    // Offsite replication: enforce required per-host pool selection (Req 4.5).
+    // Only re-validate when the request carries offsite fields; otherwise the
+    // existing selection is preserved unchanged. When present, the same
+    // required-selection rule as create applies (exactly one pool per host).
+    const offsiteFieldsProvided =
+      Object.prototype.hasOwnProperty.call(req.body, 'offsiteTargets') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'offsiteHostIds') ||
+      Object.prototype.hasOwnProperty.call(req.body, 'offsiteHostId');
+
+    let offsiteTargetsToPersist;
+    let offsiteHostIdsToPersist;
+    if (offsiteFieldsProvided) {
+      const { getOffsiteHosts } = require('../services/fileStorage');
+      const offsiteHosts = await getOffsiteHosts();
+      const offsiteSelection = await validateOffsiteSelection(req.body, offsiteHosts);
+      if (!offsiteSelection.ok) {
+        return res.status(400).json({ success: false, error: offsiteSelection.error });
+      }
+      offsiteTargetsToPersist = offsiteSelection.offsiteTargets;
+      offsiteHostIdsToPersist = offsiteSelection.offsiteHostIds;
+    } else {
+      offsiteTargetsToPersist = Array.isArray(existingSchedule.offsiteTargets)
+        ? existingSchedule.offsiteTargets
+        : [];
+      offsiteHostIdsToPersist = Array.isArray(existingSchedule.offsiteHostIds)
+        ? existingSchedule.offsiteHostIds
+        : (existingSchedule.offsiteHostId ? [existingSchedule.offsiteHostId] : []);
+    }
+
     // Generate cron expression for non-custom-days schedules
     let cronExpression = existingSchedule.cronExpression;
     if (scheduleType !== 'custom-days') {
@@ -418,7 +687,18 @@ router.put('/:id', requireUser, async (req, res, next) => {
       keepArchive: typeof req.body.keepArchive === 'number'
         ? req.body.keepArchive
         : (existingSchedule.keepArchive ?? 2),
-      
+
+      // Offsite replication targets (Req 4.4, 4.5): one destination pool per
+      // selected offsite host. offsiteHostIds is mirrored from the targets.
+      offsiteTargets: offsiteTargetsToPersist,
+      offsiteHostIds: offsiteHostIdsToPersist,
+
+      // Clear the migration/validation invalid flag (Req 8.4) when offsite
+      // fields were provided and passed validateOffsiteSelection above (a
+      // failed validation would have returned 400 before reaching here). This
+      // lets a corrected schedule be re-enabled and armed normally.
+      ...(offsiteFieldsProvided && { invalid: false, invalidReason: null }),
+
       // Type-specific updates
       ...(scheduleType === 'daily' && {
         time: req.body.time || existingSchedule.time,

@@ -26,6 +26,79 @@ class SchedulerService {
     this._hostLocks = new Map(); // Map of hostId -> promise chain (serializes slot decisions)
   }
 
+  /**
+   * Resolve a schedule's offsite targets into agent-ready destinations.
+   *
+   * Returns { resolved, encoded } where:
+   *   - resolved: [{ offsiteHostId, offsitePoolId, ip, path }] — persisted on
+   *     the job record so retries / missed-run replays reproduce the same
+   *     destinations (Req 9.4).
+   *   - encoded:  ["ip:path", ...] — the shell-safe `ip:path` payload sent to
+   *     the agent (colon delimiter, no `|`, Req 9.1). Entries that carry no
+   *     path encode as just "ip" so the agent falls back to legacy behavior
+   *     (Req 9.2).
+   *
+   * Resolution rules:
+   *   - New per-pool shape: each `offsiteTargets` entry
+   *     { offsiteHostId, offsitePoolId } is resolved by looking up the offsite
+   *     host and its pool inside the host's embedded `storagePools` array.
+   *     Entries whose host or pool cannot be found are skipped — invalid
+   *     selections are flagged separately by migration/validation (Req 8).
+   *   - Legacy fallback: when a schedule has no `offsiteTargets`, fall back to
+   *     `offsiteHostIds` (or a single legacy `offsiteHostId`) plus each host's
+   *     legacy `backupPath`, so in-flight / pre-migration configs keep working
+   *     (Req 8.5, 9.3).
+   *
+   * @param {object} schedule - schedule (or job-like) record carrying offsite selections.
+   * @returns {Promise<{ resolved: Array<{offsiteHostId:string, offsitePoolId:(string|null), ip:string, path:string}>, encoded: string[] }>}
+   */
+  async resolveOffsiteTargets(schedule) {
+    const allOffsiteHosts = await getOffsiteHosts();
+
+    const targets = Array.isArray(schedule && schedule.offsiteTargets)
+      ? schedule.offsiteTargets
+      : [];
+    const resolved = [];
+
+    if (targets.length > 0) {
+      // New per-pool shape: resolve host + pool from embedded storagePools.
+      for (const t of targets) {
+        if (!t) continue;
+        const host = allOffsiteHosts.find(h => h.id === t.offsiteHostId);
+        if (!host) continue; // invalid selection — skip (flagged by migration/validation)
+        const pool = (host.storagePools || []).find(p => p.id === t.offsitePoolId);
+        if (!pool) continue; // invalid selection — skip
+        resolved.push({
+          offsiteHostId: host.id,
+          offsitePoolId: pool.id,
+          ip: host.ip,
+          path: pool.path || '',
+        });
+      }
+    } else {
+      // Legacy fallback: offsiteHostIds + host backupPath (Req 8.5, 9.3).
+      const offsiteIds = Array.isArray(schedule && schedule.offsiteHostIds)
+        ? schedule.offsiteHostIds
+        : (schedule && schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
+      for (const id of offsiteIds) {
+        const host = allOffsiteHosts.find(h => h.id === id);
+        if (!host) continue; // unknown host — skip
+        resolved.push({
+          offsiteHostId: host.id,
+          offsitePoolId: null,
+          ip: host.ip,
+          path: host.backupPath || '',
+        });
+      }
+    }
+
+    // Encode for the agent as shell-safe "ip:path" (colon delimiter, Req 9.1);
+    // path-less entries encode as just "ip" (legacy fallback, Req 9.2).
+    const encoded = resolved.map(r => (r.path ? `${r.ip}:${r.path}` : r.ip));
+
+    return { resolved, encoded };
+  }
+
   async initialize(io) {
     this.io = io;
     console.log('Initializing backup scheduler...');
@@ -633,18 +706,12 @@ class SchedulerService {
         throw new Error('Storage pool not found on backup host');
       }
 
-      // Resolve offsite hosts
-      let offsiteHostIps = [];
-      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
-        ? schedule.offsiteHostIds
-        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
-      if (offsiteIds.length > 0) {
-        const allOffsiteHosts = await getOffsiteHosts();
-        offsiteHostIps = offsiteIds
-          .map(id => allOffsiteHosts.find(h => h.id === id))
-          .filter(Boolean)
-          .map(h => h.ip);
-      }
+      // Resolve offsite targets: `resolved` is persisted on the job record so
+      // the retry reproduces the same destinations (Req 9.4); `encoded`
+      // (ip:path) is sent to the agent (Req 6.6, 9.1).
+      const { resolved, encoded } = await this.resolveOffsiteTargets(schedule);
+      job.offsiteTargets = resolved;
+      await saveBackupJobs(jobs);
 
       const agentScheduleType = (() => {
         switch (schedule.scheduleType) {
@@ -678,7 +745,7 @@ class SchedulerService {
         compression: schedule.compression || 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
-        offsiteHosts: offsiteHostIps,
+        offsiteHosts: encoded,
         verbose: schedule.verbose || false,
         method: job.method, // Use same method as original
         isRetry: true, // NEW: Flag to indicate this is a retry
@@ -829,17 +896,11 @@ class SchedulerService {
       const pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
       if (!pool) throw new Error('Storage pool for schedule not found on backup host');
 
-      let offsiteHostIps = [];
-      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
-        ? schedule.offsiteHostIds
-        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
-      if (offsiteIds.length > 0) {
-        const allOffsiteHosts = await getOffsiteHosts();
-        offsiteHostIps = offsiteIds
-          .map(id => allOffsiteHosts.find(h => h.id === id))
-          .filter(Boolean)
-          .map(h => h.ip);
-      }
+      // Resolve offsite targets: `resolved` persisted on the job (Req 9.4),
+      // `encoded` (ip:path) sent to the agent (Req 6.6, 9.1). Persisted by the
+      // saveBackupJobs call after triggerBackup below.
+      const { resolved, encoded } = await this.resolveOffsiteTargets(schedule);
+      job.offsiteTargets = resolved;
 
       const agentScheduleType = (() => {
         switch (schedule.scheduleType) {
@@ -870,7 +931,7 @@ class SchedulerService {
         compression: schedule.compression || 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
-        offsiteHosts: offsiteHostIps,
+        offsiteHosts: encoded,
         verbose: schedule.verbose || false,
         ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
@@ -935,17 +996,11 @@ class SchedulerService {
       const pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
       if (!pool) throw new Error('Storage pool for schedule not found on backup host');
 
-      let offsiteHostIps = [];
-      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
-        ? schedule.offsiteHostIds
-        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
-      if (offsiteIds.length > 0) {
-        const allOffsiteHosts = await getOffsiteHosts();
-        offsiteHostIps = offsiteIds
-          .map(id => allOffsiteHosts.find(h => h.id === id))
-          .filter(Boolean)
-          .map(h => h.ip);
-      }
+      // Resolve offsite targets: `resolved` persisted on the retry job (Req 9.4),
+      // `encoded` (ip:path) sent to the agent (Req 6.6, 9.1). Persisted by the
+      // saveBackupJobs call after triggerBackup below.
+      const { resolved, encoded } = await this.resolveOffsiteTargets(schedule);
+      retryJob.offsiteTargets = resolved;
 
       const agentScheduleType = (() => {
         switch (schedule.scheduleType) {
@@ -976,7 +1031,7 @@ class SchedulerService {
         compression: schedule.compression || 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
-        offsiteHosts: offsiteHostIps,
+        offsiteHosts: encoded,
         verbose: schedule.verbose || false,
         ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
@@ -1009,6 +1064,12 @@ class SchedulerService {
     const schedules = await getBackupSchedules();
     
     for (const schedule of schedules) {
+      // Skip arming schedules flagged invalid by migration/validation (Req 8.2)
+      // in addition to the existing enabled check.
+      if (schedule.invalid === true) {
+        console.log(`[Scheduler] Skipping invalid schedule ${schedule.id}: ${schedule.invalidReason || 'invalid'}`);
+        continue;
+      }
       if (schedule.enabled !== false) {
         this.createTask(schedule);
       }
@@ -1199,6 +1260,11 @@ class SchedulerService {
       // host serialize here so the count→decide→create sequence can't race
       // (otherwise 20 backups firing at 02:00 could all start at once). A
       // limit of 0 means UNLIMITED — every backup starts immediately.
+      // Resolve offsite targets once, before the concurrency lock, so both the
+      // queued and running job records can persist them (Req 9.4) and the agent
+      // payload can carry the shell-safe ip:path encoding (Req 6.6, 9.1).
+      const { resolved, encoded } = await this.resolveOffsiteTargets(schedule);
+
       let job = null;
       let didQueue = false;
       await this._withHostLock(host.id, async () => {
@@ -1238,6 +1304,7 @@ class SchedulerService {
             progressText: `Queued — waiting for a free slot (limit ${maxConcurrent})`,
             scheduled: true,
             canRetry: true,
+            offsiteTargets: resolved,
             ...(replayMeta ? { replay: true, originallyScheduledAt: replayMeta.scheduledAt, replayReason: replayMeta.reason } : {}),
           };
 
@@ -1268,6 +1335,7 @@ class SchedulerService {
           exitCode: null,
           error: null,
           scheduled: true,
+          offsiteTargets: resolved,
           attemptNumber: replayMeta && replayMeta.attemptNumber ? replayMeta.attemptNumber : 1,
           maxAttempts: (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3) + 1,
           retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
@@ -1327,18 +1395,8 @@ class SchedulerService {
         );
       }
 
-      // Resolve offsite host IPs (optional)
-      let offsiteHostIps = [];
-      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
-        ? schedule.offsiteHostIds
-        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
-      if (offsiteIds.length > 0) {
-        const allOffsiteHosts = await getOffsiteHosts();
-        offsiteHostIps = offsiteIds
-          .map(id => allOffsiteHosts.find(h => h.id === id))
-          .filter(Boolean)
-          .map(h => h.ip);
-      }
+      // Offsite targets were resolved above (before the concurrency lock) into
+      // `resolved` (persisted on the job) and `encoded` (ip:path for the agent).
 
       // Map controller schedule types to the agent script's accepted values.
       // The Backup_Manager.sh script accepts only: once | monthly | daily |
@@ -1384,7 +1442,7 @@ class SchedulerService {
         compression: schedule.compression || 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
-        offsiteHosts: offsiteHostIps,
+        offsiteHosts: encoded,
         verbose: schedule.verbose || false,
         ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
@@ -1568,6 +1626,10 @@ class SchedulerService {
         return;
       }
 
+      // Resolve offsite targets: `resolved` is persisted on the job record
+      // (Req 9.4); `encoded` (ip:path) is sent to the agent (Req 6.6, 9.1).
+      const { resolved, encoded } = await this.resolveOffsiteTargets(schedule);
+
       const job = {
         id: jobId,
         scheduleId: schedule.id,
@@ -1585,6 +1647,7 @@ class SchedulerService {
         exitCode: null,
         error: null,
         scheduled: true,
+        offsiteTargets: resolved,
       };
 
       const jobs = await getBackupJobs();
@@ -1631,19 +1694,8 @@ class SchedulerService {
       backupData.keepArchive = schedule.keepArchive || 2;
       backupData.compression = schedule.compression || 2;
 
-      // Resolve offsite host IPs (optional)
-      const offsiteIds = Array.isArray(schedule.offsiteHostIds)
-        ? schedule.offsiteHostIds
-        : (schedule.offsiteHostId ? [schedule.offsiteHostId] : []);
-      if (offsiteIds.length > 0) {
-        const allOffsiteHosts = await getOffsiteHosts();
-        backupData.offsiteHosts = offsiteIds
-          .map(id => allOffsiteHosts.find(h => h.id === id))
-          .filter(Boolean)
-          .map(h => h.ip);
-      } else {
-        backupData.offsiteHosts = [];
-      }
+      // Offsite targets resolved above: send the shell-safe ip:path encoding.
+      backupData.offsiteHosts = encoded;
 
       await agentService.triggerBackup(url, backupData);
       await this._markScheduleFired(schedule.id);
@@ -1677,6 +1729,13 @@ class SchedulerService {
   }
 
   async addSchedule(schedule) {
+    // Never arm a schedule flagged invalid by migration/validation (Req 8.2):
+    // an offsite host is selected but has no resolvable pool. Such a schedule
+    // must not create any cron task until it is corrected.
+    if (schedule.invalid === true) {
+      console.log(`[Scheduler] Not arming invalid schedule ${schedule.id}: ${schedule.invalidReason || 'invalid'}`);
+      return;
+    }
     if (schedule.enabled !== false) {
       this.createTask(schedule);
     }
@@ -1695,6 +1754,14 @@ class SchedulerService {
     if (customTasks) {
       customTasks.forEach(t => t.stop());
       this.customDaysTasks.delete(schedule.id);
+    }
+
+    // Never (re-)arm a schedule flagged invalid by migration/validation
+    // (Req 8.2). Any existing task was already stopped/removed above, so an
+    // invalid schedule ends up with no cron task.
+    if (schedule.invalid === true) {
+      console.log(`[Scheduler] Not arming invalid schedule ${schedule.id}: ${schedule.invalidReason || 'invalid'}`);
+      return;
     }
 
     // Create new task if enabled

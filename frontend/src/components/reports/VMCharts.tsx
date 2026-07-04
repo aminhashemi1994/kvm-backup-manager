@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, memo } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   PieChart,
@@ -10,7 +10,6 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   ResponsiveContainer,
   LineChart,
   Line,
@@ -36,8 +35,6 @@ const METHOD_COLORS: Record<string, string> = {
   copy: '#f59e0b',
 }
 
-const DISK_COLORS = ['#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', '#10b981', '#06b6d4', '#ef4444']
-
 const parseGbValue = (gbString: string | number | undefined): number => {
   if (typeof gbString === 'number') return gbString
   if (!gbString) return 0
@@ -45,7 +42,26 @@ const parseGbValue = (gbString: string | number | undefined): number => {
   return match ? parseFloat(match[0]) : 0
 }
 
-export default function VMCharts({ vm }: VMChartsProps) {
+// Memoized custom tooltip to prevent re-renders
+const CustomTooltip = memo(({ active, payload, label }: any) => {
+  if (active && payload && payload.length) {
+    return (
+      <div className="bg-white border border-gray-200 rounded-lg shadow-lg p-2">
+        <p className="font-medium text-gray-900 text-xs mb-0.5">{label || payload[0].name}</p>
+        {payload.map((entry: any, idx: number) => (
+          <p key={idx} className="text-xs" style={{ color: entry.color || entry.fill }}>
+            {entry.name}: <span className="font-semibold">{entry.value}{entry.dataKey?.includes('virtual') || entry.dataKey?.includes('data') || entry.dataKey === 'size' ? ' GB' : ''}</span>
+          </p>
+        ))}
+      </div>
+    )
+  }
+  return null
+})
+
+CustomTooltip.displayName = 'CustomTooltip'
+
+function VMCharts({ vm }: VMChartsProps) {
   // Disk size breakdown across all schedules
   const diskSizeData = useMemo(() => {
     const diskMap: Record<string, { virtual: number; data: number; format: string }> = {}
@@ -183,22 +199,6 @@ export default function VMCharts({ vm }: VMChartsProps) {
     ].filter((d) => d.value > 0)
   }, [vm])
 
-  const CustomTooltip = ({ active, payload, label }: any) => {
-    if (active && payload && payload.length) {
-      return (
-        <div className="bg-white border border-gray-200 rounded-lg shadow-lg p-3">
-          <p className="font-medium text-gray-900 text-sm mb-1">{label || payload[0].name}</p>
-          {payload.map((entry: any, idx: number) => (
-            <p key={idx} className="text-xs" style={{ color: entry.color || entry.fill }}>
-              {entry.name}: <span className="font-semibold">{entry.value}{entry.dataKey?.includes('virtual') || entry.dataKey?.includes('data') || entry.dataKey === 'size' ? ' GB' : ''}</span>
-            </p>
-          ))}
-        </div>
-      )
-    }
-    return null
-  }
-
   const hasAnyData = 
     diskSizeData.length > 0 || 
     scheduleSizeData.length > 0 || 
@@ -259,13 +259,13 @@ export default function VMCharts({ vm }: VMChartsProps) {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <ResponsiveContainer width="100%" height={220}>
+              <ResponsiveContainer width="100%" height={180}>
                 <BarChart data={scheduleSizeData}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                  <XAxis dataKey="name" tick={{ fontSize: 11 }} />
-                  <YAxis tick={{ fontSize: 11 }} label={{ value: 'GB', angle: -90, position: 'insideLeft', style: { fontSize: 11 } }} />
+                  <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                  <YAxis tick={{ fontSize: 10 }} label={{ value: 'GB', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
                   <Tooltip content={<CustomTooltip />} />
-                  <Bar dataKey="size" name="Size">
+                  <Bar dataKey="size" name="Size" isAnimationActive={false}>
                     {scheduleSizeData.map((entry: any, index: number) => (
                       <Cell key={`cell-${index}`} fill={entry.color} />
                     ))}
@@ -286,7 +286,7 @@ export default function VMCharts({ vm }: VMChartsProps) {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <ResponsiveContainer width="100%" height={220}>
+              <ResponsiveContainer width="100%" height={180}>
                 <PieChart>
                   <Pie
                     data={statusData}
@@ -294,8 +294,9 @@ export default function VMCharts({ vm }: VMChartsProps) {
                     cy="50%"
                     labelLine={false}
                     label={({ name, percent }: any) => `${name}: ${(percent * 100).toFixed(0)}%`}
-                    outerRadius={80}
+                    outerRadius={70}
                     dataKey="value"
+                    isAnimationActive={false}
                   >
                     {statusData.map((entry, index) => (
                       <Cell key={`cell-${index}`} fill={entry.color} />
@@ -319,15 +320,14 @@ export default function VMCharts({ vm }: VMChartsProps) {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ResponsiveContainer width="100%" height={220}>
+            <ResponsiveContainer width="100%" height={180}>
               <BarChart data={chainCompositionData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                <XAxis dataKey="name" tick={{ fontSize: 10 }} angle={-15} textAnchor="end" height={60} />
-                <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
+                <XAxis dataKey="name" tick={{ fontSize: 9 }} angle={-15} textAnchor="end" height={50} />
+                <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar dataKey="full" name="Full Backups" stackId="a" fill={METHOD_COLORS.full} />
-                <Bar dataKey="inc" name="Incremental" stackId="a" fill={METHOD_COLORS.inc} />
+                <Bar dataKey="full" name="Full" stackId="a" fill={METHOD_COLORS.full} isAnimationActive={false} />
+                <Bar dataKey="inc" name="Inc" stackId="a" fill={METHOD_COLORS.inc} isAnimationActive={false} />
               </BarChart>
             </ResponsiveContainer>
           </CardContent>
@@ -344,15 +344,14 @@ export default function VMCharts({ vm }: VMChartsProps) {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ResponsiveContainer width="100%" height={220}>
+            <ResponsiveContainer width="100%" height={180}>
               <BarChart data={diskSizeData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                <XAxis dataKey="name" tick={{ fontSize: 10 }} angle={-15} textAnchor="end" height={60} />
-                <YAxis tick={{ fontSize: 11 }} label={{ value: 'GB', angle: -90, position: 'insideLeft', style: { fontSize: 11 } }} />
+                <XAxis dataKey="name" tick={{ fontSize: 9 }} angle={-15} textAnchor="end" height={50} />
+                <YAxis tick={{ fontSize: 10 }} label={{ value: 'GB', angle: -90, position: 'insideLeft', style: { fontSize: 10 } }} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar dataKey="virtual" name="Virtual Size" fill="#06b6d4" />
-                <Bar dataKey="data" name="Actual Data" fill="#8b5cf6" />
+                <Bar dataKey="virtual" name="Virtual" fill="#06b6d4" isAnimationActive={false} />
+                <Bar dataKey="data" name="Data" fill="#8b5cf6" isAnimationActive={false} />
               </BarChart>
             </ResponsiveContainer>
           </CardContent>
@@ -369,17 +368,16 @@ export default function VMCharts({ vm }: VMChartsProps) {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <ResponsiveContainer width="100%" height={220}>
+            <ResponsiveContainer width="100%" height={180}>
               <LineChart data={historyData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                <XAxis dataKey="date" tick={{ fontSize: 10 }} angle={-15} textAnchor="end" height={50} />
-                <YAxis tick={{ fontSize: 11 }} allowDecimals={false} />
+                <XAxis dataKey="date" tick={{ fontSize: 9 }} angle={-15} textAnchor="end" height={45} />
+                <YAxis tick={{ fontSize: 10 }} allowDecimals={false} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Line type="monotone" dataKey="full" name="Full" stroke={METHOD_COLORS.full} strokeWidth={2} />
-                <Line type="monotone" dataKey="inc" name="Incremental" stroke={METHOD_COLORS.inc} strokeWidth={2} />
+                <Line type="monotone" dataKey="full" name="Full" stroke={METHOD_COLORS.full} strokeWidth={2} dot={false} isAnimationActive={false} />
+                <Line type="monotone" dataKey="inc" name="Inc" stroke={METHOD_COLORS.inc} strokeWidth={2} dot={false} isAnimationActive={false} />
                 {historyData.some((d) => d.copy > 0) && (
-                  <Line type="monotone" dataKey="copy" name="Copy" stroke={METHOD_COLORS.copy} strokeWidth={2} />
+                  <Line type="monotone" dataKey="copy" name="Copy" stroke={METHOD_COLORS.copy} strokeWidth={2} dot={false} isAnimationActive={false} />
                 )}
               </LineChart>
             </ResponsiveContainer>
@@ -389,3 +387,6 @@ export default function VMCharts({ vm }: VMChartsProps) {
     </div>
   )
 }
+
+// Export memoized component to prevent unnecessary re-renders
+export default memo(VMCharts)

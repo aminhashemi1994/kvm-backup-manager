@@ -56,6 +56,10 @@ archives_to_keep=""
 compress_backup=""
 verbose="false"
 offsite_ips=""
+# Maps an offsite IP → its custom destination base path (empty = mirror the
+# source pool path). Populated from the "ip:path" entries in --offsite-ip
+# (colon delimiter — IPv4-safe since IPv4 addresses contain no colons).
+declare -A OFFSITE_PATH_BY_IP=()
 backup_path=""
 events_file=""
 log_file_path=""
@@ -1726,11 +1730,22 @@ offsite_sync() {
 	local offsite_skipped=()
 	local offsite_progress_files=()
 
-	local oip=""
-	for oip in "${OFFSITE_HOSTS[@]}"; do
+	local entry=""
+	for entry in "${OFFSITE_HOSTS[@]}"; do
+		entry=$(echo "$entry" | xargs)
+		[[ -z "$entry" ]] && continue
+		# Entry format: "ip" or "ip:/custom/base/path" (colon delimiter — safe
+		# because IPv4 addresses contain no colons).
+		local oip="${entry%%:*}"
+		local opath=""
+		if [[ "$entry" == *":"* ]]; then
+			opath="${entry#*:}"
+		fi
 		oip=$(echo "$oip" | xargs)
+		opath=$(echo "$opath" | xargs)
 		if [[ -n "$oip" ]]; then
 			offsite_host_list+=("$oip")
+			OFFSITE_PATH_BY_IP["$oip"]="$opath"
 		fi
 	done
 
@@ -1750,7 +1765,12 @@ offsite_sync() {
 			valid_hosts+=("$oip")
 		else
 			echo -e "${Red}${CROSS} SSH to $oip — FAILED. Skipping.${NC}"
-			emit_event "offsite_fail" "error" "SSH failed to $oip" "offsite_ip=$oip"
+			# Carry the resolved destination path + reason so the controller can
+			# map this skip back to the exact offsite host/pool (Req 6.3, 6.4).
+			local _skip_path="${OFFSITE_PATH_BY_IP[$oip]:-}"
+			[[ -z "$_skip_path" ]] && _skip_path="$backup_path"
+			emit_event "offsite_fail" "error" "SSH failed to $oip" \
+				"offsite_ip=$oip" "offsite_path=$_skip_path" "reason=SSH connection failed"
 			offsite_skipped+=("$oip")
 		fi
 	done
@@ -1759,7 +1779,8 @@ offsite_sync() {
 
 	if [[ ${#valid_hosts[@]} -eq 0 ]]; then
 		echo -e "${Red}${CROSS} All offsite hosts failed SSH. No sync performed.${NC}"
-		emit_event "offsite_complete" "error" "All offsite hosts unreachable"
+		emit_event "offsite_complete" "error" "All offsite hosts unreachable" \
+			"offsite_ips=${offsite_host_list[*]}"
 		return 1
 	fi
 
@@ -1811,13 +1832,28 @@ offsite_sync() {
 		fi
 		rm -f "$status_file"
 
-		if [[ "$status" == "SUCCESS" ]]; then
+		# The per-host worker writes either "SUCCESS" or "FAILED|<reason>" so we
+		# can surface the specific cause (SSH/disk/rsync) to the controller,
+		# not just a generic failure. Also resolve this host's destination path
+		# (custom pool path or legacy mirror) so the controller can map the
+		# outcome back to the exact offsite host/pool (Req 6.3, 6.4).
+		local ostatus="${status%%|*}"
+		local oreason="offsite sync failed"
+		if [[ "$status" == *"|"* ]]; then
+			oreason="${status#*|}"
+		fi
+		local opath="${OFFSITE_PATH_BY_IP[$oip]:-}"
+		[[ -z "$opath" ]] && opath="$backup_path"
+
+		if [[ "$ostatus" == "SUCCESS" ]]; then
 			info "Offsite sync to $oip — ${Green}COMPLETED${NC}"
-			emit_event "offsite_host_complete" "success" "Sync to $oip completed" "offsite_ip=$oip"
+			emit_event "offsite_host_complete" "success" "Sync to $oip completed" \
+				"offsite_ip=$oip" "offsite_path=$opath"
 		else
 			echo -e "${Red}${CROSS} Offsite sync to $oip — FAILED${NC}"
 			echo -e "${Dim}  Log: $offsite_log${NC}"
-			emit_event "offsite_host_fail" "error" "Sync to $oip failed" "offsite_ip=$oip"
+			emit_event "offsite_host_fail" "error" "Sync to $oip failed: $oreason" \
+				"offsite_ip=$oip" "offsite_path=$opath" "reason=$oreason"
 			all_success=false
 		fi
 	done
@@ -2036,7 +2072,11 @@ offsite_sync_single_host() {
 
 	local offsite_lock="$offsite_lock_dir/${vm_name}_${schedule}_offsite_${oip}"
 	local remote_user="root"
-	local remote_vm_dir="$backup_path/$vm_name"
+	# Per-host destination base: use the offsite host's custom path if one was
+	# configured, otherwise mirror the source pool path (legacy behavior).
+	local remote_base="${OFFSITE_PATH_BY_IP[$oip]:-}"
+	[[ -z "$remote_base" ]] && remote_base="$backup_path"
+	local remote_vm_dir="$remote_base/$vm_name"
 
 	# ── Progress-file writer (for the per-host monitor bars) ─────────────
 	write_progress() {
@@ -2247,7 +2287,7 @@ offsite_sync_single_host() {
 			write_progress 0 "" "0B" "" "failed"
 			offsite_emit "offsite_fail" "error" "SSH failed"
 			rm -f "$offsite_lock"
-			echo "FAILED" >"$status_file"
+			echo "FAILED|SSH connection failed" >"$status_file"
 			return 1
 		fi
 		echo "✓ SSH OK"
@@ -2262,7 +2302,7 @@ offsite_sync_single_host() {
 				write_progress 0 "" "0B" "" "failed"
 				offsite_emit "offsite_fail" "error" "rsync install failed"
 				rm -f "$offsite_lock"
-				echo "FAILED" >"$status_file"
+				echo "FAILED|rsync install failed on offsite host" >"$status_file"
 				return 1
 			fi
 			echo "✓ rsync installed"
@@ -2274,14 +2314,14 @@ offsite_sync_single_host() {
 		echo "Checking disk space on $oip ..."
 		local remote_usage=""
 		remote_usage=$(ssh "${remote_user}@${oip}" \
-			"mkdir -p '$backup_path'; df '$backup_path' | awk 'NR>1 {print \$5}' | sed 's/%//g'" 2>/dev/null)
+			"mkdir -p '$remote_base'; df '$remote_base' | awk 'NR>1 {print \$5}' | sed 's/%//g'" 2>/dev/null)
 
 		if [[ -n "$remote_usage" ]] && [[ "$remote_usage" -gt 85 ]]; then
 			echo "✗ Remote disk ${remote_usage}% (>85%)."
 			write_progress 0 "" "0B" "" "failed"
 			offsite_emit "offsite_fail" "error" "Remote disk >85%"
 			rm -f "$offsite_lock"
-			echo "FAILED" >"$status_file"
+			echo "FAILED|Remote disk ${remote_usage}% (>85%)" >"$status_file"
 			return 1
 		elif [[ -n "$remote_usage" ]] && [[ "$remote_usage" -gt 70 ]]; then
 			echo "⚠ Remote disk ${remote_usage}%"
@@ -2380,7 +2420,7 @@ offsite_sync_single_host() {
 			offsite_emit "offsite_rsync_fail" "error" "rsync failed" \
 				"duration_seconds=$rsync_duration"
 			rm -f "$offsite_lock"
-			echo "FAILED" >"$status_file"
+			echo "FAILED|rsync transfer failed" >"$status_file"
 			return 1
 		fi
 

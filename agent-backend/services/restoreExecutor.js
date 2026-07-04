@@ -658,16 +658,37 @@ class RestoreExecutor {
       }
       
       console.log(`[Restore] Updating controller for ${restoreId}: ${status} (${progress}%)`);
-      
-      // Use controllerAuthService for authenticated requests
-      await controllerAuthService.post(
-        this.config.controllerUrl,
-        `/restore/jobs/${restoreId}/update`,
-        payload,
-        { timeout: 5000 }
-      );
-      
-      console.log(`[Restore] Controller updated successfully for ${restoreId}`);
+
+      // Terminal updates (completed/failed) are retried with backoff so a
+      // transient blip at the end doesn't leave the controller stuck showing
+      // the restore as running with an inflated duration. Progress updates
+      // stay single-shot.
+      const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+      const attempts = isTerminal ? 6 : 1;
+      const baseTimeout = isTerminal ? 10000 : 5000;
+
+      let lastErr = null;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          await controllerAuthService.post(
+            this.config.controllerUrl,
+            `/restore/jobs/${restoreId}/update`,
+            payload,
+            { timeout: baseTimeout }
+          );
+          console.log(`[Restore] Controller updated successfully for ${restoreId}${attempt > 1 ? ` (attempt ${attempt})` : ''}`);
+          return;
+        } catch (err) {
+          lastErr = err;
+          if (!isTerminal) throw err;
+          if (attempt < attempts) {
+            const delay = Math.min(1000 * 2 ** (attempt - 1), 30000);
+            console.warn(`[Restore] Controller update for ${restoreId} (${status}) failed (attempt ${attempt}/${attempts}): ${err.message}. Retrying in ${delay}ms`);
+            await new Promise(r => setTimeout(r, delay));
+          }
+        }
+      }
+      console.error(`[Restore] CRITICAL: could not report terminal status '${status}' for ${restoreId} after ${attempts} attempts: ${lastErr && lastErr.message}`);
     } catch (err) {
       // Don't log every progress update failure to avoid spam
       if (status !== 'running' || !progress) {

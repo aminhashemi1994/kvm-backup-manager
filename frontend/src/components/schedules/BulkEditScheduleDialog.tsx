@@ -4,19 +4,20 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Select } from '@/components/ui/select'
 import { useUpdateSchedule } from '@/hooks/useBackups'
+import { useOffsiteHostsByBackupHost } from '@/hooks/useOffsiteHosts'
 import { Loader2, AlertCircle, CheckCircle } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { toast } from 'sonner'
 
 interface BulkEditScheduleDialogProps {
-  scheduleIds: string[]
   schedules: any[]
   onClose: () => void
 }
 
-export default function BulkEditScheduleDialog({ scheduleIds, schedules, onClose }: BulkEditScheduleDialogProps) {
+export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditScheduleDialogProps) {
   const [formData, setFormData] = useState({
     // Flags to indicate which fields to update
     updateTime: false,
@@ -25,6 +26,7 @@ export default function BulkEditScheduleDialog({ scheduleIds, schedules, onClose
     updateCompression: false,
     updateVerify: false,
     updateEnabled: false,
+    updateOffsite: false,
     
     // Values
     time: '02:00',
@@ -33,13 +35,48 @@ export default function BulkEditScheduleDialog({ scheduleIds, schedules, onClose
     noCompression: false,
     noVerify: false,
     enabled: true,
+
+    // Offsite values
+    syncToOffsite: false,
+    offsiteHostIds: [] as string[],
+    // Per-offsite-host destination pool: offsiteHostId -> offsitePoolId
+    offsitePoolByHost: {} as Record<string, string>,
   })
 
+  const [offsiteValidationAttempted, setOffsiteValidationAttempted] = useState(false)
   const [isUpdating, setIsUpdating] = useState(false)
   const [updatedCount, setUpdatedCount] = useState(0)
   const [failedCount, setFailedCount] = useState(0)
 
   const updateSchedule = useUpdateSchedule()
+
+  // Offsite hosts are scoped to a single backup host, so bulk offsite editing
+  // is only offered when every selected schedule shares the same backup host.
+  const backupHostIds = Array.from(
+    new Set(schedules.map(s => s.backupHostId).filter(Boolean))
+  )
+  const commonBackupHostId = backupHostIds.length === 1 ? (backupHostIds[0] as string) : ''
+  const canEditOffsite = !!commonBackupHostId
+  const { data: offsiteHosts, isLoading: offsiteLoading } = useOffsiteHostsByBackupHost(commonBackupHostId)
+
+  const handleOffsiteHostToggle = (hostId: string) => {
+    setFormData(prev => {
+      const isChecked = prev.offsiteHostIds.includes(hostId)
+      const nextHostIds = isChecked
+        ? prev.offsiteHostIds.filter(id => id !== hostId)
+        : [...prev.offsiteHostIds, hostId]
+      const nextPools = { ...prev.offsitePoolByHost }
+      if (isChecked) delete nextPools[hostId]
+      return { ...prev, offsiteHostIds: nextHostIds, offsitePoolByHost: nextPools }
+    })
+  }
+
+  const handleOffsitePoolChange = (hostId: string, poolId: string) => {
+    setFormData(prev => ({
+      ...prev,
+      offsitePoolByHost: { ...prev.offsitePoolByHost, [hostId]: poolId },
+    }))
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -50,7 +87,8 @@ export default function BulkEditScheduleDialog({ scheduleIds, schedules, onClose
                        formData.updateKeepArchive || 
                        formData.updateCompression || 
                        formData.updateVerify || 
-                       formData.updateEnabled
+                       formData.updateEnabled ||
+                       formData.updateOffsite
 
     if (!hasUpdates) {
       toast.error('Please select at least one field to update')
@@ -61,6 +99,27 @@ export default function BulkEditScheduleDialog({ scheduleIds, schedules, onClose
       toast.error('Please enter a valid start time (HH:MM)')
       return
     }
+
+    // Offsite validation (mirrors server Req 4.3): when enabling offsite sync,
+    // require at least one host and a destination pool for each checked host.
+    if (formData.updateOffsite && formData.syncToOffsite) {
+      if (formData.offsiteHostIds.length === 0) {
+        toast.error('Select at least one offsite host or turn off offsite sync')
+        return
+      }
+      const missing = formData.offsiteHostIds.filter(id => !formData.offsitePoolByHost[id])
+      if (missing.length > 0) {
+        setOffsiteValidationAttempted(true)
+        toast.error('Select a destination pool for each offsite host')
+        return
+      }
+    }
+
+    // Build the offsite targets once — all selected schedules share one
+    // backup host, so the same targets apply to every schedule.
+    const offsiteTargets = formData.offsiteHostIds
+      .map(id => ({ offsiteHostId: id, offsitePoolId: formData.offsitePoolByHost[id] }))
+      .filter(t => !!t.offsitePoolId)
 
     setIsUpdating(true)
     setUpdatedCount(0)
@@ -97,6 +156,18 @@ export default function BulkEditScheduleDialog({ scheduleIds, schedules, onClose
         }
         if (formData.updateEnabled) {
           updates.enabled = formData.enabled
+        }
+        if (formData.updateOffsite) {
+          updates.syncToOffsite = formData.syncToOffsite
+          if (formData.syncToOffsite) {
+            // Primary field: one { offsiteHostId, offsitePoolId } per checked host.
+            updates.offsiteTargets = offsiteTargets
+            updates.offsiteHostIds = formData.offsiteHostIds
+          } else {
+            // Turning offsite off clears any existing targets.
+            updates.offsiteTargets = []
+            updates.offsiteHostIds = []
+          }
         }
 
         if (Object.keys(updates).length > 0) {
@@ -347,6 +418,155 @@ export default function BulkEditScheduleDialog({ scheduleIds, schedules, onClose
                   </div>
                 </div>
               </div>
+            </div>
+
+            {/* Offsite Settings (All Schedules) */}
+            <div className="space-y-4 p-4 border rounded-md bg-blue-50 dark:bg-blue-900/10">
+              <h3 className="font-medium text-sm flex items-center">
+                <span className="mr-2">📤</span>
+                Offsite Backup Settings
+              </h3>
+
+              {!canEditOffsite ? (
+                <Alert>
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription className="text-xs">
+                    The selected schedules span multiple backup hosts (or have no backup host).
+                    Offsite settings can only be bulk-edited when all schedules belong to the same backup host.
+                  </AlertDescription>
+                </Alert>
+              ) : (
+                <div className="flex items-start space-x-3">
+                  <Checkbox
+                    id="updateOffsite"
+                    checked={formData.updateOffsite}
+                    onChange={(e: any) => setFormData({ ...formData, updateOffsite: e.target.checked })}
+                  />
+                  <div className="flex-1">
+                    <Label htmlFor="updateOffsite" className="cursor-pointer">
+                      Update Offsite Settings
+                    </Label>
+                    {formData.updateOffsite && (
+                      <div className="mt-3 space-y-3">
+                        <div className="flex items-center space-x-2">
+                          <Checkbox
+                            id="syncToOffsite"
+                            checked={formData.syncToOffsite}
+                            onChange={(e: any) => setFormData({ ...formData, syncToOffsite: e.target.checked })}
+                          />
+                          <Label htmlFor="syncToOffsite" className="cursor-pointer font-normal">
+                            Sync backups to offsite location(s)
+                          </Label>
+                        </div>
+
+                        {formData.syncToOffsite && (
+                          <div className="space-y-2">
+                            <Label>Offsite Hosts</Label>
+                            {offsiteLoading ? (
+                              <div className="border rounded-lg p-3 bg-white dark:bg-gray-800 flex items-center space-x-2">
+                                <Loader2 className="h-4 w-4 animate-spin text-gray-500" />
+                                <p className="text-sm text-gray-500">Loading offsite hosts...</p>
+                              </div>
+                            ) : !offsiteHosts || offsiteHosts.length === 0 ? (
+                              <div className="border rounded-lg p-3 bg-white dark:bg-gray-800">
+                                <p className="text-sm text-gray-500">No offsite hosts configured yet</p>
+                                <p className="text-xs text-gray-400 mt-1">
+                                  Add offsite hosts in the Backup Hosts page to enable offsite backup.
+                                </p>
+                              </div>
+                            ) : (
+                              <div className="border rounded-lg p-3 space-y-3 max-h-72 overflow-y-auto bg-white dark:bg-gray-800">
+                                {offsiteHosts.map((host: any) => {
+                                  const checked = formData.offsiteHostIds.includes(host.id)
+                                  const selectedPoolId = formData.offsitePoolByHost[host.id] || ''
+                                  const pools: any[] = host.storagePools || []
+                                  const selectedPool = pools.find((p: any) => p.id === selectedPoolId)
+                                  const missingPool = checked && !selectedPoolId
+                                  const poolTooFull = !!selectedPool &&
+                                    typeof selectedPool.usagePercent === 'number' &&
+                                    selectedPool.usagePercent >= 80
+                                  return (
+                                    <div key={host.id} className="space-y-2 border-b border-gray-100 dark:border-gray-700 pb-2 last:border-b-0 last:pb-0">
+                                      <div className="flex items-center space-x-2">
+                                        <Checkbox
+                                          id={`bulkedit-offsite-${host.id}`}
+                                          checked={checked}
+                                          onChange={() => handleOffsiteHostToggle(host.id)}
+                                        />
+                                        <Label htmlFor={`bulkedit-offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
+                                          {host.name} ({host.ip})
+                                        </Label>
+                                        {host.status === 'online' ? (
+                                          <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
+                                            Connected
+                                          </Badge>
+                                        ) : (
+                                          <Badge variant="outline" className="text-xs bg-red-50 text-red-700 border-red-200">
+                                            Disconnected
+                                          </Badge>
+                                        )}
+                                      </div>
+                                      {checked && (
+                                        <div className="ml-6 space-y-1">
+                                          <Label htmlFor={`bulkedit-offsite-pool-${host.id}`} className="text-xs">
+                                            Destination Pool *
+                                          </Label>
+                                          <Select
+                                            id={`bulkedit-offsite-pool-${host.id}`}
+                                            value={selectedPoolId}
+                                            onChange={(e) => handleOffsitePoolChange(host.id, e.target.value)}
+                                            className={missingPool && offsiteValidationAttempted ? 'border-red-500' : ''}
+                                          >
+                                            <option value="">Select pool...</option>
+                                            {pools.length === 0 ? (
+                                              <option disabled>No pools configured</option>
+                                            ) : (
+                                              pools.map((p: any) => (
+                                                <option key={p.id} value={p.id}>
+                                                  {p.name}
+                                                  {typeof p.usagePercent === 'number' ? ` (${p.usagePercent}% used)` : ''}
+                                                </option>
+                                              ))
+                                            )}
+                                          </Select>
+                                          {pools.length === 0 && (
+                                            <p className="text-xs text-red-600">
+                                              This offsite host has no storage pools. Add one before selecting it.
+                                            </p>
+                                          )}
+                                          {missingPool && offsiteValidationAttempted && pools.length > 0 && (
+                                            <p className="text-xs text-red-600">
+                                              Select a destination pool for this offsite host.
+                                            </p>
+                                          )}
+                                          {poolTooFull && (
+                                            <p className="text-xs text-amber-600">
+                                              Selected pool is {selectedPool.usagePercent}% full (≥80%); the server may reject this target.
+                                            </p>
+                                          )}
+                                        </div>
+                                      )}
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            )}
+                            <p className="text-xs text-gray-500">
+                              Applies the same offsite hosts and pools to all {schedules.length} selected schedule(s).
+                            </p>
+                          </div>
+                        )}
+
+                        {!formData.syncToOffsite && (
+                          <p className="text-xs text-gray-500">
+                            Offsite sync will be turned off for all selected schedules.
+                          </p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Progress Indicator */}

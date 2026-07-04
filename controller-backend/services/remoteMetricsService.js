@@ -1,6 +1,6 @@
 const { exec } = require('child_process');
 const { promisify } = require('util');
-const { getHypervisors, getOffsiteHosts, getBackupHosts } = require('./fileStorage');
+const { getHypervisors, getOffsiteHosts, getBackupHosts, updateOffsiteHost } = require('./fileStorage');
 const agentService = require('./agentService');
 
 const execAsync = promisify(exec);
@@ -70,9 +70,12 @@ class RemoteMetricsService {
         this.collectHypervisorMetrics(hypervisor);
       }
 
-      // Collect offsite host metrics
+      // Collect offsite host metrics.
+      // Collect sequentially (await) so the per-pool metrics write-back into
+      // each offsite host record does not race with another host's write-back
+      // (the update reads the full offsite-hosts list, merges one host, saves).
       for (const offsite of offsiteHosts) {
-        this.collectOffsiteMetrics(offsite);
+        await this.collectOffsiteMetrics(offsite);
       }
     } catch (error) {
       console.error('[RemoteMetrics] Error collecting metrics:', error);
@@ -143,37 +146,69 @@ class RemoteMetricsService {
         throw new Error(`Backup host not found for offsite ${offsite.name}`);
       }
 
-      // Get storage pools for this backup host
-      const { getStoragePools } = require('./fileStorage');
-      const allPools = await getStoragePools();
-      const storagePools = allPools.filter(pool => pool.backupHostId === offsite.backupHostId);
+      // Use THIS offsite host's own storage pools (embedded in the offsite
+      // host record), not the backup host's pools. Each pool has a name and an
+      // absolute path on the offsite host (Req 7.1).
+      const offsitePools = Array.isArray(offsite.storagePools) ? offsite.storagePools : [];
 
-      // Call agent API to collect metrics via SSH, passing storage pools
+      // Call agent API to collect metrics via SSH, passing the offsite pools.
+      // The agent df-checks each offsitePath independently and returns per-pool
+      // metrics keyed by poolId/poolName (Req 7.2).
       const result = await agentService.getRemoteOffsiteMetrics(backupHost.url, {
         ip: offsite.ip,
         username: offsite.username || 'root',
         port: offsite.port || 22,
-        storagePools: storagePools.map(pool => ({
+        storagePools: offsitePools.map(pool => ({
           id: pool.id,
           name: pool.name,
-          mountPoint: pool.mountPoint,
-          offsitePath: pool.offsitePath || pool.mountPoint
+          offsitePath: pool.path
         }))
       });
 
       if (result.success && result.data) {
+        const disks = result.data.disks || [];
+
         this.metricsCache.set(`offsite-${offsite.id}`, {
           id: offsite.id,
           name: offsite.name,
           ip: offsite.ip,
           backupHostId: offsite.backupHostId,
           type: 'offsite',
-          disks: result.data.disks || [],
+          disks,
           timestamp: result.data.timestamp || new Date().toISOString(),
           status: result.data.status || 'online'
         });
 
-        console.log(`[RemoteMetrics] ✓ Collected ${result.data.disks?.length || 0} disk(s) for ${offsite.name}`);
+        // Write per-pool metrics back into each offsite pool snapshot so the UI
+        // and the 80% disk-usage checks can read the latest usage (Req 7.1).
+        if (offsitePools.length > 0) {
+          const disksByPoolId = new Map();
+          for (const disk of disks) {
+            if (disk.poolId) disksByPoolId.set(disk.poolId, disk);
+          }
+
+          const now = new Date().toISOString();
+          const updatedPools = offsitePools.map(pool => {
+            const disk = disksByPoolId.get(pool.id);
+            if (!disk) return pool;
+            return {
+              ...pool,
+              device: disk.device,
+              path: pool.path,
+              totalGB: disk.total,
+              usedGB: disk.used,
+              availableGB: disk.available,
+              usagePercent: disk.usage,
+              status: 'active',
+              lastError: null,
+              updatedAt: now
+            };
+          });
+
+          await updateOffsiteHost(offsite.id, { storagePools: updatedPools });
+        }
+
+        console.log(`[RemoteMetrics] ✓ Collected ${disks.length} disk(s) for ${offsite.name}`);
       } else {
         throw new Error(result.error || 'Failed to collect metrics');
       }

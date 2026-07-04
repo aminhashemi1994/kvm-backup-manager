@@ -7,7 +7,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Select } from '@/components/ui/select'
 import {
   Plus, Trash2, Edit, Power, Loader2, CheckSquare, Search, XCircle,
-  Filter, ChevronDown, ChevronUp, Play, ChevronLeft, ChevronRight,
+  Filter, ChevronDown, ChevronUp, Play, ChevronLeft, ChevronRight, AlertTriangle,
 } from 'lucide-react'
 import ScheduleForm from './ScheduleForm'
 import BulkEditScheduleDialog from './BulkEditScheduleDialog'
@@ -572,8 +572,39 @@ export default function ScheduleList() {
 
                         const offsiteCount = schedule.offsiteHostIds?.length || 0
 
+                        // Migration/validation state (Req 8.3): invalid schedules are shown red.
+                        const isInvalid = schedule.invalid === true
+                        const invalidReason: string =
+                          schedule.invalidReason || 'This schedule is invalid and will not run.'
+
+                        // Runtime offsite sync warnings (Req 6.3). Resolve host/pool names
+                        // from the enriched schedule where available for a helpful tooltip.
+                        const offsiteWarnings = Array.isArray(schedule.offsiteWarnings)
+                          ? schedule.offsiteWarnings
+                          : []
+                        const offsiteHostNames: string[] = (schedule as any).offsiteHostNames || []
+                        const offsiteHostIds: string[] = schedule.offsiteHostIds || []
+                        const hostNameById = (hostId: string): string | undefined => {
+                          const idx = offsiteHostIds.indexOf(hostId)
+                          return idx >= 0 ? offsiteHostNames[idx] : undefined
+                        }
+                        const warningTooltip = offsiteWarnings
+                          .map((w: any) => {
+                            const hostName = hostNameById(w?.offsiteHostId) || w?.offsiteHostId || 'offsite host'
+                            const reason = w?.reason || 'sync skipped'
+                            return `${hostName}: ${reason}`
+                          })
+                          .join('\n')
+
                         return (
-                          <TableRow key={schedule.id}>
+                          <TableRow
+                            key={schedule.id}
+                            className={
+                              isInvalid
+                                ? 'bg-red-50 dark:bg-red-900/20 border-l-2 border-l-red-500'
+                                : undefined
+                            }
+                          >
                             <TableCell>
                               <Checkbox
                                 checked={selectedScheduleIds.has(schedule.id)}
@@ -584,6 +615,16 @@ export default function ScheduleList() {
                               <div className="truncate max-w-[240px]" title={schedule.name}>
                                 {schedule.name}
                               </div>
+                              {isInvalid && (
+                                <Badge
+                                  variant="destructive"
+                                  className="mt-1 gap-1 cursor-help"
+                                  title={invalidReason}
+                                >
+                                  <AlertTriangle className="h-3 w-3" />
+                                  Invalid
+                                </Badge>
+                              )}
                             </TableCell>
                             <TableCell>
                               <VmNameCell
@@ -603,13 +644,25 @@ export default function ScheduleList() {
                               <p className="text-sm">{getScheduleInfo()}</p>
                             </TableCell>
                             <TableCell>
-                              {offsiteCount > 0 ? (
-                                <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
-                                  {offsiteCount} {offsiteCount === 1 ? 'host' : 'hosts'}
-                                </Badge>
-                              ) : (
-                                <span className="text-xs text-gray-400">—</span>
-                              )}
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {offsiteCount > 0 ? (
+                                  <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
+                                    {offsiteCount} {offsiteCount === 1 ? 'host' : 'hosts'}
+                                  </Badge>
+                                ) : (
+                                  <span className="text-xs text-gray-400">—</span>
+                                )}
+                                {offsiteWarnings.length > 0 && (
+                                  <Badge
+                                    variant="outline"
+                                    className="gap-1 bg-amber-50 text-amber-700 border-amber-200 cursor-help dark:bg-amber-900/20 dark:text-amber-400 dark:border-amber-800"
+                                    title={warningTooltip}
+                                  >
+                                    <AlertTriangle className="h-3 w-3" />
+                                    {offsiteWarnings.length}
+                                  </Badge>
+                                )}
+                              </div>
                             </TableCell>
                             <TableCell>
                               <Badge className={schedule.enabled ? getStatusColor('online') : getStatusColor('offline')}>
@@ -776,7 +829,6 @@ export default function ScheduleList() {
 
       {showBulkEditDialog && (
         <BulkEditScheduleDialog
-          scheduleIds={Array.from(selectedScheduleIds)}
           schedules={schedules?.filter(s => selectedScheduleIds.has(s.id)) || []}
           onClose={() => { setShowBulkEditDialog(false); setSelectedScheduleIds(new Set()) }}
         />

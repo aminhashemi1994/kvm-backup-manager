@@ -9,7 +9,7 @@ import { Calendar } from '@/components/ui/calendar'
 import { useCreateSchedule, useUpdateSchedule } from '@/hooks/useBackups'
 import { useBackupHosts, useHypervisorsByBackupHost, useVMsByHypervisor, useAllVMs } from '@/hooks/useBackupHosts'
 import { useOffsiteHostsByBackupHost } from '@/hooks/useOffsiteHosts'
-import { Loader2, Trash2, Plus, Search, HardDrive, AlertCircle } from 'lucide-react'
+import { Loader2, Search, HardDrive, AlertCircle } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { useQuery } from '@tanstack/react-query'
@@ -75,7 +75,12 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     // Offsite - Changed to support multiple hosts
     syncToOffsite: false,
     offsiteHostIds: [] as string[], // Changed from offsiteHostId to offsiteHostIds array
+    // Per-offsite-host destination pool: offsiteHostId -> offsitePoolId
+    offsitePoolByHost: {} as Record<string, string>,
   })
+
+  // Set true after a failed submit so per-host "pool required" errors render inline.
+  const [offsiteValidationAttempted, setOffsiteValidationAttempted] = useState(false)
 
   // Hierarchical selection state. In edit mode we initialize from the
   // schedule prop directly so the cascading effects below never observe a
@@ -127,7 +132,7 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     if (!selectedBackupHostId) {
       const hypId = selectedHypervisorId || allVMs?.find(v => v.id === schedule.vmId)?.hypervisorId
       const hyp = hypId && allHypervisors?.find(h => h.id === hypId)
-      if (hyp?.backupHostId) {
+      if (hyp && typeof hyp.backupHostId === 'string') {
         setSelectedBackupHostId(hyp.backupHostId)
       }
     }
@@ -166,11 +171,23 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
   }, [vms, vmSearchQuery])
 
   const handleOffsiteHostToggle = (hostId: string) => {
-    setFormData(prev => ({
-      ...prev,
-      offsiteHostIds: prev.offsiteHostIds.includes(hostId)
+    setFormData(prev => {
+      const isChecked = prev.offsiteHostIds.includes(hostId)
+      const nextHostIds = isChecked
         ? prev.offsiteHostIds.filter(id => id !== hostId)
         : [...prev.offsiteHostIds, hostId]
+      // Drop the pool selection when a host is unchecked so we never submit a
+      // stale target for a host that is no longer selected.
+      const nextPools = { ...prev.offsitePoolByHost }
+      if (isChecked) delete nextPools[hostId]
+      return { ...prev, offsiteHostIds: nextHostIds, offsitePoolByHost: nextPools }
+    })
+  }
+
+  const handleOffsitePoolChange = (hostId: string, poolId: string) => {
+    setFormData(prev => ({
+      ...prev,
+      offsitePoolByHost: { ...prev.offsitePoolByHost, [hostId]: poolId },
     }))
   }
 
@@ -204,7 +221,17 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         retryCount: typeof schedule.retryCount === 'number' ? schedule.retryCount : 3,
         retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
         syncToOffsite: schedule.syncToOffsite || false,
-        offsiteHostIds: schedule.offsiteHostIds || (schedule.offsiteHostId ? [schedule.offsiteHostId] : []),
+        // Prefer the new offsiteTargets shape; fall back to legacy
+        // offsiteHostIds/offsiteHostId (no pool -> user must pick one).
+        offsiteHostIds: Array.isArray(schedule.offsiteTargets) && schedule.offsiteTargets.length > 0
+          ? schedule.offsiteTargets.map((t: any) => t.offsiteHostId)
+          : (schedule.offsiteHostIds || (schedule.offsiteHostId ? [schedule.offsiteHostId] : [])),
+        offsitePoolByHost: Array.isArray(schedule.offsiteTargets)
+          ? schedule.offsiteTargets.reduce((acc: Record<string, string>, t: any) => {
+              if (t.offsiteHostId && t.offsitePoolId) acc[t.offsiteHostId] = t.offsitePoolId
+              return acc
+            }, {})
+          : {},
       })
 
       // Load custom dates into calendar
@@ -292,7 +319,21 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
       return
     }
 
+    // Offsite validation (mirrors server Req 4.3): every checked offsite host
+    // must have a destination pool selected before we allow save.
+    if (formData.syncToOffsite && formData.offsiteHostIds.length > 0) {
+      const missing = formData.offsiteHostIds.filter(id => !formData.offsitePoolByHost[id])
+      if (missing.length > 0) {
+        setOffsiteValidationAttempted(true)
+        toast.error('Select a destination pool for each offsite host')
+        return
+      }
+    }
+
     const buildData = (vmId: string, vmName?: string): any => {
+      const offsiteTargets = formData.offsiteHostIds
+        .map(id => ({ offsiteHostId: id, offsitePoolId: formData.offsitePoolByHost[id] }))
+        .filter(t => !!t.offsitePoolId)
       const data: any = {
         vmId,
         storagePoolId: formData.storagePoolId,
@@ -307,6 +348,9 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         retryCount: formData.retryCount,
         retryDelayMinutes: formData.retryDelayMinutes,
         syncToOffsite: formData.syncToOffsite,
+        // Primary field: one { offsiteHostId, offsitePoolId } per checked host.
+        offsiteTargets: formData.syncToOffsite && offsiteTargets.length > 0 ? offsiteTargets : undefined,
+        // Kept for backward-compat with any existing read paths.
         offsiteHostIds: formData.syncToOffsite && formData.offsiteHostIds.length > 0 ? formData.offsiteHostIds : undefined,
       }
       switch (formData.scheduleType) {
@@ -1162,32 +1206,84 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                       </p>
                     </div>
                   ) : (
-                    <div className="border rounded-lg p-3 space-y-2 max-h-40 overflow-y-auto bg-white">
-                      {offsiteHosts.map((host: any) => (
-                        <div key={host.id} className="flex items-center space-x-2">
-                          <Checkbox
-                            id={`offsite-${host.id}`}
-                            checked={formData.offsiteHostIds.includes(host.id)}
-                            onChange={() => handleOffsiteHostToggle(host.id)}
-                          />
-                          <Label htmlFor={`offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
-                            {host.name} ({host.ip})
-                          </Label>
-                          {host.status === 'online' ? (
-                            <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
-                              Connected
-                            </Badge>
-                          ) : (
-                            <Badge variant="outline" className="text-xs bg-red-50 text-red-700 border-red-200">
-                              Disconnected
-                            </Badge>
-                          )}
-                        </div>
-                      ))}
+                    <div className="border rounded-lg p-3 space-y-3 max-h-72 overflow-y-auto bg-white">
+                      {offsiteHosts.map((host: any) => {
+                        const checked = formData.offsiteHostIds.includes(host.id)
+                        const selectedPoolId = formData.offsitePoolByHost[host.id] || ''
+                        const pools: any[] = host.storagePools || []
+                        const selectedPool = pools.find((p: any) => p.id === selectedPoolId)
+                        const missingPool = checked && !selectedPoolId
+                        const poolTooFull = !!selectedPool &&
+                          typeof selectedPool.usagePercent === 'number' &&
+                          selectedPool.usagePercent >= 80
+                        return (
+                          <div key={host.id} className="space-y-2 border-b border-gray-100 pb-2 last:border-b-0 last:pb-0">
+                            <div className="flex items-center space-x-2">
+                              <Checkbox
+                                id={`offsite-${host.id}`}
+                                checked={checked}
+                                onChange={() => handleOffsiteHostToggle(host.id)}
+                              />
+                              <Label htmlFor={`offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
+                                {host.name} ({host.ip})
+                              </Label>
+                              {host.status === 'online' ? (
+                                <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
+                                  Connected
+                                </Badge>
+                              ) : (
+                                <Badge variant="outline" className="text-xs bg-red-50 text-red-700 border-red-200">
+                                  Disconnected
+                                </Badge>
+                              )}
+                            </div>
+                            {checked && (
+                              <div className="ml-6 space-y-1">
+                                <Label htmlFor={`offsite-pool-${host.id}`} className="text-xs">
+                                  Destination Pool *
+                                </Label>
+                                <Select
+                                  id={`offsite-pool-${host.id}`}
+                                  value={selectedPoolId}
+                                  onChange={(e) => handleOffsitePoolChange(host.id, e.target.value)}
+                                  className={missingPool && offsiteValidationAttempted ? 'border-red-500' : ''}
+                                >
+                                  <option value="">Select pool...</option>
+                                  {pools.length === 0 ? (
+                                    <option disabled>No pools configured</option>
+                                  ) : (
+                                    pools.map((p: any) => (
+                                      <option key={p.id} value={p.id}>
+                                        {p.name}
+                                        {typeof p.usagePercent === 'number' ? ` (${p.usagePercent}% used)` : ''}
+                                      </option>
+                                    ))
+                                  )}
+                                </Select>
+                                {pools.length === 0 && (
+                                  <p className="text-xs text-red-600">
+                                    This offsite host has no storage pools. Add one before selecting it.
+                                  </p>
+                                )}
+                                {missingPool && offsiteValidationAttempted && pools.length > 0 && (
+                                  <p className="text-xs text-red-600">
+                                    Select a destination pool for this offsite host.
+                                  </p>
+                                )}
+                                {poolTooFull && (
+                                  <p className="text-xs text-amber-600">
+                                    Selected pool is {selectedPool.usagePercent}% full (≥80%); the server may reject this target.
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
                     </div>
                   )}
                   <p className="text-xs text-gray-600">
-                    Select one or more offsite hosts. Backups will be synced after completion.
+                    Select one or more offsite hosts and a destination pool for each. Backups will be synced after completion.
                   </p>
                 </div>
               )}
