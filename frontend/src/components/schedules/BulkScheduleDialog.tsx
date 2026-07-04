@@ -63,8 +63,11 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
     // Offsite
     syncToOffsite: false,
     offsiteHostIds: [] as string[],
+    // Per-offsite-host destination pool: offsiteHostId -> offsitePoolId
+    offsitePoolByHost: {} as Record<string, string>,
   })
 
+  const [offsiteValidationAttempted, setOffsiteValidationAttempted] = useState(false)
   const [selectedCalendarDates, setSelectedCalendarDates] = useState<Date[]>([])
   const [isCreating, setIsCreating] = useState(false)
   const [createdCount, setCreatedCount] = useState(0)
@@ -88,11 +91,21 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
   const { data: offsiteHosts, isLoading: offsiteLoading } = useOffsiteHostsByBackupHost(backupHostId)
 
   const handleOffsiteHostToggle = (hostId: string) => {
-    setFormData(prev => ({
-      ...prev,
-      offsiteHostIds: prev.offsiteHostIds.includes(hostId)
+    setFormData(prev => {
+      const isChecked = prev.offsiteHostIds.includes(hostId)
+      const nextHostIds = isChecked
         ? prev.offsiteHostIds.filter(id => id !== hostId)
         : [...prev.offsiteHostIds, hostId]
+      const nextPools = { ...prev.offsitePoolByHost }
+      if (isChecked) delete nextPools[hostId]
+      return { ...prev, offsiteHostIds: nextHostIds, offsitePoolByHost: nextPools }
+    })
+  }
+
+  const handleOffsitePoolChange = (hostId: string, poolId: string) => {
+    setFormData(prev => ({
+      ...prev,
+      offsitePoolByHost: { ...prev.offsitePoolByHost, [hostId]: poolId },
     }))
   }
 
@@ -163,9 +176,24 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
       return
     }
 
+    // Offsite validation (mirrors server Req 4.3): each checked offsite host
+    // must have a destination pool selected.
+    if (formData.syncToOffsite && formData.offsiteHostIds.length > 0) {
+      const missing = formData.offsiteHostIds.filter(id => !formData.offsitePoolByHost[id])
+      if (missing.length > 0) {
+        setOffsiteValidationAttempted(true)
+        toast.error('Select a destination pool for each offsite host')
+        return
+      }
+    }
+
     setIsCreating(true)
     setCreatedCount(0)
     setFailedCount(0)
+
+    const offsiteTargets = formData.offsiteHostIds
+      .map(id => ({ offsiteHostId: id, offsitePoolId: formData.offsitePoolByHost[id] }))
+      .filter(t => !!t.offsitePoolId)
 
     // Create schedule for each VM
     for (const vm of selectedVMs) {
@@ -179,7 +207,8 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
           noVerify: formData.noVerify,
           enabled: formData.enabled,
           syncToOffsite: formData.syncToOffsite,
-          offsiteHostIds: formData.syncToOffsite ? formData.offsiteHostIds : undefined,
+          offsiteTargets: formData.syncToOffsite && offsiteTargets.length > 0 ? offsiteTargets : undefined,
+          offsiteHostIds: formData.syncToOffsite && formData.offsiteHostIds.length > 0 ? formData.offsiteHostIds : undefined,
         }
 
         // Add type-specific fields
@@ -614,32 +643,84 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
                       </p>
                     </div>
                   ) : (
-                    <div className="border rounded-lg p-3 space-y-2 max-h-40 overflow-y-auto bg-white dark:bg-gray-800">
-                      {offsiteHosts.map((host: any) => (
-                        <div key={host.id} className="flex items-center space-x-2">
-                          <Checkbox
-                            id={`bulk-offsite-${host.id}`}
-                            checked={formData.offsiteHostIds.includes(host.id)}
-                            onChange={() => handleOffsiteHostToggle(host.id)}
-                          />
-                          <Label htmlFor={`bulk-offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
-                            {host.name} ({host.ip})
-                          </Label>
-                          {host.status === 'online' ? (
-                            <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
-                              Connected
-                            </Badge>
-                          ) : (
-                            <Badge variant="outline" className="text-xs bg-red-50 text-red-700 border-red-200">
-                              Disconnected
-                            </Badge>
-                          )}
-                        </div>
-                      ))}
+                    <div className="border rounded-lg p-3 space-y-3 max-h-72 overflow-y-auto bg-white dark:bg-gray-800">
+                      {offsiteHosts.map((host: any) => {
+                        const checked = formData.offsiteHostIds.includes(host.id)
+                        const selectedPoolId = formData.offsitePoolByHost[host.id] || ''
+                        const pools: any[] = host.storagePools || []
+                        const selectedPool = pools.find((p: any) => p.id === selectedPoolId)
+                        const missingPool = checked && !selectedPoolId
+                        const poolTooFull = !!selectedPool &&
+                          typeof selectedPool.usagePercent === 'number' &&
+                          selectedPool.usagePercent >= 80
+                        return (
+                          <div key={host.id} className="space-y-2 border-b border-gray-100 dark:border-gray-700 pb-2 last:border-b-0 last:pb-0">
+                            <div className="flex items-center space-x-2">
+                              <Checkbox
+                                id={`bulk-offsite-${host.id}`}
+                                checked={checked}
+                                onChange={() => handleOffsiteHostToggle(host.id)}
+                              />
+                              <Label htmlFor={`bulk-offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
+                                {host.name} ({host.ip})
+                              </Label>
+                              {host.status === 'online' ? (
+                                <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
+                                  Connected
+                                </Badge>
+                              ) : (
+                                <Badge variant="outline" className="text-xs bg-red-50 text-red-700 border-red-200">
+                                  Disconnected
+                                </Badge>
+                              )}
+                            </div>
+                            {checked && (
+                              <div className="ml-6 space-y-1">
+                                <Label htmlFor={`bulk-offsite-pool-${host.id}`} className="text-xs">
+                                  Destination Pool *
+                                </Label>
+                                <Select
+                                  id={`bulk-offsite-pool-${host.id}`}
+                                  value={selectedPoolId}
+                                  onChange={(e) => handleOffsitePoolChange(host.id, e.target.value)}
+                                  className={missingPool && offsiteValidationAttempted ? 'border-red-500' : ''}
+                                >
+                                  <option value="">Select pool...</option>
+                                  {pools.length === 0 ? (
+                                    <option disabled>No pools configured</option>
+                                  ) : (
+                                    pools.map((p: any) => (
+                                      <option key={p.id} value={p.id}>
+                                        {p.name}
+                                        {typeof p.usagePercent === 'number' ? ` (${p.usagePercent}% used)` : ''}
+                                      </option>
+                                    ))
+                                  )}
+                                </Select>
+                                {pools.length === 0 && (
+                                  <p className="text-xs text-red-600">
+                                    This offsite host has no storage pools. Add one before selecting it.
+                                  </p>
+                                )}
+                                {missingPool && offsiteValidationAttempted && pools.length > 0 && (
+                                  <p className="text-xs text-red-600">
+                                    Select a destination pool for this offsite host.
+                                  </p>
+                                )}
+                                {poolTooFull && (
+                                  <p className="text-xs text-amber-600">
+                                    Selected pool is {selectedPool.usagePercent}% full (≥80%); the server may reject this target.
+                                  </p>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      })}
                     </div>
                   )}
                   <p className="text-xs text-gray-600 dark:text-gray-400">
-                    Select one or more offsite hosts. Backups for all {selectedVMs.length} VM(s) will be synced after completion.
+                    Select one or more offsite hosts and a destination pool for each. Backups for all {selectedVMs.length} VM(s) will be synced after completion.
                   </p>
                 </div>
               )}

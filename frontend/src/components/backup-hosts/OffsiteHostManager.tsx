@@ -28,6 +28,7 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
     name: '',
     ip: '',
     username: 'root',
+    backupPath: '',
   })
 
   const queryClient = useQueryClient()
@@ -104,7 +105,7 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
         toast.warning('Offsite host added but connection test failed')
       }
       setShowAddDialog(false)
-      setFormData({ name: '', ip: '', username: 'root' })
+      setFormData({ name: '', ip: '', username: 'root', backupPath: '' })
     },
     onError: (error: any) => {
       toast.error(error.response?.data?.error || 'Failed to add offsite host')
@@ -359,9 +360,24 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
                 </div>
               </div>
 
+              <div className="space-y-2">
+                <Label htmlFor="backupPath">Backup Path (optional)</Label>
+                <Input
+                  id="backupPath"
+                  placeholder="/mnt/offsite/backups"
+                  value={formData.backupPath}
+                  onChange={(e) => setFormData({ ...formData, backupPath: e.target.value })}
+                />
+                <p className="text-xs text-gray-500">
+                  Destination base directory on this offsite host. Backups replicate to
+                  <code className="mx-1">&lt;path&gt;/&lt;vm&gt;</code>. Leave empty to mirror the source
+                  storage-pool path (default).
+                </p>
+              </div>
+
               <p className="text-xs text-gray-500">
                 This offsite host will be available when backing up VMs from <strong>{backupHostName}</strong>.
-                The IP will be passed to backup_manager.sh via --offsite-ip parameter.
+                Each host replicates to its own backup path (or mirrors the source path when left empty).
               </p>
             </div>
 

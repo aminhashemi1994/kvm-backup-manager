@@ -42,6 +42,22 @@ export interface VirtualMachine {
   updatedAt: string
 }
 
+// Storage pool owned by an offsite host (independent of backup-host pools)
+export interface OffsiteStoragePool {
+  id: string
+  name: string
+  path: string
+  totalGB?: number
+  usedGB?: number
+  availableGB?: number
+  usagePercent?: number
+  mounted?: boolean
+  status: 'active' | 'error'
+  lastError?: string | null
+  createdAt: string
+  updatedAt: string
+}
+
 // Offsite Host for backup replication
 export interface OffsiteHost {
   id: string
@@ -51,9 +67,27 @@ export interface OffsiteHost {
   port: number
   username: string
   path: string
+  /** This offsite host's own storage pools. Replaces the single legacy `backupPath`. */
+  storagePools: OffsiteStoragePool[]
+  /** LEGACY: optional custom destination base path. Migration source only. */
+  backupPath?: string
   status: 'connected' | 'disconnected' | 'pending'
   createdAt: string
   updatedAt: string
+}
+
+// A schedule/job's chosen offsite destination: one pool per offsite host
+export interface OffsiteTarget {
+  offsiteHostId: string
+  offsitePoolId: string
+}
+
+// A runtime warning recorded when an offsite sync is skipped/failed
+export interface OffsiteWarning {
+  offsiteHostId: string
+  offsitePoolId: string
+  reason: string
+  at: string
 }
 
 // Backup Schedule
@@ -63,6 +97,8 @@ export interface BackupSchedule {
   vmName?: string
   backupHostId?: string
   backupHostName?: string
+  hypervisorId?: string
+  hypervisorName?: string
   name: string
   scheduleType: 'daily' | 'weekly' | 'custom-days' | 'interval' | 'cron' | 'once' | 'monthly'
   cronExpression: string
@@ -76,6 +112,29 @@ export interface BackupSchedule {
   missedRunPolicy?: 'immediate' | 'most-recent' | 'skip'
   missedRunGracePeriodMinutes?: number
   lastFiredAt?: string
+  // Offsite replication targets: one destination pool per selected offsite host
+  offsiteTargets?: OffsiteTarget[]
+  /** Derived from offsiteTargets; kept for enrichment/backward-compat. */
+  offsiteHostIds?: string[]
+  offsiteHostNames?: string[]
+  storagePoolId?: string
+  storagePoolName?: string
+  time?: string
+  incrementalCount?: number
+  retention?: number
+  keepArchive?: number
+  daysOfWeek?: number[]
+  customDates?: Array<{ date: string; time: string; method: 'full' | 'inc' }>
+  retentionCount?: number
+  intervalValue?: number
+  intervalUnit?: 'hours' | 'days'
+  retryCount?: number
+  retryDelayMinutes?: number
+  // Migration/validation flags: set when a schedule is disabled for a missing offsite pool selection
+  invalid?: boolean
+  invalidReason?: string | null
+  // Runtime offsite sync warnings (skipped/failed syncs while primary succeeded)
+  offsiteWarnings?: OffsiteWarning[]
   createdAt: string
   updatedAt: string
 }

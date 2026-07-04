@@ -935,11 +935,29 @@ class BackupExecutor {
       log('Verification: disabled');
     }
 
-    // Offsite hosts
+    // Offsite hosts. Each entry may be a bare IP string (legacy) or an
+    // object { ip, backupPath }. We encode them for the script as "ip:path"
+    // (path optional) joined by commas — a colon is used as the ip/path
+    // delimiter because the script command is run through a shell and a
+    // colon is shell-safe (unlike '|'). IPv4 addresses and normal paths
+    // contain no colons. The script replicates to <path>/<vm> on that host,
+    // or mirrors the source pool path when the path is empty.
     if (offsiteHosts && offsiteHosts.length > 0) {
-      const offsiteIps = offsiteHosts.join(',');
-      args.push('--offsite-ip', offsiteIps);
-      log(`Offsite hosts: ${offsiteIps}`);
+      const encoded = offsiteHosts
+        .map(h => {
+          if (typeof h === 'string') return h.trim();
+          if (h && h.ip) {
+            const p = (h.backupPath || '').trim();
+            return p ? `${h.ip}:${p}` : `${h.ip}`;
+          }
+          return null;
+        })
+        .filter(Boolean)
+        .join(',');
+      if (encoded) {
+        args.push('--offsite-ip', encoded);
+        log(`Offsite hosts: ${encoded}`);
+      }
     }
 
     // Verbose
@@ -1350,13 +1368,43 @@ class BackupExecutor {
         payload.failureReason = failureReason;
       }
       
-      // Use controllerAuthService for authenticated requests
-      await controllerAuthService.post(
-        this.config.controllerUrl,
-        `/backups/jobs/${jobId}/update`,
-        payload,
-        { timeout: 5000 }
-      );
+      // Terminal status updates (completed/failed/cancelled) are critical:
+      // if one is lost to a transient blip, the controller keeps the job
+      // "running" until a much later reconcile, producing a wrong status and
+      // a hugely inflated duration. So we retry terminal updates with backoff.
+      // Progress/running updates are frequent and self-correcting, so they
+      // stay single-shot to avoid backpressure.
+      const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+      const attempts = isTerminal ? 6 : 1;
+      const baseTimeout = isTerminal ? 10000 : 5000;
+
+      let lastErr = null;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          await controllerAuthService.post(
+            this.config.controllerUrl,
+            `/backups/jobs/${jobId}/update`,
+            payload,
+            { timeout: baseTimeout }
+          );
+          if (attempt > 1) {
+            console.log(`[BackupExecutor] Controller update for ${jobId} (${status}) succeeded on attempt ${attempt}`);
+          }
+          return; // success
+        } catch (err) {
+          lastErr = err;
+          if (!isTerminal) throw err; // handled by outer catch (progress: quiet)
+          if (attempt < attempts) {
+            const delay = Math.min(1000 * 2 ** (attempt - 1), 30000); // 1s,2s,4s,8s,16s(cap 30s)
+            console.warn(`[BackupExecutor] Controller update for ${jobId} (${status}) failed (attempt ${attempt}/${attempts}): ${err.message}. Retrying in ${delay}ms`);
+            await new Promise(r => setTimeout(r, delay));
+          }
+        }
+      }
+      // All terminal retries exhausted — log loudly. The controller-side
+      // periodic reconciler is the final safety net that will still finalize
+      // this job by inspecting the agent's real state.
+      console.error(`[BackupExecutor] CRITICAL: could not report terminal status '${status}' for job ${jobId} after ${attempts} attempts: ${lastErr && lastErr.message}. Controller will reconcile it on its next sync.`);
     } catch (err) {
       // Don't log every progress update failure to avoid spam
       if (status !== 'running' || !progress) {

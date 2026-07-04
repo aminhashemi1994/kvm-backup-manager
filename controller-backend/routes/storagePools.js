@@ -7,8 +7,7 @@ const {
   addStoragePool, 
   updateStoragePool, 
   deleteStoragePool,
-  getBackupHosts,
-  getOffsiteHosts
+  getBackupHosts
 } = require('../services/fileStorage');
 
 // GET /api/storage-pools - Get all storage pools
@@ -90,45 +89,6 @@ router.post('/', async (req, res, next) => {
 
     console.log('[Storage Pools] Validation successful:', validation.data);
 
-    // Validate storage pool exists on all offsite hosts for this backup host
-    const offsiteHosts = await getOffsiteHosts();
-    const backupHostOffsiteHosts = offsiteHosts.filter(h => h.backupHostId === backupHostId);
-    
-    console.log('[Storage Pools] Checking offsite hosts:', backupHostOffsiteHosts.length);
-    
-    const offsiteValidationErrors = [];
-    for (const offsiteHost of backupHostOffsiteHosts) {
-      const offsiteValidation = await agentService.validateOffsiteStoragePool(
-        backupHost.url,
-        path,
-        offsiteHost.ip,
-        offsiteHost.username || 'root'
-      );
-      
-      if (!offsiteValidation.success) {
-        offsiteValidationErrors.push({
-          host: offsiteHost.name,
-          ip: offsiteHost.ip,
-          error: offsiteValidation.error
-        });
-      }
-    }
-
-    // If any offsite validation failed, return error
-    if (offsiteValidationErrors.length > 0) {
-      const errorMessages = offsiteValidationErrors.map(e => 
-        `${e.host} (${e.ip}): ${e.error}`
-      ).join('; ');
-      
-      console.error('[Storage Pools] Offsite validation failed:', errorMessages);
-      
-      return res.status(400).json({
-        success: false,
-        error: `Storage pool validation failed on offsite hosts: ${errorMessages}`,
-        offsiteErrors: offsiteValidationErrors
-      });
-    }
-
     const pool = {
       id: uuidv4(),
       backupHostId,
@@ -142,7 +102,6 @@ router.post('/', async (req, res, next) => {
       usedGB: validation.data.usedGB,
       availableGB: validation.data.availableGB,
       usagePercent: validation.data.usagePercent,
-      offsitePath: validation.data.mountPoint, // Same mount point should exist on offsite hosts
       status: 'active',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()

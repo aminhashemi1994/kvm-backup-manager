@@ -6,7 +6,11 @@ const path = require('path');
 class MonitoringService {
   constructor() {
     this.monitoringInterval = null;
-    this.stuckJobThreshold = 4 * 60 * 60 * 1000; // 4 hours
+    // A job is "stuck" when we've had NO updates from the agent for this long
+    // — NOT when total runtime exceeds it. This lets legitimately long backups
+    // (many hours / multiple days) run freely as long as they keep reporting
+    // progress, while still catching genuine hangs or lost agent connectivity.
+    this.stuckInactivityThreshold = 60 * 60 * 1000; // 60 minutes with no updates
     this.extendedDowntimeThreshold = 6 * 60 * 60 * 1000; // 6 hours
     this.notifiedStuckJobs = new Set();
     this.notifiedDownAgents = new Set();
@@ -55,31 +59,40 @@ class MonitoringService {
 
       for (const job of jobs) {
         if (job.status !== 'running') continue;
+        // Jobs waiting in the concurrency queue aren't running work yet.
+        if (job.pendingStart) continue;
 
-        const startTime = new Date(job.startTime).getTime();
-        const duration = now - startTime;
+        // "Stuck" = no updates from the agent for longer than the threshold,
+        // measured from the most recent sign of life (progress update, live
+        // sync, or — if none yet — the start time). A backup that keeps
+        // reporting progress is never flagged, no matter how long it runs.
+        const lastActivity = new Date(
+          job.lastProgressAt || job.lastSyncedAt || job.startTime
+        ).getTime();
+        const sinceUpdate = now - lastActivity;
 
-        // If job has been running longer than threshold
-        if (duration > this.stuckJobThreshold) {
-          const jobKey = `backup-${job.id}`;
-          
-          // Only notify once per job
+        const jobKey = `backup-${job.id}`;
+
+        if (sinceUpdate > this.stuckInactivityThreshold) {
           if (!this.notifiedStuckJobs.has(jobKey)) {
-            const durationHours = Math.round(duration / (60 * 60 * 1000));
-            console.log(`[Monitoring] Stuck backup job detected: ${job.vmName} (${durationHours}h)`);
-            
+            const mins = Math.round(sinceUpdate / (60 * 1000));
+            console.log(`[Monitoring] Stalled backup job: ${job.vmName} — no updates for ${mins}m`);
+
             rocketChatService.notifyBackupStuck(
               job.vmName,
               job.id,
-              `${durationHours} hours`
+              `no updates for ${mins} minutes`
             );
-            
+
             this.notifiedStuckJobs.add(jobKey);
           }
+        } else if (this.notifiedStuckJobs.has(jobKey)) {
+          // Activity resumed — clear the flag so a future stall re-alerts.
+          this.notifiedStuckJobs.delete(jobKey);
         }
       }
 
-      // Clean up notifications for completed jobs
+      // Clean up notifications for jobs that are no longer running.
       for (const jobKey of this.notifiedStuckJobs) {
         const jobId = jobKey.replace('backup-', '');
         const job = jobs.find(j => j.id === jobId);

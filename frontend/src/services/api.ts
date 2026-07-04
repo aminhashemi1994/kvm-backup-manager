@@ -114,6 +114,16 @@ export const offsiteHostsApi = {
   delete: (id: string) => api.delete(`/offsite-hosts/${id}`),
   test: (id: string) => api.post(`/offsite-hosts/${id}/test`),
   sync: (id: string, vmName: string) => api.post(`/offsite-hosts/${id}/sync/${vmName}`),
+  // Offsite host storage pools (embedded in the offsite host record)
+  listPools: (hostId: string) => api.get(`/offsite-hosts/${hostId}/pools`),
+  createPool: (hostId: string, data: { name: string; path: string }) =>
+    api.post(`/offsite-hosts/${hostId}/pools`, data),
+  updatePool: (hostId: string, poolId: string, data: { name?: string; path?: string }) =>
+    api.put(`/offsite-hosts/${hostId}/pools/${poolId}`, data),
+  deletePool: (hostId: string, poolId: string) =>
+    api.delete(`/offsite-hosts/${hostId}/pools/${poolId}`),
+  validatePool: (hostId: string, poolId: string) =>
+    api.post(`/offsite-hosts/${hostId}/pools/${poolId}/validate`),
 }
 
 // Schedules

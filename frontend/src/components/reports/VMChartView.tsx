@@ -246,7 +246,7 @@ export default function VMChartView({ vms }: VMChartViewProps) {
                 <CardTitle className="text-base">Overall Health Distribution</CardTitle>
               </CardHeader>
               <CardContent>
-                <ResponsiveContainer width="100%" height={250}>
+                <ResponsiveContainer width="100%" height={200}>
                   <PieChart>
                     <Pie
                       data={healthData}
@@ -254,8 +254,9 @@ export default function VMChartView({ vms }: VMChartViewProps) {
                       cy="50%"
                       labelLine={false}
                       label={({ name, percent }: any) => `${name}: ${(percent * 100).toFixed(0)}%`}
-                      outerRadius={85}
+                      outerRadius={70}
                       dataKey="value"
+                      isAnimationActive={false}
                     >
                       {healthData.map((entry, index) => (
                         <Cell key={`cell-${index}`} fill={entry.color} />
@@ -273,13 +274,13 @@ export default function VMChartView({ vms }: VMChartViewProps) {
                 <CardTitle className="text-base">Top 10 VMs by Size</CardTitle>
               </CardHeader>
               <CardContent>
-                <ResponsiveContainer width="100%" height={250}>
+                <ResponsiveContainer width="100%" height={200}>
                   <BarChart data={topVMsBySize} layout="vertical" margin={{ left: 10, right: 20 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                    <XAxis type="number" tick={{ fontSize: 11 }} />
-                    <YAxis dataKey="name" type="category" width={140} tick={{ fontSize: 10 }} />
+                    <XAxis type="number" tick={{ fontSize: 10 }} />
+                    <YAxis dataKey="name" type="category" width={120} tick={{ fontSize: 9 }} />
                     <Tooltip content={<CustomBarTooltip />} />
-                    <Bar dataKey="sizeGB" name="Size (GB)">
+                    <Bar dataKey="sizeGB" name="Size (GB)" isAnimationActive={false}>
                       {topVMsBySize.map((entry, index) => (
                         <Cell key={`cell-${index}`} fill={HEALTH_COLORS[entry.health] || '#3b82f6'} />
                       ))}

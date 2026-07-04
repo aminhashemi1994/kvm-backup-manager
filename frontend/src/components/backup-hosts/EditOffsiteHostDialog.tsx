@@ -17,6 +17,7 @@ export default function EditOffsiteHostDialog({ open, onOpenChange, offsiteHost 
   const [name, setName] = useState(offsiteHost.name)
   const [ip, setIp] = useState(offsiteHost.ip)
   const [username, setUsername] = useState(offsiteHost.username || 'root')
+  const [backupPath, setBackupPath] = useState(offsiteHost.backupPath || '')
   
   const updateHost = useUpdateOffsiteHost()
 
@@ -25,16 +26,23 @@ export default function EditOffsiteHostDialog({ open, onOpenChange, offsiteHost 
       setName(offsiteHost.name)
       setIp(offsiteHost.ip)
       setUsername(offsiteHost.username || 'root')
+      setBackupPath(offsiteHost.backupPath || '')
     }
   }, [open, offsiteHost])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    
+
+    const trimmedPath = backupPath.trim()
+    if (trimmedPath && !trimmedPath.startsWith('/')) {
+      alert('Backup path must be an absolute path (start with /)')
+      return
+    }
+
     try {
       await updateHost.mutateAsync({
         id: offsiteHost.id,
-        data: { name, ip, username }
+        data: { name, ip, username, backupPath: trimmedPath }
       })
       onOpenChange(false)
     } catch (error) {
@@ -81,6 +89,21 @@ export default function EditOffsiteHostDialog({ open, onOpenChange, offsiteHost 
               placeholder="root"
               required
             />
+          </div>
+
+          <div>
+            <Label htmlFor="backupPath">Backup Path (optional)</Label>
+            <Input
+              id="backupPath"
+              value={backupPath}
+              onChange={(e) => setBackupPath(e.target.value)}
+              placeholder="/mnt/offsite/backups"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Destination base directory on this offsite host. Backups replicate to
+              <code className="mx-1">&lt;path&gt;/&lt;vm&gt;</code>. Leave empty to mirror the source
+              storage-pool path (default).
+            </p>
           </div>
 
           <div className="flex justify-end space-x-2 pt-4">

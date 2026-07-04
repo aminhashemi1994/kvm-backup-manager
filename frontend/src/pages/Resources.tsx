@@ -234,7 +234,7 @@ export default function Resources() {
           </Card>
 
           {filteredHypervisorMetrics && filteredHypervisorMetrics.length > 0 ? (
-            <div className="grid grid-cols-1 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
               {filteredHypervisorMetrics.map((metrics: any) => {
                 // Get storage pools for this hypervisor's backup host
                 const hostStoragePools = allStoragePools?.filter(
@@ -322,7 +322,7 @@ export default function Resources() {
           </Card>
 
           {filteredOffsiteMetrics && filteredOffsiteMetrics.length > 0 ? (
-            <div className="grid grid-cols-1 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
               {filteredOffsiteMetrics.map((metrics: any) => {
                 // Get storage pools for this offsite host's backup host
                 const hostStoragePools = allStoragePools?.filter(

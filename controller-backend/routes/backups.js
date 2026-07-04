@@ -9,6 +9,8 @@ const {
   getHypervisors, 
   getVirtualMachines,
   getBackupSchedules,
+  saveBackupSchedules,
+  getOffsiteHosts,
   getRestoreJobs,
   saveRestoreJobs,
   appendLog, 
@@ -74,6 +76,203 @@ async function syncJobStatusWithAgent(job, hosts) {
   }
   
   return false;
+}
+
+/**
+ * Ingest per-offsite sync outcomes reported by the agent for a finished job and
+ * record schedule-level warnings + notifications when an offsite host/pool was
+ * skipped or failed while the primary backup itself succeeded (Req 6.2–6.4).
+ *
+ * ── Assumed payload shape (from the agent job-update body) ──────────────────
+ * The agent may include an `offsiteResults` array on the terminal
+ * `/api/backups/jobs/:id/update` call. Each entry describes one offsite target:
+ *
+ *   offsiteResults: [
+ *     {
+ *       ip,        // offsite host IP the agent synced to (e.g. "10.0.0.5")
+ *       host,      // optional hostname/label, used as a secondary match key
+ *       poolPath,  // destination path on the offsite host (e.g. "/mnt/pool1")
+ *       status,    // "success" | "skipped" | "failed"
+ *       reason,    // human-readable reason for a skip/failure (optional)
+ *     }, ...
+ *   ]
+ *
+ * This mirrors the agent script's per-host offsite tracking (Backup_Manager.sh
+ * emits `offsite_host_fail` / `offsite_complete` events carrying `offsite_ip`).
+ * The controller maps each result back to the job's persisted `offsiteTargets`
+ * (which carry `{ offsiteHostId, offsitePoolId, ip, path }`) by matching on
+ * `ip` first, then `host`/`poolPath`, so a warning can name the exact host+pool.
+ *
+ * This handler processes the full `offsiteResults` array in a single pass
+ * (task 9.2): skipped/failed outcomes APPEND (or refresh) a warning, while a
+ * later SUCCESS to the same target CLEARS the matching warning so offsite sync
+ * auto-resumes without operator intervention (Req 6.7). The schedule is never
+ * disabled for a transient offsite failure — offsite issues only add/remove
+ * warnings and the schedule keeps running (Req 6.5). Append and clear share the
+ * same dedup key (`offsiteHostId + offsitePoolId`) so the two paths mirror each
+ * other exactly.
+ *
+ * @param {object} job      The finished backup job (must have `scheduleId`).
+ * @param {Array}  offsiteResults  Per-offsite outcome entries from the agent.
+ * @returns {Promise<boolean>} true when the schedule was modified & saved.
+ */
+async function ingestOffsiteSyncResults(job, offsiteResults) {
+  // Only schedule-triggered jobs carry a schedule to annotate (Req 6.3).
+  if (!job || !job.scheduleId) return false;
+  if (!Array.isArray(offsiteResults) || offsiteResults.length === 0) return false;
+
+  // Classify every result: successes clear warnings (Req 6.7), skips/failures
+  // append/refresh them (Req 6.3). The primary backup outcome is unaffected —
+  // we never disable the schedule here (Req 6.5).
+  const classify = (r) => {
+    const s = (r && typeof r.status === 'string') ? r.status.toLowerCase() : '';
+    if (s === 'success' || s === 'succeeded' || s === 'ok') return 'success';
+    if (s === 'skipped' || s === 'failed' || s === 'error') return 'problem';
+    return 'ignore';
+  };
+  const hasActionable = offsiteResults.some(r => classify(r) !== 'ignore');
+  if (!hasActionable) return false;
+
+  const schedules = await getBackupSchedules();
+  const schedule = schedules.find(s => s.id === job.scheduleId);
+  if (!schedule) return false;
+
+  // The job persists its resolved offsite targets (Req 9.4) — use them to map
+  // an incoming result's ip/host back to offsiteHostId/offsitePoolId. Fall back
+  // to the offsite host records when the job predates persisted targets.
+  const jobTargets = Array.isArray(job.offsiteTargets) ? job.offsiteTargets : [];
+  let offsiteHosts = [];
+  try {
+    offsiteHosts = await getOffsiteHosts();
+  } catch (_) {
+    offsiteHosts = [];
+  }
+
+  // Resolve a single offsite result to { offsiteHostId, offsitePoolId } plus
+  // display names, matching by ip or host/path as available.
+  const resolveTarget = (result) => {
+    const ip = result && result.ip ? String(result.ip).trim() : '';
+    const host = result && result.host ? String(result.host).trim() : '';
+    const poolPath = result && result.poolPath ? String(result.poolPath).trim() : '';
+
+    // 1) Prefer the job's persisted targets (authoritative host+pool mapping).
+    let target = jobTargets.find(t => t && ip && t.ip === ip);
+    if (!target && poolPath) {
+      target = jobTargets.find(t => t && ip && t.ip === ip && t.path === poolPath)
+        || jobTargets.find(t => t && t.path === poolPath);
+    }
+    if (!target && host) {
+      // host may be an IP-or-name; try matching against target ip as a fallback.
+      target = jobTargets.find(t => t && t.ip === host);
+    }
+
+    let offsiteHostId = target ? target.offsiteHostId : null;
+    let offsitePoolId = target ? target.offsitePoolId : null;
+
+    // 2) Enrich with names (and back-fill ids) from the offsite host records.
+    const hostRec = offsiteHosts.find(h =>
+      (offsiteHostId && h.id === offsiteHostId) ||
+      (ip && h.ip === ip) ||
+      (host && (h.ip === host || h.name === host))
+    );
+    if (hostRec && !offsiteHostId) offsiteHostId = hostRec.id;
+
+    let hostName = hostRec ? (hostRec.name || hostRec.ip) : (host || ip || 'unknown host');
+    let poolName = null;
+    if (hostRec && Array.isArray(hostRec.storagePools)) {
+      const poolRec = hostRec.storagePools.find(p =>
+        (offsitePoolId && p.id === offsitePoolId) ||
+        (poolPath && p.path === poolPath)
+      );
+      if (poolRec) {
+        if (!offsitePoolId) offsitePoolId = poolRec.id;
+        poolName = poolRec.name || poolRec.path;
+      }
+    }
+    if (!poolName) poolName = poolPath || (offsitePoolId || 'default pool');
+
+    return { offsiteHostId, offsitePoolId, hostName, poolName };
+  };
+
+  if (!Array.isArray(schedule.offsiteWarnings)) schedule.offsiteWarnings = [];
+  const now = new Date().toISOString();
+  const notifications = [];
+  let changed = false;
+  let cleared = 0;
+
+  // Match an existing warning by the shared dedup key (offsiteHostId +
+  // offsitePoolId). Mirrors the keying used by the append path (task 9.1).
+  const sameTarget = (w, offsiteHostId, offsitePoolId) =>
+    w && w.offsiteHostId === offsiteHostId && w.offsitePoolId === offsitePoolId;
+
+  // Single pass over every reported outcome (task 9.2): success clears a
+  // matching warning; skip/fail appends or refreshes one.
+  for (const result of offsiteResults) {
+    const kind = classify(result);
+    if (kind === 'ignore') continue;
+
+    const { offsiteHostId, offsitePoolId, hostName, poolName } = resolveTarget(result);
+
+    if (kind === 'success') {
+      // A later successful sync to this target clears its warning and lets
+      // offsite sync auto-resume without operator intervention (Req 6.7, 6.5).
+      const before = schedule.offsiteWarnings.length;
+      schedule.offsiteWarnings = schedule.offsiteWarnings.filter(
+        w => !sameTarget(w, offsiteHostId, offsitePoolId)
+      );
+      const removed = before - schedule.offsiteWarnings.length;
+      if (removed > 0) {
+        cleared += removed;
+        changed = true;
+        console.log(`[Backups] Cleared offsite warning for ${hostName} / pool ${poolName} on schedule ${schedule.id} after successful sync`);
+      }
+      continue;
+    }
+
+    // kind === 'problem': append/refresh the warning (Req 6.3).
+    const reason = (result && result.reason)
+      ? String(result.reason)
+      : `Offsite sync ${((result && result.status) || 'failed')}`;
+
+    // Dedupe by offsiteHostId + offsitePoolId: update the existing warning's
+    // reason/timestamp instead of pushing a duplicate (task requirement).
+    const existing = schedule.offsiteWarnings.find(
+      w => sameTarget(w, offsiteHostId, offsitePoolId)
+    );
+    if (existing) {
+      existing.reason = reason;
+      existing.at = now;
+    } else {
+      schedule.offsiteWarnings.push({ offsiteHostId, offsitePoolId, reason, at: now });
+    }
+    changed = true;
+
+    notifications.push({ hostName, poolName, reason });
+  }
+
+  if (changed) {
+    await saveBackupSchedules(schedules);
+
+    // Notify RocketChat, naming the schedule, offsite host, pool, and reason
+    // (Req 6.4). notifyOffsiteSyncFailed(name, offsiteHost, error) is reused;
+    // we pass a descriptive destination string including schedule + pool.
+    const scheduleLabel = schedule.name || schedule.vmName || `schedule ${schedule.id}`;
+    for (const n of notifications) {
+      try {
+        rocketChatService.notifyOffsiteSyncFailed(
+          `${job.vmName || scheduleLabel} (schedule: ${scheduleLabel})`,
+          `${n.hostName} / pool ${n.poolName}`,
+          n.reason
+        );
+      } catch (err) {
+        console.error(`[Backups] Failed to send offsite sync failure notification: ${err.message}`);
+      }
+    }
+
+    console.log(`[Backups] Offsite sync results for job ${job.id} on schedule ${schedule.id}: recorded ${notifications.length} warning(s), cleared ${cleared} warning(s)`);
+  }
+
+  return changed;
 }
 
 // GET /api/backups/active - Get active backup jobs
@@ -353,6 +552,7 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       noCompression = false,
       noVerify = false,
       offsiteHostIds = [],
+      offsiteTargets = [],
       verbose = false
     } = req.body;
 
@@ -433,18 +633,14 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       finalHypervisorIp = hypervisor.ip;
     }
 
-    // Get offsite host IPs
-    const offsiteHosts = [];
-    if (offsiteHostIds && offsiteHostIds.length > 0) {
-      const { getOffsiteHosts } = require('../services/fileStorage');
-      const allOffsiteHosts = await getOffsiteHosts();
-      offsiteHostIds.forEach(id => {
-        const offsiteHost = allOffsiteHosts.find(h => h.id === id);
-        if (offsiteHost) {
-          offsiteHosts.push(offsiteHost.ip);
-        }
-      });
-    }
+    // Resolve offsite targets through the shared scheduler helper so manual
+    // triggers behave identically to scheduled backups. The helper prefers the
+    // per-pool `offsiteTargets` shape and falls back to legacy `offsiteHostIds`
+    // + host `backupPath`. `resolved` (with ip/path) is persisted on the job
+    // record for retries/replays (Req 9.4); `encoded` (shell-safe ip:path) is
+    // sent to the agent (Req 6.6, 9.1).
+    const { resolved: offsiteTargetsResolved, encoded: offsiteEncoded } =
+      await schedulerService.resolveOffsiteTargets({ offsiteTargets, offsiteHostIds });
 
     // PRE-FLIGHT CHECK: Verify no backup is already in progress
     console.log(`[BackupTrigger] Checking if backup is already in progress for ${finalVmName}/${scheduleType}`);
@@ -494,7 +690,7 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       compression: compression || 2,
       noCompression: noCompression || false,
       noVerify: noVerify || false,
-      offsiteHosts,
+      offsiteTargets: offsiteTargetsResolved,
       status: 'queued',
       startTime: new Date().toISOString(),
       endTime: null,
@@ -515,8 +711,8 @@ router.post('/trigger', requireUser, async (req, res, next) => {
     await appendLog(jobId, `Schedule Type: ${scheduleType}`);
     await appendLog(jobId, `Retention: ${retention}, Keep Archive: ${keepArchive}`);
     await appendLog(jobId, `Compression: ${noCompression ? 'disabled' : compression || 2}`);
-    if (offsiteHosts.length > 0) {
-      await appendLog(jobId, `Offsite hosts: ${offsiteHosts.join(', ')}`);
+    if (offsiteEncoded.length > 0) {
+      await appendLog(jobId, `Offsite targets: ${offsiteEncoded.join(', ')}`);
     }
 
     // Get io from app
@@ -537,7 +733,7 @@ router.post('/trigger', requireUser, async (req, res, next) => {
         compression: compression || 2,
         noCompression: noCompression || false,
         noVerify: noVerify || false,
-        offsiteHosts,
+        offsiteHosts: offsiteEncoded,
         verbose,
       });
 
@@ -680,7 +876,7 @@ router.post('/trigger-scheduled', async (req, res, next) => {
 // POST /api/backups/jobs/:id/update - Update job status (called by agent)
 router.post('/jobs/:id/update', async (req, res, next) => {
   try {
-    const { status, exitCode, error, logLine, progress, progressText, failureReason } = req.body;
+    const { status, exitCode, error, logLine, progress, progressText, failureReason, offsiteResults } = req.body;
     
     const jobs = await getBackupJobs();
     const job = jobs.find(j => j.id === req.params.id);
@@ -745,6 +941,12 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     if (failureReason) job.failureReason = failureReason;
     if (progress !== undefined) job.progress = progress;
     if (progressText !== undefined) job.progressText = progressText;
+
+    // Record the last time we heard from the agent about this job. Used by the
+    // monitoring service to detect *inactivity* (a genuinely hung backup or
+    // lost connectivity) instead of naively alerting on total runtime — a
+    // legitimately long backup keeps updating this and is never "stuck".
+    job.lastProgressAt = new Date().toISOString();
     
     // Set end time for terminal states
     if (status === 'completed' || status === 'cancelled' || 
@@ -787,6 +989,17 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       // Include retry information in notification
       const retryInfo = job.wasRetried ? ` (succeeded on attempt ${job.succeededOnAttempt})` : '';
       rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration + retryInfo);
+
+      // Primary backup succeeded — check whether any offsite host/pool sync was
+      // skipped or failed and record a resilience warning + notification on the
+      // originating schedule without disabling it (Req 6.2, 6.3, 6.4). Offsite
+      // problems never affect the primary outcome. Fire-and-forget so a slow
+      // schedule write can't delay the agent's status ack.
+      if (offsiteResults) {
+        ingestOffsiteSyncResults(job, offsiteResults).catch(err => {
+          console.error(`[Backups] Failed to ingest offsite sync results for job ${job.id}: ${err.message}`);
+        });
+      }
     } else if (job.status === 'failed' || status === 'cancelled') {
       // Only emit backup-error if truly failed (not retrying)
       io.emit('backup-error', job);
@@ -1095,7 +1308,7 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
     // Resolve storage pool. Prefer the schedule's pool, then the original
     // job's pool id (manual triggers store storagePoolId on the job
     // record), otherwise refuse — without it the agent returns 400.
-    const { getStoragePools, getOffsiteHosts } = require('../services/fileStorage');
+    const { getStoragePools } = require('../services/fileStorage');
     const pools = await getStoragePools();
     const poolId = schedule?.storagePoolId || originalJob.storagePoolId;
     const pool = poolId
@@ -1110,21 +1323,31 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       });
     }
 
-    // Resolve offsite hosts (optional)
-    const offsiteIds = Array.isArray(schedule?.offsiteHostIds)
-      ? schedule.offsiteHostIds
-      : (schedule?.offsiteHostId ? [schedule.offsiteHostId]
-        : (Array.isArray(originalJob.offsiteHosts) ? [] : [])); // originalJob.offsiteHosts already holds IPs
-    let offsiteHostIps = [];
-    if (offsiteIds.length > 0) {
-      const allOffsiteHosts = await getOffsiteHosts();
-      offsiteHostIps = offsiteIds
-        .map(id => allOffsiteHosts.find(h => h.id === id))
-        .filter(Boolean)
-        .map(h => h.ip);
-    } else if (Array.isArray(originalJob.offsiteHosts)) {
-      // Manual jobs persist resolved IPs directly
-      offsiteHostIps = originalJob.offsiteHosts;
+    // Resolve offsite targets through the shared scheduler helper so retries
+    // reproduce the same destinations. For scheduled retries, resolve from the
+    // schedule (per-pool `offsiteTargets`, or legacy `offsiteHostIds` + host
+    // `backupPath`). For non-scheduled retries, reuse the `offsiteTargets`
+    // persisted on the original job (Req 9.4). Re-resolving through the helper
+    // keeps ip/path fresh against current host/pool config while still
+    // persisting resolved targets on the new job.
+    const offsiteSource = schedule || { offsiteTargets: originalJob.offsiteTargets };
+    let { resolved: offsiteTargetsResolved, encoded: offsiteEncoded } =
+      await schedulerService.resolveOffsiteTargets(offsiteSource);
+
+    // Backward compat: a pre-feature original job may carry only the legacy
+    // `offsiteHosts` array (string IPs or { ip, backupPath }) with no
+    // `offsiteTargets`. Preserve its destinations by encoding them directly.
+    if (
+      offsiteEncoded.length === 0 &&
+      Array.isArray(originalJob.offsiteHosts) &&
+      originalJob.offsiteHosts.length > 0
+    ) {
+      offsiteTargetsResolved = originalJob.offsiteHosts.map(h =>
+        typeof h === 'string'
+          ? { offsiteHostId: null, offsitePoolId: null, ip: h, path: '' }
+          : { offsiteHostId: null, offsitePoolId: null, ip: h.ip, path: h.backupPath || '' }
+      );
+      offsiteEncoded = offsiteTargetsResolved.map(r => (r.path ? `${r.ip}:${r.path}` : r.ip));
     }
 
     // Translate the controller's scheduleType to one the bash script
@@ -1163,7 +1386,7 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       compression: schedule?.compression ?? originalJob.compression ?? 2,
       noCompression: originalJob.noCompression || false,
       noVerify: originalJob.noVerify || false,
-      offsiteHosts: offsiteHostIps,
+      offsiteTargets: offsiteTargetsResolved,
       status: 'queued',
       startTime: new Date().toISOString(),
       endTime: null,
@@ -1207,7 +1430,7 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
         compression: retryJob.compression,
         noCompression: retryJob.noCompression,
         noVerify: retryJob.noVerify,
-        offsiteHosts: offsiteHostIps,
+        offsiteHosts: offsiteEncoded,
         verbose: schedule?.verbose || false,
         ...(sourceScheduleType === 'daily' || sourceScheduleType === 'interval' || sourceScheduleType === 'cron'
           ? { vmId: originalJob.vmId, incrementalCount: schedule?.incrementalCount }
