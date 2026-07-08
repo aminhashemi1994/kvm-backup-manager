@@ -154,6 +154,7 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
   const { data: offsiteHosts, isLoading: offsiteLoading, error: offsiteError } = useOffsiteHostsByBackupHost(selectedBackupHostId)
   
   console.log('ScheduleForm offsite hosts:', { selectedBackupHostId, offsiteHosts, offsiteLoading, offsiteError })
+  console.log('ScheduleForm offsite formData:', { offsiteHostIds: formData.offsiteHostIds, offsitePoolByHost: formData.offsitePoolByHost, syncToOffsite: formData.syncToOffsite })
   
   const createSchedule = useCreateSchedule()
   const updateSchedule = useUpdateSchedule()
@@ -220,7 +221,11 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
           ? schedule.missedRunGracePeriodMinutes : 360,
         retryCount: typeof schedule.retryCount === 'number' ? schedule.retryCount : 3,
         retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
-        syncToOffsite: schedule.syncToOffsite || false,
+        // Derive syncToOffsite from presence of offsite targets
+        syncToOffsite: schedule.syncToOffsite || 
+          (Array.isArray(schedule.offsiteTargets) && schedule.offsiteTargets.length > 0) ||
+          (schedule.offsiteHostIds && schedule.offsiteHostIds.length > 0) ||
+          !!schedule.offsiteHostId,
         // Prefer the new offsiteTargets shape; fall back to legacy
         // offsiteHostIds/offsiteHostId (no pool -> user must pick one).
         offsiteHostIds: Array.isArray(schedule.offsiteTargets) && schedule.offsiteTargets.length > 0
@@ -357,11 +362,15 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         case 'daily':
           data.time = formData.time
           data.incrementalCount = formData.incrementalCount
+          data.retention = formData.retention
+          data.keepArchive = formData.keepArchive
           break
         case 'weekly':
           data.time = formData.time
           data.daysOfWeek = formData.daysOfWeek
           data.incrementalCount = formData.incrementalCount
+          data.retention = formData.retention
+          data.keepArchive = formData.keepArchive
           break
         case 'custom-days':
           data.customDates = formData.customDates
@@ -371,10 +380,14 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
           data.intervalValue = formData.intervalValue
           data.intervalUnit = formData.intervalUnit
           data.incrementalCount = formData.incrementalCount
+          data.retention = formData.retention
+          data.keepArchive = formData.keepArchive
           break
         case 'cron':
           data.cronExpression = formData.cronExpression
           data.incrementalCount = formData.incrementalCount
+          data.retention = formData.retention
+          data.keepArchive = formData.keepArchive
           break
         case 'once':
         case 'monthly':
@@ -828,6 +841,38 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                     Number of incremental backups before a new full backup. After this many incrementals, the chain is archived and a new full backup starts.
                   </p>
                 </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="weekly-retention">Retention *</Label>
+                    <Input
+                      id="weekly-retention"
+                      type="number"
+                      min="1"
+                      max="30"
+                      value={formData.retention}
+                      onChange={(e) => setFormData({ ...formData, retention: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Backups before archiving
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="weekly-keepArchive">Keep Archives *</Label>
+                    <Input
+                      id="weekly-keepArchive"
+                      type="number"
+                      min="0"
+                      max="10"
+                      value={formData.keepArchive}
+                      onChange={(e) => setFormData({ ...formData, keepArchive: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Number of archived chains to keep
+                    </p>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -941,6 +986,38 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                     Number of incremental backups before archiving (1 full + N inc)
                   </p>
                 </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="interval-retention">Retention *</Label>
+                    <Input
+                      id="interval-retention"
+                      type="number"
+                      min="1"
+                      max="30"
+                      value={formData.retention}
+                      onChange={(e) => setFormData({ ...formData, retention: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Backups before archiving
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="interval-keepArchive">Keep Archives *</Label>
+                    <Input
+                      id="interval-keepArchive"
+                      type="number"
+                      min="0"
+                      max="10"
+                      value={formData.keepArchive}
+                      onChange={(e) => setFormData({ ...formData, keepArchive: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Number of archived chains to keep
+                    </p>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -974,6 +1051,38 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                   <p className="text-xs text-gray-500">
                     Number of incremental backups before archiving (1 full + N inc)
                   </p>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="cron-retention">Retention *</Label>
+                    <Input
+                      id="cron-retention"
+                      type="number"
+                      min="1"
+                      max="30"
+                      value={formData.retention}
+                      onChange={(e) => setFormData({ ...formData, retention: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Backups before archiving
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="cron-keepArchive">Keep Archives *</Label>
+                    <Input
+                      id="cron-keepArchive"
+                      type="number"
+                      min="0"
+                      max="10"
+                      value={formData.keepArchive}
+                      onChange={(e) => setFormData({ ...formData, keepArchive: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Number of archived chains to keep
+                    </p>
+                  </div>
                 </div>
               </div>
             )}

@@ -224,6 +224,8 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
             data.time = formData.time
             data.daysOfWeek = formData.daysOfWeek
             data.incrementalCount = formData.incrementalCount
+            data.retention = formData.retention
+            data.keepArchive = formData.keepArchive
             break
           
           case 'custom-days':
@@ -235,11 +237,15 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
             data.intervalValue = formData.intervalValue
             data.intervalUnit = formData.intervalUnit
             data.incrementalCount = formData.incrementalCount
+            data.retention = formData.retention
+            data.keepArchive = formData.keepArchive
             break
           
           case 'cron':
             data.cronExpression = formData.cronExpression
             data.incrementalCount = formData.incrementalCount
+            data.retention = formData.retention
+            data.keepArchive = formData.keepArchive
             break
         }
 
@@ -436,6 +442,38 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
                     Number of incremental backups before a new full backup. After this many incrementals, the chain is archived and a new full backup starts.
                   </p>
                 </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="weekly-retention">Retention *</Label>
+                    <Input
+                      id="weekly-retention"
+                      type="number"
+                      min="1"
+                      max="30"
+                      value={formData.retention}
+                      onChange={(e) => setFormData({ ...formData, retention: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Backups before archiving
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="weekly-keepArchive">Keep Archives *</Label>
+                    <Input
+                      id="weekly-keepArchive"
+                      type="number"
+                      min="0"
+                      max="10"
+                      value={formData.keepArchive}
+                      onChange={(e) => setFormData({ ...formData, keepArchive: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Number of archived chains to keep
+                    </p>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -549,6 +587,38 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
                     Number of incremental backups before archiving (1 full + N inc)
                   </p>
                 </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="interval-retention">Retention *</Label>
+                    <Input
+                      id="interval-retention"
+                      type="number"
+                      min="1"
+                      max="30"
+                      value={formData.retention}
+                      onChange={(e) => setFormData({ ...formData, retention: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Backups before archiving
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="interval-keepArchive">Keep Archives *</Label>
+                    <Input
+                      id="interval-keepArchive"
+                      type="number"
+                      min="0"
+                      max="10"
+                      value={formData.keepArchive}
+                      onChange={(e) => setFormData({ ...formData, keepArchive: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Number of archived chains to keep
+                    </p>
+                  </div>
+                </div>
               </div>
             )}
 
@@ -582,6 +652,38 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
                   <p className="text-xs text-gray-500">
                     Number of incremental backups before archiving (1 full + N inc)
                   </p>
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="cron-retention">Retention *</Label>
+                    <Input
+                      id="cron-retention"
+                      type="number"
+                      min="1"
+                      max="30"
+                      value={formData.retention}
+                      onChange={(e) => setFormData({ ...formData, retention: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Backups before archiving
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="cron-keepArchive">Keep Archives *</Label>
+                    <Input
+                      id="cron-keepArchive"
+                      type="number"
+                      min="0"
+                      max="10"
+                      value={formData.keepArchive}
+                      onChange={(e) => setFormData({ ...formData, keepArchive: parseInt(e.target.value) })}
+                      required
+                    />
+                    <p className="text-xs text-gray-500">
+                      Number of archived chains to keep
+                    </p>
+                  </div>
                 </div>
               </div>
             )}
