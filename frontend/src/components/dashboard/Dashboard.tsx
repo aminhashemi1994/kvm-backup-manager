@@ -67,7 +67,7 @@ export default function Dashboard() {
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => navigate('/history?status=skipped')}
+                    onClick={() => navigate('/backups/history?status=skipped')}
                     className="border-orange-300 text-orange-700 hover:bg-orange-100"
                   >
                     View All Skipped Backups

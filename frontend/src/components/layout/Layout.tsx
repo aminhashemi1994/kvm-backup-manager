@@ -3,6 +3,7 @@ import Sidebar from './Sidebar'
 import Header from './Header'
 import CommandPalette from './CommandPalette'
 import { useSocket, useSocketEvent } from '@/hooks/useSocket'
+import { debouncedInvalidate } from '@/lib/debouncedInvalidate'
 import { useQueryClient } from '@tanstack/react-query'
 
 interface LayoutProps {
@@ -46,9 +47,19 @@ export default function Layout({ children }: LayoutProps) {
     queryClient.invalidateQueries({ queryKey: ['backups'] })
   })
 
-  // Handle job-updated event (from agent sync)
+  // Handle job-updated event (from agent sync). Debounced: agent sync can
+  // emit one event per job in a burst; a single trailing refetch is enough.
   useSocketEvent('job-updated', () => {
-    queryClient.invalidateQueries({ queryKey: ['backups'] })
+    debouncedInvalidate(queryClient, ['backups'])
+  })
+
+  // Bulk reconciliation and retry-state events should also refresh job lists
+  useSocketEvent('jobs-synced', () => {
+    debouncedInvalidate(queryClient, ['backups'])
+  })
+
+  useSocketEvent('backup-retrying', () => {
+    debouncedInvalidate(queryClient, ['backups'])
   })
 
   useEffect(() => {

@@ -3,6 +3,7 @@ const { promisify } = require('util');
 const fs = require('fs').promises;
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { sanitizeLog } = require('../utils/logSanitizer');
 
 const execAsync = promisify(exec);
 
@@ -444,7 +445,7 @@ class RestoreExecutor {
   /**
    * Get restore logs
    */
-  async getJobLogs(restoreId) {
+  async getJobLogs(restoreId, tailLines = null) {
     const job = await this.getJob(restoreId);
     if (!job) {
       throw new Error('Restore job not found');
@@ -452,12 +453,14 @@ class RestoreExecutor {
 
     console.log(`[Restore] Getting logs for ${restoreId}, logFile: ${job.logFile}, tmuxSession: ${job.tmuxSession}, isActive: ${this.activeJobs.has(restoreId)}`);
 
-    // Try to get logs from tmux session if still active
+    // Try to get logs from tmux session if still active. Sanitized like
+    // backup logs: progress renders collapse to their final state instead
+    // of thousands of near-identical lines (see utils/logSanitizer.js).
     if (job.tmuxSession && this.activeJobs.has(restoreId)) {
       try {
         const { stdout } = await execAsync(`tmux capture-pane -t ${job.tmuxSession} -p -S -`);
         console.log(`[Restore] Got logs from tmux session, length: ${stdout.length}`);
-        return stdout;
+        return sanitizeLog(stdout, tailLines);
       } catch (error) {
         console.error(`Error capturing tmux logs:`, error);
       }
@@ -469,7 +472,7 @@ class RestoreExecutor {
         console.log(`[Restore] Attempting to read log file: ${job.logFile}`);
         const content = await fs.readFile(job.logFile, 'utf8');
         console.log(`[Restore] Successfully read log file, length: ${content.length}`);
-        return content;
+        return sanitizeLog(content, tailLines);
       } catch (error) {
         if (error.code !== 'ENOENT') {
           console.error(`Error reading log file ${job.logFile}:`, error);

@@ -167,6 +167,12 @@ export interface BackupJob {
   skippedReason?: string // Reason for skipping (e.g., 'agent_offline')
   canRetry?: boolean // Whether this job can be retried
   retryOf?: string // ID of the original job if this is a retry
+  supersededBy?: string // ID of the retry job that superseded this skipped record
+  progressType?: string // Current progress phase reported by the agent ('backup' | 'rsync')
+  offsiteSyncStatus?: 'running' | 'completed' | 'partial' | 'failed' | 'unknown' // Offsite replication outcome
+  offsiteResults?: Array<{ ip: string; poolPath?: string; status: string; reason?: string }>
+  verified?: boolean // True when the terminal status came from the agent's own exit-code detection
+  unverified?: boolean // True when completion was inferred by the reconciler without a confirmed exit code
   replay?: boolean // Whether this is a missed-run replay
   originallyScheduledAt?: string // Original scheduled time for replays
   replayReason?: string

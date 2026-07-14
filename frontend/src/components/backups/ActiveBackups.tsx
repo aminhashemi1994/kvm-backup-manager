@@ -11,6 +11,7 @@ import { formatDuration } from '@/lib/utils'
 import LiveLogViewer from './LiveLogViewer'
 import JobStatusBadge from './JobStatusBadge'
 import JobProgressBar from './JobProgressBar'
+import OffsiteSyncBadge from './OffsiteSyncBadge'
 import VmNameCell from '@/components/common/VmNameCell'
 import VmNameToggle from '@/components/common/VmNameToggle'
 import socketService from '@/services/socket'
@@ -288,6 +289,11 @@ export default function ActiveBackups() {
                         failureReason={job.failureReason}
                         replay={job.replay}
                       />
+                      {(job as any).offsiteSyncStatus && (job as any).offsiteSyncStatus !== 'running' && (
+                        <div className="mt-1">
+                          <OffsiteSyncBadge job={job as any} />
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell>
                       <JobProgressBar

@@ -2,10 +2,14 @@ import { useState } from 'react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { ChevronDown, ChevronRight, Calendar, HardDrive, AlertCircle, CheckCircle } from 'lucide-react'
+import { ChevronDown, ChevronRight, Calendar, HardDrive, AlertCircle, CheckCircle, Eraser, Loader2 } from 'lucide-react'
+import { useConfirm } from '@/components/ui/confirm-dialog'
+import { useClearInProgress } from '@/hooks/useClearInProgress'
 
 interface ScheduleDetailsProps {
   schedule: any
+  vmId?: string
+  vmName?: string
 }
 
 // Utility function to remove ANSI color codes
@@ -20,10 +24,29 @@ const stripAnsiCodes = (text: string): string => {
     .trim()
 }
 
-export default function ScheduleDetails({ schedule }: ScheduleDetailsProps) {
+export default function ScheduleDetails({ schedule, vmId, vmName }: ScheduleDetailsProps) {
   const [expanded, setExpanded] = useState(false)
+  const confirm = useConfirm()
+  const clearInProgress = useClearInProgress()
 
   const isInProgress = schedule.in_progress === true || schedule.in_progress === 'true'
+
+  const handleClearInProgress = async () => {
+    if (!vmId || !vmName) return
+    const ok = await confirm({
+      title: 'Clear in-progress state?',
+      description: `This removes the stale lock for ${vmName} (${schedule.schedule}) so it no longer shows as in progress. If the backup is actually running, the request is refused automatically.`,
+      confirmText: 'Clear',
+      variant: 'danger',
+    })
+    if (!ok) return
+    clearInProgress.mutate({
+      vmId,
+      vmName,
+      scheduleType: schedule.schedule,
+      schedulePath: schedule.path,
+    })
+  }
   const isLegacyFormat = schedule.is_legacy_format === true || schedule.is_legacy_format === 'true'
   const backupLocation = schedule.backup_location || null
 
@@ -89,6 +112,23 @@ export default function ScheduleDetails({ schedule }: ScheduleDetailsProps) {
                 <Badge className="text-xs bg-blue-100 text-blue-800 border-blue-200">
                   In Progress
                 </Badge>
+              )}
+              {isInProgress && vmId && vmName && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 px-2 text-xs text-orange-700 border-orange-300 hover:bg-orange-50"
+                  onClick={handleClearInProgress}
+                  disabled={clearInProgress.isPending}
+                  title="Remove stale lock if this backup is not actually running"
+                >
+                  {clearInProgress.isPending ? (
+                    <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                  ) : (
+                    <Eraser className="h-3 w-3 mr-1" />
+                  )}
+                  Clear stuck state
+                </Button>
               )}
               {schedule.corrupted && (
                 <Badge variant="destructive" className="text-xs">Corrupted</Badge>

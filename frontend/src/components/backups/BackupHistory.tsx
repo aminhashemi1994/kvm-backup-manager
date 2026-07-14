@@ -10,10 +10,12 @@ import { useBackupHistory, useForceRemoveJob, useRetryBackup } from '@/hooks/use
 import { formatDate, formatDuration, getStatusColor } from '@/lib/utils'
 import LiveLogViewer from './LiveLogViewer'
 import JobProgressBar from './JobProgressBar'
+import OffsiteSyncBadge from './OffsiteSyncBadge'
 import VmNameCell from '@/components/common/VmNameCell'
 import VmNameToggle from '@/components/common/VmNameToggle'
 import socketService from '@/services/socket'
 import { useQueryClient } from '@tanstack/react-query'
+import { debouncedInvalidate } from '@/lib/debouncedInvalidate'
 import { useSearchParams } from 'react-router-dom'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 
@@ -79,11 +81,15 @@ export default function BackupHistory() {
     }
   }, [statusFilter, setSearchParams])
 
-  // Poll for updates every second for running jobs
+  // Periodic reconcile as a safety net. Real-time changes arrive via the
+  // socket handlers below (which patch the cache in place); refetching the
+  // full history every second hammered the controller — each request also
+  // runs a per-job agent sync — and was a major cause of panel lag when
+  // many jobs run at once.
   useEffect(() => {
     const interval = setInterval(() => {
       queryClient.invalidateQueries({ queryKey: ['backups', 'history'] })
-    }, 1000)
+    }, 10000)
 
     return () => clearInterval(interval)
   }, [queryClient])
@@ -125,8 +131,9 @@ export default function BackupHistory() {
     })
 
     const cleanupStarted = socketService.on('backup-started', () => {
-      // Refetch to get the new job
-      queryClient.invalidateQueries({ queryKey: ['backups', 'history'] })
+      // Refetch to get the new job — debounced so a burst of simultaneous
+      // starts coalesces into a single refetch
+      debouncedInvalidate(queryClient, ['backups', 'history'])
     })
 
     return () => {
@@ -221,12 +228,12 @@ export default function BackupHistory() {
                   <TableHead>Start Time</TableHead>
                   <TableHead>Duration</TableHead>
                   <TableHead>Exit Code</TableHead>
-                  <TableHead>Actions</TableHead>
+                  <TableHead className="sticky right-0 z-20 bg-gray-50 dark:bg-gray-800 shadow-[-8px_0_8px_-8px_rgba(0,0,0,0.15)]">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {history.map((job) => (
-                  <TableRow key={job.id}>
+                  <TableRow key={job.id} className="group">
                     <TableCell>
                       <Badge variant="outline" className={job.jobType === 'restore' ? 'bg-purple-50 text-purple-700 border-purple-200' : 'bg-blue-50 text-blue-700 border-blue-200'}>
                         {job.jobType === 'restore' ? 'RESTORE' : 'BACKUP'}
@@ -242,6 +249,22 @@ export default function BackupHistory() {
                       <Badge className={getStatusColor(job.status === 'queued' && (job.progress || 0) > 0 ? 'running' : job.status)}>
                         {job.status === 'queued' && (job.progress || 0) > 0 ? 'running' : job.status}
                       </Badge>
+                      {job.status === 'completed' && job.unverified && (
+                        <div className="mt-1">
+                          <Badge
+                            className="bg-amber-100 text-amber-800 border-amber-200 gap-1"
+                            title="This backup was marked completed by the controller because the agent had no record of it — its success was never confirmed by an exit code. Check the report to verify the backup actually exists."
+                          >
+                            <AlertTriangle className="h-3 w-3" />
+                            Unverified
+                          </Badge>
+                        </div>
+                      )}
+                      {job.offsiteSyncStatus && (
+                        <div className="mt-1">
+                          <OffsiteSyncBadge job={job} />
+                        </div>
+                      )}
                       {job.status === 'skipped' && job.skippedReason && (
                         <div className="text-xs text-gray-500 mt-1">
                           {job.skippedReason === 'agent_offline' ? 'Agent offline' : job.skippedReason}
@@ -288,7 +311,7 @@ export default function BackupHistory() {
                         '-'
                       )}
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="sticky right-0 z-10 bg-white dark:bg-gray-900 group-hover:bg-muted/50 shadow-[-8px_0_8px_-8px_rgba(0,0,0,0.15)]">
                       <div className="flex items-center space-x-2">
                         <Button
                           variant="ghost"
@@ -301,7 +324,8 @@ export default function BackupHistory() {
                           <Eye className="h-4 w-4 mr-2" />
                           View Logs
                         </Button>
-                        {(job.status === 'skipped' || job.status === 'failed') && job.canRetry && (
+                        {((job.status === 'skipped' && job.canRetry) ||
+                          (job.status === 'failed' && job.canRetry !== false && job.jobType !== 'restore')) && (
                           <Button
                             variant="ghost"
                             size="sm"

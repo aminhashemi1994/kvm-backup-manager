@@ -1147,6 +1147,18 @@ draw_aggregate_progress_bar() {
 	if [[ "$overall_pct" -lt 0 ]]; then overall_pct=0; fi
 	if [[ "$overall_pct" -gt 100 ]]; then overall_pct=100; fi
 
+	# Throttle: re-render only when the percentage changes, or at most every
+	# 5s otherwise. Every render is captured into the job log by tmux
+	# pipe-pane, so unthrottled rendering (one line per virtnbdbackup tick,
+	# often byte-identical) bloats job logs by an order of magnitude.
+	local _now_ts
+	_now_ts=$(date +%s)
+	if [[ "$overall_pct" == "${_AGG_LAST_PCT:-}" && $((_now_ts - ${_AGG_LAST_TS:-0})) -lt 5 && "$overall_pct" -lt 100 ]]; then
+		return 0
+	fi
+	_AGG_LAST_PCT="$overall_pct"
+	_AGG_LAST_TS="$_now_ts"
+
 	# Write progress metadata
 	write_progress_metadata "$overall_pct" "Backup: $overall_xferred/$overall_total" "backup"
 
@@ -1294,6 +1306,16 @@ draw_rsync_progress_bar() {
 
 	if [[ "$pct" -lt 0 ]]; then pct=0; fi
 	if [[ "$pct" -gt 100 ]]; then pct=100; fi
+
+	# Throttle identically to draw_aggregate_progress_bar: re-render only on
+	# a percentage change, or at most every 5s — keeps job logs small.
+	local _now_ts
+	_now_ts=$(date +%s)
+	if [[ "$pct" == "${_RSYNC_LAST_PCT:-}" && $((_now_ts - ${_RSYNC_LAST_TS:-0})) -lt 5 && "$pct" -lt 100 ]]; then
+		return 0
+	fi
+	_RSYNC_LAST_PCT="$pct"
+	_RSYNC_LAST_TS="$_now_ts"
 
 	# Write progress metadata
 	write_progress_metadata "$pct" "Offsite sync: $xferred @ $speed" "rsync"
@@ -1896,8 +1918,44 @@ monitor_offsite_progress() {
 	done
 
 	local all_done=false
+	local _mon_last_sig=""
+	local _mon_last_ts=0
 
 	while [[ "$all_done" != "true" ]]; do
+		# Throttle: build a cheap per-host (pct|status) signature and skip the
+		# whole redraw when nothing visible changed — the block is re-rendered
+		# every second otherwise, and each render lands in the job log via
+		# tmux pipe-pane (the dominant source of log bloat on long syncs).
+		# Redraw at most every 10s regardless, to refresh speed/ETA.
+		local _sig=""
+		local _si=0
+		for _si in "${!_hosts[@]}"; do
+			local _spf="${_progress_files[$_si]}"
+			local _sline=""
+			[[ -f "$_spf" ]] && _sline=$(tail -1 "$_spf" 2>/dev/null)
+			local _spct="" _sstat=""
+			IFS='|' read -r _spct _ _ _ _sstat <<<"$_sline"
+			_sig+="${_spct}|${_sstat};"
+		done
+		local _mon_now
+		_mon_now=$(date +%s)
+		if [[ "$_sig" == "$_mon_last_sig" && $((_mon_now - _mon_last_ts)) -lt 10 ]]; then
+			all_done=true
+			for _si in "${!_pids[@]}"; do
+				if kill -0 "${_pids[$_si]}" 2>/dev/null; then
+					all_done=false
+					break
+				fi
+			done
+			if [[ "$all_done" != "true" ]]; then
+				sleep 1
+				continue
+			fi
+			# All workers just finished — fall through for one final render.
+		fi
+		_mon_last_sig="$_sig"
+		_mon_last_ts=$_mon_now
+
 		# Move cursor up
 		printf "\033[%dA" "$display_lines"
 
@@ -2390,6 +2448,7 @@ offsite_sync_single_host() {
 			--exclude='logs/' \
 			--exclude='in_progress_backups/' \
 			--exclude='offsite_locks/' \
+			--exclude='*.partial' \
 			"$vm_base_dir/" \
 			"${remote_user}@${oip}:${remote_vm_dir}/"; then
 
@@ -2436,15 +2495,23 @@ CLEANUP_IN_PROGRESS=false
 
 # Comprehensive cleanup function
 cleanup_on_exit() {
+	# Capture the exit code FIRST — any command (even the recursion guard's
+	# [[ ]] test) overwrites $? and would make every exit look successful.
+	local exit_code=$?
+
 	# Prevent recursive cleanup
 	if [[ "$CLEANUP_IN_PROGRESS" == "true" ]]; then
 		return 0
 	fi
 	CLEANUP_IN_PROGRESS=true
 
-	local exit_code=$?
-
 	echo -e "${Yellow}Cleaning up backup resources...${NC}"
+
+	# Remove backup lock FIRST. This only touches local files and must never
+	# depend on the network calls below (e.g. ssh to a dead hypervisor after
+	# a libvirt EOF error) — otherwise an interrupted cleanup leaves a stale
+	# lock that keeps this backup showing "in progress" even though it isn't.
+	remove_backup_lock
 	
 	# Clean up scheduler validation flag file
 	rm -f "/tmp/.backup_manager_scheduler_validated_$$" 2>/dev/null || true
@@ -2468,9 +2535,12 @@ cleanup_on_exit() {
 	# Stop NBD server if running. The pattern is anchored with `\b` so we
 	# don't accidentally match a sibling backup whose port happens to share
 	# a digit-prefix (e.g. killing port 6294 must not match port 62943).
+	# Bounded with timeouts: if the hypervisor is unreachable (the usual
+	# reason we're cleaning up after a failure), this must not hang cleanup.
 	if [[ -n "$nbd_port" && -n "$remote_ip" ]]; then
 		echo "Stopping NBD server on port $nbd_port..."
-		ssh "root@$remote_ip" "pkill -f 'qemu-nbd.*\\b$nbd_port\\b'" 2>/dev/null || true
+		timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$remote_ip" \
+			"pkill -f 'qemu-nbd.*\\b$nbd_port\\b'" 2>/dev/null || true
 	fi
 
 	# Release our reservation in the allocator registry so other backups
@@ -2478,9 +2548,6 @@ cleanup_on_exit() {
 	if [[ -n "$nbd_port_claim_file" && -f "$nbd_port_claim_file" ]]; then
 		rm -f "$nbd_port_claim_file" 2>/dev/null || true
 	fi
-
-	# Remove backup lock
-	remove_backup_lock
 
 	# Clean up temporary files from organized directories
 	if [[ -n "$vm_name" && -n "$schedule" ]]; then
@@ -2696,6 +2763,15 @@ main() {
 		echo -e "${Red}${CROSS} Backup FAILED after $(format_duration $duration)${NC}"
 		echo -e "${Red}${CROSS} Log: $log_file_path${NC}"
 		emit_event "job_fail" "error" "Failed after $(format_duration $duration)" "duration_seconds=$duration"
+
+		# Even though this run failed, still replicate the VM's existing
+		# backup data (previous fulls/incrementals, archives) to the offsite
+		# hosts so they don't go stale. Partial files from the failed run are
+		# excluded by the rsync filter. Running this here — inside the tmux
+		# session, before exit — keeps the sync monitored, so the panel can
+		# show its progress and outcome even though the backup itself failed.
+		offsite_sync || true
+
 		exit 1
 	fi
 

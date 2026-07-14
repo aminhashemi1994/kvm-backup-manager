@@ -157,9 +157,11 @@ export function useRetryBackup() {
       const response = await backupsApi.retryJob(jobId)
       return response.data
     },
-    onSuccess: () => {
+    onSuccess: (data: any) => {
       queryClient.invalidateQueries({ queryKey: ['backups'] })
-      toast.success('Backup retry initiated')
+      // "adopted" means a backup for this VM was already in progress and the
+      // skipped records were resolved against it — surface that message.
+      toast.success(data?.message || 'Backup retry initiated')
     },
     onError: (error: any) => {
       toast.error(error.response?.data?.error || 'Failed to retry backup')

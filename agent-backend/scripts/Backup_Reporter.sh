@@ -338,6 +338,34 @@ _parse_dump() {
 # CHECK FOR PARTIAL/INTERRUPTED BACKUPS
 ###############################################################################
 
+# Decide whether a lock file with no matching tmux session represents a live
+# backup. Returns 0 (running) only if an actual backup process is alive for
+# this VM. A merely "recent" lock is NOT treated as running — a failed backup
+# whose cleanup was interrupted can leave a fresh lock behind, and reporting
+# it as in-progress makes the VM look stuck. Old locks are removed; recent
+# ones are left for the periodic cleanup service (grace period against races).
+_check_lock_liveness() {
+    local lock_file="$1"
+    local vmname="$2"
+    local schedule="$3"
+
+    if pgrep -f "virtnbdbackup.*${vmname}" >/dev/null 2>&1 || \
+       pgrep -f "Backup_Manager.sh.*${vmname}" >/dev/null 2>&1; then
+        _log "_check_partial: backup is running for $vmname/$schedule (live backup process found)"
+        return 0
+    fi
+
+    local lock_age
+    lock_age=$(( $(date +%s) - $(stat -c %Y "$lock_file" 2>/dev/null || echo 0) ))
+    if [[ $lock_age -lt 3600 ]]; then
+        _log "_check_partial: lock file present but no tmux/process for $vmname/$schedule (age: ${lock_age}s) - reporting NOT running, leaving lock for cleanup service"
+    else
+        _log "_check_partial: stale lock file detected for $vmname/$schedule (age: ${lock_age}s) - removing"
+        rm -f "$lock_file" 2>/dev/null || true
+    fi
+    return 1
+}
+
 _check_partial_backups() {
     local dir="${1:-}"
     local vmname="${2:-}"
@@ -426,18 +454,7 @@ _check_partial_backups() {
                         backup_running="true"
                         _log "_check_partial: found running tmux session: $found_session"
                     else
-                        # No tmux session found - check if lock file is recent
-                        local lock_age
-                        lock_age=$(( $(date +%s) - $(stat -c %Y "$lock_file" 2>/dev/null || echo 0) ))
-                        if [[ $lock_age -lt 3600 ]]; then
-                            # Lock file is recent, assume backup is running
-                            backup_running="true"
-                            _log "_check_partial: backup is running for $vmname/$schedule (recent lock file, age: ${lock_age}s)"
-                        else
-                            # Lock file is old - likely stale
-                            _log "_check_partial: stale lock file detected for $vmname/$schedule (age: ${lock_age}s) - removing"
-                            rm -f "$lock_file" 2>/dev/null || true
-                        fi
+                        _check_lock_liveness "$lock_file" "$vmname" "$schedule" && backup_running="true"
                     fi
                 fi
             else
@@ -446,23 +463,12 @@ _check_partial_backups() {
                 local tmux_pattern="${sanitized_vmname}_${schedule}_"
                 local found_session=""
                 found_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${tmux_pattern}" | head -n1) || found_session=""
-                
+
                 if [[ -n "$found_session" ]]; then
                     backup_running="true"
                     _log "_check_partial: found running tmux session: $found_session"
                 else
-                    # No tmux session found - check if lock file is recent
-                    local lock_age
-                    lock_age=$(( $(date +%s) - $(stat -c %Y "$lock_file" 2>/dev/null || echo 0) ))
-                    if [[ $lock_age -lt 3600 ]]; then
-                        # Lock file is recent, assume backup is running
-                        backup_running="true"
-                        _log "_check_partial: backup is running for $vmname/$schedule (recent lock file, age: ${lock_age}s)"
-                    else
-                        # Lock file is old - likely stale
-                        _log "_check_partial: stale lock file detected for $vmname/$schedule (age: ${lock_age}s) - removing"
-                        rm -f "$lock_file" 2>/dev/null || true
-                    fi
+                    _check_lock_liveness "$lock_file" "$vmname" "$schedule" && backup_running="true"
                 fi
             fi
         fi

@@ -4,6 +4,7 @@ const fs = require('fs');
 const axios = require('axios');
 const controllerAuthService = require('./controllerAuthService');
 const concurrencyConfigSyncService = require('./concurrencyConfigSyncService');
+const { sanitizeLog } = require('../utils/logSanitizer');
 
 class BackupExecutor {
   constructor() {
@@ -471,18 +472,46 @@ class BackupExecutor {
    */
   async checkAndRecoverJobs() {
     const jobStates = this.getAllJobStates();
-    
+
     for (const jobState of jobStates) {
       const { jobId, vmName, hypervisorIp } = jobState;
-      
+
       // Skip if already attached
       if (this.activeJobs.has(jobId)) {
         continue;
       }
-      
+      // Skip if monitors for this job are still wired (mid-teardown race)
+      if (this.activeProcesses.has(jobId)) {
+        continue;
+      }
+
+      // FIRST check the tmux session by its exact recorded name — it is
+      // authoritative. During setup phases (retry cleanup, checksumming)
+      // no virtnbdbackup process matches yet, so the process check below
+      // would wrongly conclude the job died and mark it completed/failed
+      // while it is in fact running. Re-adopt and resume full monitoring.
+      if (jobState.tmuxSession) {
+        const liveSession = await this.findRunningTmuxSession(jobState.tmuxSession);
+        if (liveSession) {
+          console.log(`Re-adopting job ${jobId} — tmux session ${liveSession} is alive but was untracked`);
+          this.activeJobs.set(jobId, {
+            ...jobState,
+            progress: jobState.progress || 0,
+            progressText: jobState.progressText || 'Re-attached...',
+            recovered: true,
+          });
+          this.vmLocks.set(vmName, jobId);
+          const logFile = path.join(this.config.logDir, `${jobId}.log`);
+          const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+          this.monitorTmuxSession(jobId, liveSession, jobState, logFile, logStream);
+          await this.updateController(jobId, 'running', null, null, jobState.progress || 0, 'Re-attached to running backup session');
+          continue;
+        }
+      }
+
       // Check if process is still running
       const pid = await this.findRunningBackupProcess(vmName, hypervisorIp);
-      
+
       if (pid) {
         console.log(`Recovering orphaned job ${jobId} (PID: ${pid})`);
         await this.reattachToJob(jobId, jobState, pid);
@@ -779,21 +808,66 @@ class BackupExecutor {
    */
   async queueBackup(jobData) {
     const { vmName } = jobData;
-    
-    // Check if VM is already being backed up
+
+    // Check if VM is already being backed up. A vmLock can go stale if a
+    // previous job died in a way that skipped lock cleanup (agent crash,
+    // SIGKILL). Before refusing, verify the lock is backed by a REAL live
+    // worker (tmux session or backup process). If nothing is alive, the
+    // lock is stale — clear it and let this backup proceed. Without this,
+    // a stale lock permanently blocks retries with a false "already in
+    // progress" (the exact symptom users hit after a crash).
     if (this.vmLocks.has(vmName)) {
       const existingJobId = this.vmLocks.get(vmName);
-      console.log(`VM ${vmName} is already being backed up (job: ${existingJobId})`);
-      return { 
-        queued: false, 
-        error: `Another backup is already in progress for VM: ${vmName}`,
-        existingJobId 
-      };
+      const stillRunning = await this._isVmBackupAlive(vmName, jobData.scheduleType);
+      if (stillRunning) {
+        console.log(`VM ${vmName} is already being backed up (job: ${existingJobId})`);
+        return {
+          queued: false,
+          error: `Another backup is already in progress for VM: ${vmName}`,
+          existingJobId,
+        };
+      }
+      console.warn(`[BackupExecutor] Stale vmLock for ${vmName} (job ${existingJobId}) — no live worker found, clearing and proceeding`);
+      this.vmLocks.delete(vmName);
+      this.deleteJobState(existingJobId);
     }
-    
+
     this.jobQueue.push(jobData);
     this.processQueue();
     return { queued: true, position: this.jobQueue.length };
+  }
+
+  /**
+   * Is there a genuinely live backup worker for this VM? Checks a matching
+   * tmux session and the backup processes. Used to distinguish a real
+   * in-progress backup from a stale in-memory lock.
+   */
+  async _isVmBackupAlive(vmName, scheduleType = null) {
+    try {
+      const { exec } = require('child_process');
+      const { promisify } = require('util');
+      const execAsync = promisify(exec);
+      const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+      // Live tmux session for this VM (optionally scoped to schedule)
+      const sanitized = vmName.replace(/[^a-zA-Z0-9-]/g, '_');
+      try {
+        const { stdout } = await execAsync(`tmux list-sessions -F "#{session_name}" 2>/dev/null || true`);
+        const prefix = scheduleType ? `${sanitized}_${scheduleType}_` : `${sanitized}_`;
+        if (stdout.split('\n').some(s => s.startsWith(prefix))) return true;
+      } catch (_) { /* no tmux server */ }
+
+      // Live backup process for this VM
+      const { stdout: procs } = await execAsync(
+        `pgrep -af "(virtnbdbackup|Backup_Manager.sh).*${esc(vmName)}" 2>/dev/null || true`
+      );
+      return procs.trim().length > 0;
+    } catch (err) {
+      // On any error, be conservative and assume it IS alive (don't clear a
+      // lock we can't verify — better a false block than a double-start).
+      console.error(`[BackupExecutor] _isVmBackupAlive check failed for ${vmName}: ${err.message}`);
+      return true;
+    }
   }
 
   /**
@@ -855,9 +929,16 @@ class BackupExecutor {
     const tmuxSession = `${sanitizedVmName}_${scheduleType}_${shortJobId}`;
     
     this.activeJobs.set(jobId, { ...jobData, progress: 0, progressText: 'Starting...', tmuxSession });
-    
+
     // Save initial job state
     this.saveJobState(jobId, { ...jobData, progress: 0, progressText: 'Starting...', tmuxSession });
+
+    // Tell the controller execution has begun RIGHT AWAY — before any retry
+    // cleanup or command setup. Otherwise the UI sits on "queued/starting"
+    // for minutes while pre-backup work (e.g. Cleanup_Backup.sh on retries)
+    // runs, even though the job is genuinely executing. Fire-and-forget so a
+    // slow controller can't delay the backup itself.
+    this.updateController(jobId, 'running', null, null, 0, 'Starting backup process...').catch(() => {});
 
     // Create log file
     const logFile = path.join(this.config.logDir, `${jobId}.log`);
@@ -1107,7 +1188,8 @@ class BackupExecutor {
    */
   monitorTmuxSession(jobId, tmuxSession, jobData, logFile, logStream) {
     const { vmName, scheduleType, storagePoolPath } = jobData;
-    
+    const monitorStartMs = Date.now();
+
     console.log(`Starting monitoring for job ${jobId} in tmux session ${tmuxSession}`);
     
     // Progress file path (matches the backup script - uses storage pool path or falls back to config)
@@ -1290,11 +1372,17 @@ class BackupExecutor {
           this.vmLocks.delete(vmName);
           this.deleteJobState(jobId);
           
+          // Collect per-offsite-host outcomes from the script's events file
+          // so the controller can persist an offsite sync status on the job.
+          // This works for failed backups too — the script now runs the
+          // offsite sync even on failure.
+          const offsiteResults = this.collectOffsiteResults(vmName, scheduleType, storagePoolPath, monitorStartMs);
+
           // Update controller with accurate status
           if (exitCode === 0) {
-            await this.updateController(jobId, 'completed', 0);
+            await this.updateController(jobId, 'completed', 0, null, null, null, null, offsiteResults);
           } else {
-            await this.updateController(jobId, 'failed', exitCode, errorMessage, null, null, failureReason);
+            await this.updateController(jobId, 'failed', exitCode, errorMessage, null, null, failureReason, offsiteResults);
           }
           
           // Process next in queue
@@ -1343,7 +1431,54 @@ class BackupExecutor {
   /**
    * Update controller with job status
    */
-  async updateController(jobId, status, exitCode = null, error = null, progress = null, progressText = null, failureReason = null) {
+  /**
+   * Parse the backup script's events file for per-offsite-host outcomes.
+   * Backup_Manager.sh emits offsite_host_complete / offsite_host_fail /
+   * offsite_fail (SSH skip) events with offsite_ip + offsite_path into
+   * <pool>/<vm>/<schedule>/logs/<ts>_<schedule>_<method>.events.jsonl.
+   * Returns [{ ip, poolPath, status, reason }] or null.
+   */
+  collectOffsiteResults(vmName, scheduleType, storagePoolPath, sinceMs) {
+    try {
+      if (!vmName || !scheduleType || !storagePoolPath) return null;
+      const logsDir = path.join(storagePoolPath, vmName, scheduleType, 'logs');
+      if (!fs.existsSync(logsDir)) return null;
+
+      // Newest events file written since (shortly before) the job started —
+      // the script names it by its own start timestamp.
+      const candidates = fs.readdirSync(logsDir)
+        .filter(f => f.endsWith('.events.jsonl') && !f.includes('_offsite_'))
+        .map(f => {
+          const full = path.join(logsDir, f);
+          try { return { full, mtime: fs.statSync(full).mtimeMs }; } catch { return null; }
+        })
+        .filter(Boolean)
+        .filter(x => x.mtime >= sinceMs - 60000)
+        .sort((a, b) => b.mtime - a.mtime);
+      if (candidates.length === 0) return null;
+
+      const results = [];
+      const lines = fs.readFileSync(candidates[0].full, 'utf8').split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.event === 'offsite_host_complete') {
+          results.push({ ip: ev.offsite_ip, poolPath: ev.offsite_path, status: 'success' });
+        } else if (ev.event === 'offsite_host_fail') {
+          results.push({ ip: ev.offsite_ip, poolPath: ev.offsite_path, status: 'failed', reason: ev.reason || ev.message });
+        } else if (ev.event === 'offsite_fail') {
+          results.push({ ip: ev.offsite_ip, poolPath: ev.offsite_path, status: 'skipped', reason: ev.reason || ev.message });
+        }
+      }
+      return results.length > 0 ? results : null;
+    } catch (err) {
+      console.error(`[BackupExecutor] Failed to collect offsite results: ${err.message}`);
+      return null;
+    }
+  }
+
+  async updateController(jobId, status, exitCode = null, error = null, progress = null, progressText = null, failureReason = null, offsiteResults = null) {
     if (!this.config.controllerUrl) {
       console.log(`No controller URL configured, skipping status update for job ${jobId}`);
       return;
@@ -1355,17 +1490,33 @@ class BackupExecutor {
         exitCode,
         error,
       };
-      
+
       if (progress !== null) {
         payload.progress = progress;
       }
-      
+
       if (progressText !== null) {
         payload.progressText = progressText;
       }
-      
+
       if (failureReason) {
         payload.failureReason = failureReason;
+      }
+
+      // Forward the current progress phase (backup vs rsync/offsite) so the
+      // controller can show "Syncing offsite" instead of a generic running
+      // state. Read from the tracked job state — set by the progress-file
+      // monitor and the log parser.
+      const trackedJob = this.activeJobs.get(jobId);
+      if (trackedJob && trackedJob.progressType) {
+        payload.progressType = trackedJob.progressType;
+      }
+
+      // Per-offsite-host outcomes parsed from the script's events file,
+      // sent with the terminal update so the controller can persist an
+      // offsite sync status on the job (visible in Active + History).
+      if (Array.isArray(offsiteResults) && offsiteResults.length > 0) {
+        payload.offsiteResults = offsiteResults;
       }
       
       // Terminal status updates (completed/failed/cancelled) are critical:
@@ -1581,15 +1732,60 @@ class BackupExecutor {
   /**
    * Read log file
    */
-  async readLog(jobId) {
+  async readLog(jobId, tailLines = null, meta = null) {
     const logFile = path.join(this.config.logDir, `${jobId}.log`);
+    let content = '';
     try {
-      return fs.readFileSync(logFile, 'utf8');
+      content = fs.readFileSync(logFile, 'utf8');
     } catch (error) {
-      if (error.code === 'ENOENT') {
-        return '';
+      if (error.code !== 'ENOENT') throw error;
+      // fall through to the durable script log
+    }
+
+    // The flat per-job log (./logs/<jobId>.log) is written by the agent while
+    // it is tracking the job. If the agent lost the job (restart mid-backup
+    // with no re-adoption, or the tmux pipe-pane died) that file can be empty
+    // or missing — the exact case where the job also ends up "completed /
+    // exit -" with nothing to show. The backup script ALSO writes a complete
+    // log onto the backup pool itself (<pool>/<vm>/<schedule>/logs/<ts>...log),
+    // which survives agent restarts. Fall back to it so logs are never lost.
+    if (!content.trim() && meta && meta.vmName && meta.scheduleType && meta.storagePoolPath) {
+      const scriptLog = this._findLatestScriptLog(meta.vmName, meta.scheduleType, meta.storagePoolPath);
+      if (scriptLog) {
+        try {
+          content = fs.readFileSync(scriptLog, 'utf8');
+          content = `[logs recovered from backup-pool log: ${scriptLog}]\n\n${content}`;
+        } catch (_) { /* ignore, return whatever we have */ }
       }
-      throw error;
+    }
+
+    if (!content) return '';
+    // Collapse in-place progress renders and optionally tail — see
+    // utils/logSanitizer.js for the full rationale.
+    return sanitizeLog(content, tailLines);
+  }
+
+  /**
+   * Newest script log for a VM/schedule on the backup pool. The script writes
+   * to <pool>/<vm>/<schedule>/logs/<ts>_<schedule>_<trigger>.log (offsite
+   * per-host logs, which contain '_offsite_', are excluded).
+   */
+  _findLatestScriptLog(vmName, scheduleType, storagePoolPath) {
+    try {
+      const logsDir = path.join(storagePoolPath, vmName, scheduleType, 'logs');
+      if (!fs.existsSync(logsDir)) return null;
+      const candidates = fs.readdirSync(logsDir)
+        .filter(f => f.endsWith('.log') && !f.includes('_offsite_'))
+        .map(f => {
+          const full = path.join(logsDir, f);
+          try { return { full, mtime: fs.statSync(full).mtimeMs }; } catch { return null; }
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.mtime - a.mtime);
+      return candidates.length ? candidates[0].full : null;
+    } catch (err) {
+      console.error(`[BackupExecutor] _findLatestScriptLog failed: ${err.message}`);
+      return null;
     }
   }
 

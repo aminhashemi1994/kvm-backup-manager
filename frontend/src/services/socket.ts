@@ -83,6 +83,34 @@ class SocketService {
       this.emit('job-removed', data)
     })
 
+    // Job status reconciliation events. These were emitted by the server
+    // (agent sync, retry flows) but never forwarded here, so UI components
+    // listening for them (e.g. Layout's job-updated invalidation) never
+    // fired and stale statuses like "queued" lingered until a full refetch.
+    this.socket.on('job-updated', (data) => {
+      this.emit('job-updated', data)
+    })
+
+    this.socket.on('jobs-synced', (data) => {
+      this.emit('jobs-synced', data)
+    })
+
+    this.socket.on('backup-retrying', (data) => {
+      this.emit('backup-retrying', data)
+    })
+
+    this.socket.on('backup-queued', (data) => {
+      this.emit('backup-queued', data)
+    })
+
+    this.socket.on('backup-cancelled', (data) => {
+      this.emit('backup-cancelled', data)
+    })
+
+    this.socket.on('restore-updated', (data) => {
+      this.emit('restore-updated', data)
+    })
+
     // Init events
     this.socket.on('init-log', (data) => {
       this.emit('init-log', data)
