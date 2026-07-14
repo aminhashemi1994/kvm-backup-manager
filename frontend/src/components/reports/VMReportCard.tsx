@@ -165,7 +165,7 @@ export default function VMReportCard({ vm, defaultView = 'details' }: VMReportCa
                 <div className="space-y-2">
                   <h5 className="font-medium text-sm">Backup Schedules</h5>
                   {vm.schedules.map((schedule: any, index: number) => (
-                    <ScheduleDetails key={index} schedule={schedule} />
+                    <ScheduleDetails key={index} schedule={schedule} vmId={vmId} vmName={vm.vm_name} />
                   ))}
                 </div>
               </div>

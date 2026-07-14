@@ -435,106 +435,34 @@ class SchedulerService {
         return;
       }
 
-      console.log(`Found ${skippedJobs.length} skipped backup(s) to retry for hosts that came back online`);
+      // A host that was offline across several schedule fires leaves MANY
+      // skipped records for the same VM + schedule. Retrying each one would
+      // send colliding triggers (the agent per-VM lock 409s all but the
+      // first). Retry only the most recent per (vm, schedule) group; the
+      // rest are superseded once the retry is in flight.
+      const groups = new Map();
+      for (const job of skippedJobs) {
+        const key = `${job.vmId}::${job.scheduleId || 'manual'}`;
+        const current = groups.get(key);
+        if (!current || new Date(job.startTime) > new Date(current.startTime)) {
+          groups.set(key, job);
+        }
+      }
+      const jobsToRetry = [...groups.values()];
 
-      for (const skippedJob of skippedJobs) {
+      console.log(`Found ${skippedJobs.length} skipped backup(s) in ${jobsToRetry.length} VM/schedule group(s) to retry for hosts that came back online`);
+
+      for (const skippedJob of jobsToRetry) {
         const host = hosts.find(h => h.id === skippedJob.backupHostId);
         if (!host) continue;
 
         console.log(`Auto-retrying skipped backup for VM: ${skippedJob.vmName} on host: ${host.name}`);
 
-        // Notify RocketChat
-        rocketChatService.notifyBackupRetry(skippedJob.vmName, host.name, skippedJob.id);
-
-        // Find the schedule for this job
-        const schedule = schedules.find(s => s.id === skippedJob.scheduleId);
-        if (!schedule) {
-          console.log(`Schedule not found for skipped job ${skippedJob.id}, skipping retry`);
-          continue;
-        }
-
-        // Create a new job for retry
-        const newJobId = uuidv4();
-        const retryJob = {
-          ...skippedJob,
-          id: newJobId,
-          status: 'queued',
-          startTime: new Date().toISOString(),
-          endTime: null,
-          exitCode: null,
-          error: null,
-          retryOf: skippedJob.id,
-          progress: 0,
-          progressText: 'Queued (auto-retry)...',
-          autoRetry: true,
-        };
-
-        jobs.push(retryJob);
-        await saveBackupJobs(jobs);
-
-        await appendLog(newJobId, `Auto-retry of skipped job ${skippedJob.id}`);
-        await appendLog(newJobId, `Original job was skipped because: ${skippedJob.error}`);
-        await appendLog(newJobId, `Agent ${host.name} came back online, retrying now`);
-
-        // Emit event
-        if (this.io) {
-          this.io.emit('backup-started', retryJob);
-        }
-
-        // Trigger backup on agent
-        try {
-          const vms = await getVirtualMachines();
-          const vm = vms.find(v => v.id === skippedJob.vmId);
-          if (!vm) {
-            console.error(`VM not found for retry: ${skippedJob.vmId}`);
-            continue;
-          }
-
-          const hypervisors = await getHypervisors();
-          const hypervisor = hypervisors.find(h => h.id === vm.hypervisorId);
-          if (!hypervisor) {
-            console.error(`Hypervisor not found for retry: ${vm.hypervisorId}`);
-            continue;
-          }
-
-          const backupData = {
-            jobId: newJobId,
-            vmName: skippedJob.vmName,
-            hypervisorId: hypervisor.id,
-            hypervisorIp: hypervisor.ip,
-            method: skippedJob.method,
-            noCompression: skippedJob.noCompression,
-            noVerify: skippedJob.noVerify,
-          };
-
-          // Check if this was a scheduled backup with cycle management
-          if (schedule && (schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly')) {
-            await agentService.triggerScheduledBackup(host.url, {
-              ...backupData,
-              vmId: skippedJob.vmId,
-              incrementalCount: schedule.incrementalCount,
-            });
-          } else {
-            await agentService.triggerBackup(host.url, backupData);
-          }
-
-          // Update job status
-          retryJob.status = 'running';
-          await saveBackupJobs(jobs);
-
-          console.log(`Successfully triggered auto-retry for ${skippedJob.vmName}`);
-        } catch (error) {
-          console.error(`Failed to trigger auto-retry for ${skippedJob.vmName}:`, error.message);
-          retryJob.status = 'failed';
-          retryJob.error = `Auto-retry failed: ${error.message}`;
-          retryJob.endTime = new Date().toISOString();
-          await saveBackupJobs(jobs);
-          await appendLog(newJobId, `Error triggering auto-retry: ${error.message}`);
-          
-          if (this.io) {
-            this.io.emit('backup-error', retryJob);
-          }
-        }
+        // Delegate to the shared retry helper. It builds the FULL agent
+        // payload (storagePoolPath, retention, compression, offsite hosts —
+        // resolved from the schedule). The old inline payload here lacked
+        // storagePoolPath, so the agent rejected every auto-retry with 400.
+        await this._retrySkippedJob(skippedJob, host, schedules, jobs);
       }
     } catch (error) {
       console.error('Error retrying skipped backups:', error);
@@ -875,12 +803,20 @@ class SchedulerService {
     }
 
     // Mark running first so it occupies a slot and won't be double-started.
+    // Persisted via a fresh read/patch so concurrent store changes (agent
+    // updates, retry supersedes) aren't rolled back by a stale-array save.
     job.status = 'running';
     job.pendingStart = false;
     job.startTime = new Date().toISOString();
     job.progress = 0;
     job.progressText = 'Starting (slot freed)...';
-    await saveBackupJobs(jobs);
+    await this._patchJobFresh(job.id, {
+      status: 'running',
+      pendingStart: false,
+      startTime: job.startTime,
+      progress: 0,
+      progressText: job.progressText,
+    });
     await appendLog(job.id, 'Slot freed — starting queued backup');
     if (this.io) this.io.emit('backup-started', job);
 
@@ -938,13 +874,18 @@ class SchedulerService {
           : {}),
       });
 
-      await saveBackupJobs(jobs);
+      await this._patchJobFresh(job.id, { offsiteTargets: job.offsiteTargets });
       console.log(`[Scheduler] ✓ Started queued backup for ${job.vmName} on ${host.name}`);
     } catch (err) {
       job.status = 'failed';
       job.error = `Failed to start queued backup: ${err.message}`;
       job.endTime = new Date().toISOString();
-      await saveBackupJobs(jobs);
+      await this._patchJobFresh(job.id, {
+        status: 'failed',
+        error: job.error,
+        endTime: job.endTime,
+        pendingStart: false,
+      });
       await appendLog(job.id, job.error);
       if (this.io) this.io.emit('backup-error', job);
       console.error(`[Scheduler] ✗ Failed to start queued backup for ${job.vmName}: ${err.message}`);
@@ -978,9 +919,13 @@ class SchedulerService {
       progressText: 'Queued (auto-retry)...',
       autoRetry: true,
     };
-    jobs.push(retryJob);
-    await saveBackupJobs(jobs);
-    await appendLog(newJobId, `Auto-retry of job ${skipped.id} that was skipped due to concurrent_limit`);
+    // Persist against fresh store state — the shared `jobs` array from the
+    // caller can be stale after earlier iterations' supersede/agent updates,
+    // and saving it would roll those changes back.
+    const currentJobs = await getBackupJobs();
+    currentJobs.push(retryJob);
+    await saveBackupJobs(currentJobs);
+    await appendLog(newJobId, `Auto-retry of skipped job ${skipped.id} (${skipped.skippedReason || 'skipped'})`);
 
     if (this.io) this.io.emit('backup-started', retryJob);
 
@@ -1039,20 +984,118 @@ class SchedulerService {
       });
 
       retryJob.status = 'running';
-      await saveBackupJobs(jobs);
+      // Persist resolved offsite targets, then promote to running against
+      // fresh store state (the agent may already have reported progress).
+      await this._patchJobFresh(newJobId, { offsiteTargets: retryJob.offsiteTargets });
+      await this._markTriggeredRunning(newJobId);
+      // A retry is now in flight — resolve every other skipped record for
+      // this VM + schedule so their Retry buttons disappear.
+      await this.supersedeSkippedSiblings(skipped, newJobId);
       try {
         rocketChatService.notifyBackupRetry(skipped.vmName, host.name, skipped.id);
       } catch (_) { /* non-fatal */ }
       console.log(`[Scheduler] ✓ Auto-retry triggered for ${skipped.vmName} on ${host.name}`);
     } catch (err) {
+      // The agent refusing with 409 means a backup for this VM is ALREADY
+      // running — the retry is redundant, not failed. Drop the retry record
+      // instead of polluting history with a bogus failure.
+      if (err.response?.status === 409) {
+        await this._removeJob(newJobId);
+        await this.supersedeSkippedSiblings(skipped, err.response?.data?.existingJobId || newJobId);
+        console.log(`[Scheduler] Auto-retry for ${skipped.vmName} adopted existing agent job (${err.response?.data?.existingJobId || 'unknown'})`);
+        return;
+      }
       retryJob.status = 'failed';
       retryJob.error = `Auto-retry failed: ${err.message}`;
       retryJob.endTime = new Date().toISOString();
-      await saveBackupJobs(jobs);
+      await this._patchJobFresh(newJobId, {
+        status: 'failed',
+        error: retryJob.error,
+        endTime: retryJob.endTime,
+      });
       await appendLog(newJobId, `Error triggering auto-retry: ${err.message}`);
       if (this.io) this.io.emit('backup-error', retryJob);
       console.error(`[Scheduler] ✗ Auto-retry failed for ${skipped.vmName}: ${err.message}`);
     }
+  }
+
+  /**
+   * Once a retry is in flight for a skipped job, every OTHER skipped record
+   * for the same VM + schedule is redundant: a host that was offline for
+   * hours accumulates one skipped record per missed occurrence, and a single
+   * successful retry satisfies all of them. Mark them failed/superseded and
+   * non-retryable so the UI stops offering Retry buttons for each one.
+   */
+  async supersedeSkippedSiblings(originalJob, newJobId, reason = 'superseded_by_retry') {
+    try {
+      const jobs = await getBackupJobs();
+      let changed = 0;
+      for (const j of jobs) {
+        if (j.id === newJobId) continue;
+        if (j.status !== 'skipped') continue;
+        if (j.vmId !== originalJob.vmId) continue;
+        if ((j.scheduleId || null) !== (originalJob.scheduleId || null)) continue;
+        j.status = 'failed';
+        j.canRetry = false;
+        j.failureReason = reason;
+        j.supersededBy = newJobId;
+        j.error = j.error
+          ? `${j.error} — superseded by retry`
+          : 'Superseded by retry';
+        j.endTime = j.endTime || new Date().toISOString();
+        changed++;
+        if (this.io) this.io.emit('job-updated', j);
+      }
+      if (changed > 0) {
+        await saveBackupJobs(jobs);
+        console.log(`[Scheduler] Superseded ${changed} skipped record(s) for ${originalJob.vmName} after retry ${newJobId}`);
+      }
+      return changed;
+    } catch (err) {
+      console.error('[Scheduler] supersedeSkippedSiblings error:', err.message);
+      return 0;
+    }
+  }
+
+  /**
+   * Promote a just-triggered job to running against FRESH store state. The
+   * agent may already have posted running/progress (or even completed for a
+   * tiny backup) while the trigger call was in flight; saving a stale array
+   * would silently roll that back, which is how jobs get stuck on "queued"
+   * in the UI while the backup is visibly running.
+   */
+  async _markTriggeredRunning(jobId) {
+    const jobs = await getBackupJobs();
+    const job = jobs.find(j => j.id === jobId);
+    if (!job) return null;
+    if (job.status === 'queued' && !job.pendingStart) {
+      job.status = 'running';
+      await saveBackupJobs(jobs);
+      if (this.io) this.io.emit('job-updated', job);
+    }
+    return job;
+  }
+
+  /** Patch a job by id against fresh store state (avoids stale-array clobber). */
+  async _patchJobFresh(jobId, patch) {
+    const jobs = await getBackupJobs();
+    const job = jobs.find(j => j.id === jobId);
+    if (!job) return null;
+    Object.assign(job, patch);
+    await saveBackupJobs(jobs);
+    if (this.io) this.io.emit('job-updated', job);
+    return job;
+  }
+
+  /** Remove a job record entirely (used when a retry adopts an existing job). */
+  async _removeJob(jobId) {
+    const jobs = await getBackupJobs();
+    const idx = jobs.findIndex(j => j.id === jobId);
+    if (idx === -1) return false;
+    jobs.splice(idx, 1);
+    await saveBackupJobs(jobs);
+    if (this.io) this.io.emit('job-removed', { jobId });
+    return true;
   }
 
   async loadSchedules() {

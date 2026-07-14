@@ -90,8 +90,9 @@ router.get('/logs/:restoreId', async (req, res, next) => {
     const { restoreId } = req.params;
     
     try {
-      const logs = await restoreExecutor.getJobLogs(restoreId);
-      
+      // ?tail=N serves only the last N (collapsed) lines
+      const logs = await restoreExecutor.getJobLogs(restoreId, req.query.tail);
+
       res.json({
         success: true,
         data: {

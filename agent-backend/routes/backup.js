@@ -113,9 +113,15 @@ router.get('/active', async (req, res, next) => {
 });
 
 // GET /api/backup/logs/:jobId - Get backup logs
+// ?tail=N serves only the last N (collapsed) lines to keep payloads small.
 router.get('/logs/:jobId', async (req, res, next) => {
   try {
-    const logs = await backupExecutor.readLog(req.params.jobId);
+    // Optional meta lets readLog fall back to the durable script log on the
+    // backup pool when the flat per-job log is missing (agent lost the job).
+    const meta = (req.query.vmName && req.query.scheduleType && req.query.storagePoolPath)
+      ? { vmName: req.query.vmName, scheduleType: req.query.scheduleType, storagePoolPath: req.query.storagePoolPath }
+      : null;
+    const logs = await backupExecutor.readLog(req.params.jobId, req.query.tail, meta);
     res.json({
       success: true,
       data: {
@@ -139,8 +145,9 @@ router.get('/logs/:jobId/stream', async (req, res, next) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    // Send initial logs
-    const initialLogs = await backupExecutor.readLog(jobId);
+    // Send initial logs (tail only — the stream keeps appending live lines,
+    // so shipping a multi-MB history upfront just stalls the viewer)
+    const initialLogs = await backupExecutor.readLog(jobId, 2000);
     if (initialLogs) {
       res.write(`data: ${JSON.stringify({ type: 'initial', content: initialLogs })}\n\n`);
     }

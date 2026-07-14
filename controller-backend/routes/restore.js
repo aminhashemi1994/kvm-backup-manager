@@ -678,9 +678,12 @@ router.get('/logs/:restoreId', async (req, res, next) => {
       }
       
       const client = agentService.createAgentClient(backupHost.url, backupHost.id, backupHost.name);
+      // Default to the last 2000 lines so a huge restore log can't stall
+      // the panel; pass ?full=1 for the complete log.
+      const tail = req.query.full === '1' ? undefined : (Number(req.query.tail) > 0 ? Number(req.query.tail) : 2000);
       const logsResponse = await client.get(
         `/api/restore/logs/${restoreId}`,
-        { timeout: 10000 }
+        { timeout: 10000, params: tail ? { tail } : {} }
       );
 
       if (logsResponse.data.success) {

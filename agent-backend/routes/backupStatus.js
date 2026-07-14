@@ -271,6 +271,73 @@ router.get('/', async (req, res, next) => {
   }
 });
 
+// POST /api/backup-status/clear-in-progress - Force-clear a stuck "in progress" state
+//
+// Removes the lock file and progress file for a VM/schedule so a backup that
+// is no longer actually running stops showing as in-progress. Refuses when a
+// live tmux session or backup process is found (the backup IS running).
+//
+// Body: { vmName, scheduleType, storagePoolPath }
+router.post('/clear-in-progress', async (req, res, next) => {
+  try {
+    const { vmName, scheduleType, storagePoolPath } = req.body;
+
+    if (!vmName || !scheduleType || !storagePoolPath) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: vmName, scheduleType, storagePoolPath',
+      });
+    }
+
+    console.log(`[BackupStatus] Clear in-progress requested for ${vmName}/${scheduleType}`);
+
+    // cleanupForVm verifies no live Backup_Manager.sh process and no tmux
+    // session before deleting the lock + progress file (no age threshold).
+    const cleanupService = require('../services/cleanupService');
+    const result = await cleanupService.cleanupForVm(vmName, scheduleType, storagePoolPath);
+
+    if (!result.cleaned && (result.reason === 'process_alive' || result.reason === 'tmux_alive')) {
+      return res.status(409).json({
+        success: false,
+        error: `A backup for ${vmName} (${scheduleType}) is actually running (${result.reason === 'tmux_alive' ? 'tmux session active' : 'backup process alive'}). Refusing to clear its in-progress state.`,
+        reason: result.reason,
+      });
+    }
+
+    // If there was no lock, an orphaned progress file may still make the VM
+    // look busy — remove it too.
+    const clearedFiles = result.files ? [...result.files] : [];
+    if (!result.cleaned) {
+      const progressFile = path.join(storagePoolPath, '.progress', `${vmName}_${scheduleType}.progress`);
+      try {
+        if (fs.existsSync(progressFile)) {
+          fs.unlinkSync(progressFile);
+          clearedFiles.push(progressFile);
+          console.log(`[BackupStatus] Removed orphaned progress file: ${progressFile}`);
+        }
+      } catch (e) {
+        if (e.code !== 'ENOENT') console.error(`[BackupStatus] Failed to remove progress file: ${e.message}`);
+      }
+    }
+
+    const message = clearedFiles.length > 0
+      ? `Cleared in-progress state for ${vmName} (${scheduleType}): removed ${clearedFiles.length} file(s)`
+      : `Nothing to clear for ${vmName} (${scheduleType}) — no lock or progress file found`;
+
+    console.log(`[BackupStatus] ${message}`);
+    res.json({
+      success: true,
+      cleared: clearedFiles.length > 0,
+      files: clearedFiles,
+      message,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error('[BackupStatus] Clear in-progress error:', error);
+    next(error);
+  }
+});
+
 // POST /api/backup-status/bulk - Check status for multiple VMs/schedules at once
 router.post('/bulk', async (req, res, next) => {
   try {

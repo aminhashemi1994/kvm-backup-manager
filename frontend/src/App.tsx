@@ -1,4 +1,4 @@
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { Toaster } from 'sonner'
 import { AuthProvider, useAuth } from './contexts/AuthContext'
 import { ThemeProvider } from './contexts/ThemeContext'
@@ -23,6 +23,12 @@ import { useHealthCheckOnMount } from './hooks/useHealthCheck'
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth()
   return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />
+}
+
+// Redirect while keeping query params (e.g. /history?status=skipped -> /backups/history?status=skipped)
+function RedirectPreservingSearch({ to }: { to: string }) {
+  const location = useLocation()
+  return <Navigate to={`${to}${location.search}`} replace />
 }
 
 function AppRoutes() {
@@ -187,6 +193,10 @@ function AppRoutes() {
           </PrivateRoute>
         }
       />
+      {/* Legacy path: redirect /history to /backups/history preserving query params */}
+      <Route path="/history" element={<RedirectPreservingSearch to="/backups/history" />} />
+      {/* Catch-all: unknown URLs render the dashboard instead of a blank screen */}
+      <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>
   )
 }

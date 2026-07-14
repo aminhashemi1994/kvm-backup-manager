@@ -28,7 +28,7 @@ const { requireUser, requireAdmin } = require('../middleware/rbac');
  * Sync job status with agent
  * Returns true if status was updated
  */
-async function syncJobStatusWithAgent(job, hosts) {
+async function syncJobStatusWithAgent(job, hosts, agentActiveCache = null) {
   if (job.status !== 'running' && job.status !== 'queued') {
     return false; // Already finished
   }
@@ -40,25 +40,112 @@ async function syncJobStatusWithAgent(job, hosts) {
   if (job.status === 'queued' && job.pendingStart) {
     return false;
   }
-  
+
   const host = hosts.find(h => h.id === job.backupHostId);
   if (!host) return false;
-  
+
   try {
-    const client = agentService.createAgentClient(host.url, host.id, host.name);
-    const response = await client.get('/api/backup/active', { timeout: 5000 });
-    
-    const agentActiveJobs = response.data.data.active || [];
-    const agentQueuedJobs = response.data.data.queued || [];
-    const isActiveOnAgent = [...agentActiveJobs, ...agentQueuedJobs].some(
+    // One agent round-trip per HOST per request, not per job — the callers
+    // sync every active job on every /active and /history request, and with
+    // 10+ concurrent jobs the duplicate agent calls made the panel crawl.
+    let listPromise;
+    if (agentActiveCache && agentActiveCache.has(host.id)) {
+      listPromise = agentActiveCache.get(host.id);
+    } else {
+      const client = agentService.createAgentClient(host.url, host.id, host.name);
+      listPromise = client.get('/api/backup/active', { timeout: 5000 }).then(r => r.data.data);
+      if (agentActiveCache) agentActiveCache.set(host.id, listPromise);
+    }
+    const agentData = await listPromise;
+
+    const agentActiveJobs = agentData.active || [];
+    const agentQueuedJobs = agentData.queued || [];
+    const isRunningOnAgent = agentActiveJobs.some(aj => aj.jobId === job.id);
+    const isActiveOnAgent = isRunningOnAgent || agentQueuedJobs.some(
       aj => aj.jobId === job.id
     );
-    
-    // If not active on agent, update status
+
+    // The agent is actually executing this job but we still show "queued"
+    // (e.g. the agent's running update was lost or hasn't arrived yet) —
+    // promote so the UI reflects reality immediately.
+    if (job.status === 'queued' && isRunningOnAgent) {
+      job.status = 'running';
+      await appendLog(job.id, 'Job promoted to running (verified with agent)');
+      return true;
+    }
+
+    // Not in the agent's active list. This does NOT prove success — the job
+    // may have finished (and the agent's terminal update reached us on a
+    // separate path), OR it may have failed / been killed / dropped off the
+    // list after an agent restart while the backup was still running. So we
+    // must NOT blindly mark it "completed" (that produced the false
+    // "completed, exit code -, no logs" records users could not trust).
+    //
+    // Ask the agent's live-status endpoint, which inspects the REAL on-host
+    // state (tmux sessions, live processes, lock + progress files):
+    //   running            → the backup is still going; leave the job alone.
+    //   failed/orphaned     → mark failed.
+    //   completed           → mark completed, exitCode 0 (trustworthy).
+    //   unknown (no record) → the agent finished & cleaned up; most likely a
+    //                         success we simply never got the exit code for.
+    //                         Mark completed but flag it UNVERIFIED so the UI
+    //                         can show that its success wasn't confirmed.
+    // This runs at most once per job (once terminal, this function returns
+    // early), so it doesn't add per-request agent load at steady state.
     if (!isActiveOnAgent) {
+      let live = null;
+      try {
+        const client = agentService.createAgentClient(host.url, host.id, host.name);
+        const r = await client.get(`/api/jobs/${job.id}/live-status`, { timeout: 5000 });
+        live = r.data?.data || null;
+      } catch (e) {
+        // Couldn't verify — leave the job as-is for the next pass rather than
+        // guessing. The periodic agentSyncService will also try.
+        return false;
+      }
+
+      if (live && live.status === 'running') {
+        if (job.status !== 'running') {
+          job.status = 'running';
+          if (live.phase) job.phase = live.phase;
+          await appendLog(job.id, 'Job still running (verified via live-status)');
+          return true;
+        }
+        return false;
+      }
+      if (live && live.status === 'failed') {
+        job.status = 'failed';
+        job.endTime = job.endTime || new Date().toISOString();
+        job.error = job.error || 'Backup orphaned: lock file present without active process';
+        job.failureReason = job.failureReason || 'orphaned';
+        job.verified = true;
+        job.finalizedBy = 'reconciler-livestatus';
+        await appendLog(job.id, 'Job marked failed (evidence-based via live-status: orphaned)');
+        return true;
+      }
+      if (live && live.status === 'completed') {
+        // Evidence-based: live-status saw the backup reach 100% with no
+        // orphaned lock. Trustworthy, but we still never captured the
+        // script's real exit code — do NOT fabricate exitCode 0, or an
+        // inferred completion would masquerade as an agent-confirmed one.
+        // `verified` reflects host-evidence; exitCode stays unknown ("-").
+        job.status = 'completed';
+        job.endTime = job.endTime || new Date().toISOString();
+        job.progress = 100;
+        job.verified = true;
+        job.finalizedBy = 'reconciler-livestatus';
+        delete job.unverified;
+        await appendLog(job.id, 'Job completed (evidence-based via live-status; exit code not captured)');
+        return true;
+      }
+
+      // Unknown / no agent record — infer completion but do NOT claim it's
+      // verified. exitCode stays null; the UI shows an "unverified" marker.
       job.status = 'completed';
       job.endTime = job.endTime || new Date().toISOString();
-      await appendLog(job.id, 'Job completed (verified with agent)');
+      job.unverified = true;
+      job.verified = false;
+      await appendLog(job.id, 'Job marked completed but UNVERIFIED (agent has no record; exit code unknown). Check the report to confirm the backup exists.');
       return true;
     }
   } catch (error) {
@@ -286,8 +373,9 @@ router.get('/active', async (req, res, next) => {
 
     if (activeJobs.length > 0) {
       const SYNC_BUDGET_MS = 6000;
+      const agentActiveCache = new Map(); // one agent call per host, shared by all jobs
       const results = await Promise.race([
-        Promise.allSettled(activeJobs.map(j => syncJobStatusWithAgent(j, hosts))),
+        Promise.allSettled(activeJobs.map(j => syncJobStatusWithAgent(j, hosts, agentActiveCache))),
         new Promise(resolve => setTimeout(() => resolve(null), SYNC_BUDGET_MS)),
       ]);
       if (Array.isArray(results)) {
@@ -336,8 +424,9 @@ router.get('/history', async (req, res, next) => {
 
     if (runningBackupJobs.length > 0) {
       const SYNC_BUDGET_MS = 6000;
+      const agentActiveCache = new Map(); // one agent call per host, shared by all jobs
       const results = await Promise.race([
-        Promise.allSettled(runningBackupJobs.map(j => syncJobStatusWithAgent(j, hosts))),
+        Promise.allSettled(runningBackupJobs.map(j => syncJobStatusWithAgent(j, hosts, agentActiveCache))),
         new Promise(resolve => setTimeout(() => resolve(null), SYNC_BUDGET_MS)),
       ]);
       if (Array.isArray(results)) {
@@ -461,24 +550,58 @@ router.get('/jobs/:id/logs', async (req, res, next) => {
       return res.json({ success: true, data: { logs } });
     }
 
-    // Fetch logs from agent
+    // Fetch logs from agent. Default to the last 2000 lines so a huge job
+    // log can't stall the panel; pass ?full=1 for the complete log.
+    const tail = req.query.full === '1' ? undefined : (Number(req.query.tail) > 0 ? Number(req.query.tail) : 2000);
+
+    // Resolve the storage pool path so the agent can fall back to the durable
+    // script log on the backup pool if the flat per-job log was lost.
+    let poolPath = null;
+    if (job.storagePoolId) {
+      try {
+        const { getStoragePools } = require('../services/fileStorage');
+        const pools = await getStoragePools();
+        const pool = pools.find(p => p.id === job.storagePoolId && p.backupHostId === host.id);
+        if (pool) poolPath = pool.path;
+      } catch (_) { /* best-effort */ }
+    }
+    const agentScheduleTypeForLog = (() => {
+      switch (job.scheduleType) {
+        case 'once': case 'monthly': case 'daily': case 'weekly': case 'custom': return job.scheduleType;
+        case 'interval': case 'cron': return 'daily';
+        case 'custom-days': return 'custom';
+        default: return job.scheduleType || null;
+      }
+    })();
+
     try {
       const client = agentService.createAgentClient(host.url, host.id, host.name);
       const response = await client.get(`/api/backup/logs/${req.params.id}`, {
-        timeout: 10000
+        timeout: 10000,
+        params: {
+          ...(tail ? { tail } : {}),
+          ...(job.vmName && poolPath && agentScheduleTypeForLog
+            ? { vmName: job.vmName, scheduleType: agentScheduleTypeForLog, storagePoolPath: poolPath }
+            : {}),
+        },
       });
-      
+
       res.json({ success: true, data: { logs: response.data.data.logs } });
     } catch (error) {
       console.error('Error fetching logs from agent:', error.message);
       
-      // If 404, the job is no longer on agent (completed/failed)
-      // Update job status if it's still showing as running
+      // A 404 only tells us the job is no longer active on the agent — NOT
+      // that it succeeded. Marking it a clean "completed" here is exactly
+      // what produced false "completed / exit -" records. Flag it UNVERIFIED
+      // so the UI shows its success was never confirmed; exit code stays "-".
       if (error.response?.status === 404 && (job.status === 'running' || job.status === 'queued')) {
         job.status = 'completed';
         job.endTime = job.endTime || new Date().toISOString();
+        job.unverified = true;
+        job.verified = false;
+        job.finalizedBy = 'reconciler-inferred';
         await saveBackupJobs(jobs);
-        await appendLog(req.params.id, 'Job completed (no longer active on agent)');
+        await appendLog(req.params.id, 'Job marked completed but UNVERIFIED (no longer active on agent; exit code unknown)');
       }
       
       // Fallback to controller logs
@@ -582,10 +705,27 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'Backup host is offline' });
     }
 
-    // Check concurrent backup limit
+    // A job for this VM is already tracked as running/queued — refuse before
+    // creating a duplicate record. (The agent-side lock check below catches
+    // locks the controller doesn't know about; this catches controller-side
+    // jobs before we even touch the agent.)
     const jobs = await getBackupJobs();
-    const runningJobsOnHost = jobs.filter(j => 
-      j.backupHostId === backupHostId && 
+    const existingVmJob = jobs.find(j =>
+      j.vmId === vmId &&
+      j.backupHostId === backupHostId &&
+      (j.status === 'running' || (j.status === 'queued' && !j.pendingStart))
+    );
+    if (existingVmJob) {
+      return res.status(409).json({
+        success: false,
+        error: `A backup for this VM is already ${existingVmJob.status} (job ${existingVmJob.id.substring(0, 8)}). Wait for it to finish or clear its state first.`,
+        existingJobId: existingVmJob.id,
+      });
+    }
+
+    // Check concurrent backup limit
+    const runningJobsOnHost = jobs.filter(j =>
+      j.backupHostId === backupHostId &&
       (j.status === 'running' || j.status === 'queued')
     );
     
@@ -737,17 +877,36 @@ router.post('/trigger', requireUser, async (req, res, next) => {
         verbose,
       });
 
-      // Update job status
-      job.status = 'running';
-      await saveBackupJobs(jobs);
+      // Update job status against FRESH store state. The agent may already
+      // have posted running/progress updates while the trigger call was in
+      // flight; saving our stale `jobs` array would silently roll them back
+      // and leave the job stuck on "queued" in the Active list.
+      const freshJobs = await getBackupJobs();
+      const freshJob = freshJobs.find(j => j.id === jobId);
+      if (freshJob && freshJob.status === 'queued') {
+        freshJob.status = 'running';
+        await saveBackupJobs(freshJobs);
+        job.status = 'running';
+        io.emit('job-updated', freshJob);
+      } else if (freshJob) {
+        job.status = freshJob.status;
+      }
 
     } catch (error) {
+      const freshJobs = await getBackupJobs();
+      let freshJob = freshJobs.find(j => j.id === jobId);
+      if (!freshJob) {
+        freshJob = job;
+        freshJobs.push(freshJob);
+      }
+      freshJob.status = 'failed';
+      freshJob.error = error.message;
+      freshJob.endTime = new Date().toISOString();
+      await saveBackupJobs(freshJobs);
       job.status = 'failed';
       job.error = error.message;
-      job.endTime = new Date().toISOString();
-      await saveBackupJobs(jobs);
       await appendLog(jobId, `Error triggering backup: ${error.message}`);
-      io.emit('backup-error', job);
+      io.emit('backup-error', freshJob);
     }
 
     res.status(202).json({ success: true, data: job });
@@ -876,7 +1035,7 @@ router.post('/trigger-scheduled', async (req, res, next) => {
 // POST /api/backups/jobs/:id/update - Update job status (called by agent)
 router.post('/jobs/:id/update', async (req, res, next) => {
   try {
-    const { status, exitCode, error, logLine, progress, progressText, failureReason, offsiteResults } = req.body;
+    const { status, exitCode, error, logLine, progress, progressText, failureReason, offsiteResults, progressType } = req.body;
     
     const jobs = await getBackupJobs();
     const job = jobs.find(j => j.id === req.params.id);
@@ -942,6 +1101,31 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     if (progress !== undefined) job.progress = progress;
     if (progressText !== undefined) job.progressText = progressText;
 
+    // Track the progress phase reported by the agent (backup vs rsync).
+    // phase='rsync' drives the purple "Syncing offsite" badge; the offsite
+    // sync status persists so History can show it after the job ends —
+    // including for failed backups whose offsite sync still ran.
+    if (progressType) {
+      job.progressType = progressType;
+      if (progressType === 'rsync') {
+        job.phase = 'rsync';
+        if (job.status === 'running' || job.status === 'queued') {
+          job.offsiteSyncStatus = 'running';
+        }
+      } else if (job.phase === 'rsync') {
+        job.phase = 'backup';
+      }
+    }
+
+    // Persist per-offsite-host outcomes (sent with the terminal update).
+    if (Array.isArray(offsiteResults) && offsiteResults.length > 0) {
+      job.offsiteResults = offsiteResults;
+      const ok = offsiteResults.filter(r => r.status === 'success').length;
+      job.offsiteSyncStatus = ok === offsiteResults.length
+        ? 'completed'
+        : ok > 0 ? 'partial' : 'failed';
+    }
+
     // Record the last time we heard from the agent about this job. Used by the
     // monitoring service to detect *inactivity* (a genuinely hung backup or
     // lost connectivity) instead of naively alerting on total runtime — a
@@ -949,9 +1133,16 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     job.lastProgressAt = new Date().toISOString();
     
     // Set end time for terminal states
-    if (status === 'completed' || status === 'cancelled' || 
+    if (status === 'completed' || status === 'cancelled' ||
         (status === 'failed' && job.status === 'failed')) { // Only set endTime if actually failed (not retrying)
       job.endTime = new Date().toISOString();
+      // This terminal status came straight from the agent's own exit-code
+      // detection — it is authoritative. Mark it verified so the UI can
+      // distinguish it from a completion inferred by the controller-side
+      // reconciler (which can't see the real exit code). A verified
+      // completion with exitCode 0 is a backup you can trust.
+      job.verified = true;
+      delete job.unverified;
       if (status === 'completed') {
         job.progress = 100;
         // Mark if this was a successful retry
@@ -960,6 +1151,12 @@ router.post('/jobs/:id/update', async (req, res, next) => {
           job.succeededOnAttempt = job.attemptNumber;
           console.log(`[Backups] Job ${job.id} completed successfully on retry attempt ${job.attemptNumber}`);
         }
+      }
+      // Terminal: no live phase remains; if the offsite sync was seen running
+      // but the agent sent no per-host outcomes, its result is unknown.
+      if (job.phase === 'rsync') job.phase = null;
+      if (job.offsiteSyncStatus === 'running' && !(Array.isArray(offsiteResults) && offsiteResults.length > 0)) {
+        job.offsiteSyncStatus = 'unknown';
       }
     }
 
@@ -1003,10 +1200,19 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     } else if (job.status === 'failed' || status === 'cancelled') {
       // Only emit backup-error if truly failed (not retrying)
       io.emit('backup-error', job);
-      
+
       // Notify RocketChat
       const retryInfo = job.retriesExhausted ? ' (all retries exhausted)' : '';
       rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', (job.error || 'Unknown error') + retryInfo);
+
+      // The offsite sync runs even when the backup fails (it replicates the
+      // VM's existing chain). Record its per-host outcomes on the schedule
+      // just like the success path does.
+      if (offsiteResults) {
+        ingestOffsiteSyncResults(job, offsiteResults).catch(err => {
+          console.error(`[Backups] Failed to ingest offsite sync results for job ${job.id}: ${err.message}`);
+        });
+      }
     } else if (job.status === 'retrying') {
       // Emit a special event for retrying status
       io.emit('backup-retrying', job);
@@ -1266,23 +1472,9 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       });
     }
 
-    // Don't push the host past its concurrent limit on a retry — the user
-    // would just get a fresh "skipped" job and a confusing UI loop. The
-    // releaseConcurrentSlotsOnHost flow will pick this VM up automatically
-    // as soon as a slot frees up.
-    const runningOnHost = jobs.filter(j =>
-      j.backupHostId === host.id && (j.status === 'running' || j.status === 'queued')
-    );
-    const rawMax = host.maxConcurrentBackups;
-    const maxConcurrent = (rawMax === undefined || rawMax === null) ? 20 : Number(rawMax);
-    if (maxConcurrent !== 0 && runningOnHost.length >= maxConcurrent) {
-      return res.status(429).json({
-        success: false,
-        error: `Backup host is at concurrent limit (${runningOnHost.length}/${maxConcurrent}). The retry will run automatically when a slot frees up.`,
-        currentRunning: runningOnHost.length,
-        maxAllowed: maxConcurrent,
-      });
-    }
+    // NOTE: the concurrency-slot check happens further down, inside
+    // _withHostLock, together with the job insert — checking here on a
+    // stale read let simultaneous retries all pass the limit at once.
 
     // Get VM and hypervisor info
     const vms = await getVirtualMachines();
@@ -1398,15 +1590,75 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       progressText: 'Queued (retry)...',
     };
 
-    jobs.push(retryJob);
-    await saveBackupJobs(jobs);
+    // Atomic slot decision + insert, serialized per host. Without the lock,
+    // several simultaneous retries all read "< limit active" before any of
+    // them writes its job, overrun the real limit, and the losers end up
+    // failed on the agent. Also dedupe per VM: if a job for this VM is
+    // already running/queued on this host, adopt it instead of colliding
+    // with the agent's per-VM lock (which would 409).
+    const io = req.app.get('io');
+    const slotResult = await schedulerService._withHostLock(host.id, async () => {
+      const freshJobs = await getBackupJobs();
+
+      const existing = freshJobs.find(j =>
+        j.vmId === originalJob.vmId &&
+        j.backupHostId === host.id &&
+        (j.status === 'running' || (j.status === 'queued' && !j.pendingStart))
+      );
+      if (existing) {
+        return { ok: false, existing };
+      }
+
+      const runningOnHost = schedulerService.countActiveJobsOnHost(freshJobs, host.id);
+      const rawMax = host.maxConcurrentBackups;
+      const maxConcurrent = (rawMax === undefined || rawMax === null) ? 20 : Number(rawMax);
+      if (maxConcurrent !== 0 && runningOnHost.length >= maxConcurrent) {
+        return { ok: false, running: runningOnHost.length, max: maxConcurrent };
+      }
+
+      // Retrying a FAILED job replaces it: drop the original record so the
+      // history isn't cluttered with the superseded failure. The new retry
+      // job carries retryOf for lineage. (Skipped jobs are handled by
+      // supersedeSkippedSiblings instead, which resolves the whole group.)
+      if (originalJob.status === 'failed') {
+        const oi = freshJobs.findIndex(j => j.id === originalJob.id);
+        if (oi !== -1) freshJobs.splice(oi, 1);
+      }
+
+      freshJobs.push(retryJob);
+      await saveBackupJobs(freshJobs);
+      return { ok: true, removedOriginal: originalJob.status === 'failed' };
+    });
+
+    if (!slotResult.ok && slotResult.existing) {
+      // A backup for this VM is already in flight — the skipped records are
+      // being satisfied by it. Resolve them and point the user at that job.
+      await schedulerService.supersedeSkippedSiblings(originalJob, slotResult.existing.id);
+      return res.status(202).json({
+        success: true,
+        adopted: true,
+        data: slotResult.existing,
+        message: `A backup for ${originalJob.vmName} is already in progress — retry not needed`,
+      });
+    }
+    if (!slotResult.ok) {
+      return res.status(429).json({
+        success: false,
+        error: `Backup host is at concurrent limit (${slotResult.running}/${slotResult.max}). The retry will run automatically when a slot frees up.`,
+        currentRunning: slotResult.running,
+        maxAllowed: slotResult.max,
+      });
+    }
+
+    // The original failed record was removed inside the lock — tell the UI.
+    if (slotResult.removedOriginal) {
+      io.emit('job-removed', { jobId: originalJob.id });
+    }
 
     await appendLog(newJobId, `Retry of job ${originalJob.id} (${originalJob.status})`);
     await appendLog(newJobId, `Original job: ${originalJob.vmName} - ${originalJob.error || 'No error message'}`);
     await appendLog(newJobId, `Storage pool: ${pool.name} (${pool.path})`);
 
-    // Get io from app
-    const io = req.app.get('io');
     io.emit('backup-started', retryJob);
 
     // Trigger backup on agent with the full payload
@@ -1437,18 +1689,57 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
           : {}),
       });
 
-      // Update job status
-      retryJob.status = 'running';
-      await saveBackupJobs(jobs);
+      // Update job status. Re-read the store first: the agent may already
+      // have posted running/progress updates for this job while we waited
+      // for the trigger call, and saving our stale `jobs` array would
+      // silently clobber them.
+      const freshJobs = await getBackupJobs();
+      const freshJob = freshJobs.find(j => j.id === newJobId);
+      if (freshJob && freshJob.status === 'queued') {
+        freshJob.status = 'running';
+        await saveBackupJobs(freshJobs);
+        retryJob.status = 'running';
+        io.emit('job-updated', freshJob);
+      } else if (freshJob) {
+        retryJob.status = freshJob.status;
+      }
+
+      // The retry is in flight — mark the original and every sibling
+      // skipped record for this VM + schedule as superseded so their
+      // Retry buttons disappear.
+      await schedulerService.supersedeSkippedSiblings(originalJob, newJobId);
 
     } catch (error) {
       const detail = error.response?.data?.error || error.message;
+
+      // 409 = the agent says a backup for this VM is already running.
+      // Adopt that job instead of recording a bogus failure.
+      if (error.response?.status === 409) {
+        const adoptedId = error.response?.data?.existingJobId || null;
+        await schedulerService._removeJob(newJobId);
+        await schedulerService.supersedeSkippedSiblings(originalJob, adoptedId || newJobId);
+        return res.status(202).json({
+          success: true,
+          adopted: true,
+          existingJobId: adoptedId,
+          message: `A backup for ${originalJob.vmName} is already in progress on the agent — retry not needed`,
+        });
+      }
+
+      const freshJobs = await getBackupJobs();
+      let freshJob = freshJobs.find(j => j.id === newJobId);
+      if (!freshJob) {
+        freshJob = retryJob;
+        freshJobs.push(freshJob);
+      }
+      freshJob.status = 'failed';
+      freshJob.error = `Retry trigger failed: ${detail}`;
+      freshJob.endTime = new Date().toISOString();
+      await saveBackupJobs(freshJobs);
       retryJob.status = 'failed';
-      retryJob.error = `Retry trigger failed: ${detail}`;
-      retryJob.endTime = new Date().toISOString();
-      await saveBackupJobs(jobs);
+      retryJob.error = freshJob.error;
       await appendLog(newJobId, `Error triggering retry: ${detail}`);
-      io.emit('backup-error', retryJob);
+      io.emit('backup-error', freshJob);
     }
 
     res.status(202).json({ 

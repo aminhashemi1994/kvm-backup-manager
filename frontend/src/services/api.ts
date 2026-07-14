@@ -238,6 +238,12 @@ export const cleanupBackupApi = {
   cleanupBackup: (data: any) => api.post('/cleanup-backup', data),
 }
 
+// Backup Status (stuck in-progress state)
+export const backupStatusApi = {
+  clearInProgress: (data: { vmId: string; scheduleType: string; storagePoolId?: string; schedulePath?: string }) =>
+    api.post('/backup-status/clear-in-progress', data),
+}
+
 // Backup Removal
 export const backupRemovalApi = {
   listVMs: (backupHostId: string) => api.get(`/backup-removal/${backupHostId}/vms`),

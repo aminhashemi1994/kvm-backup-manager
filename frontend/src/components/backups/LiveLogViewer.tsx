@@ -98,7 +98,42 @@ export default function LiveLogViewer({ jobId, jobType = 'backup', onClose }: Li
 
   const allLogs = staticLogs || ''
   const liveLogLines = liveLogs.map(l => `[${l.timestamp}] ${l.message}`).join('\n')
-  const combinedLogs = allLogs + (liveLogLines ? '\n' + liveLogLines : '')
+
+  // Collapse progress spam client-side too (old logs / controller fallback
+  // logs aren't server-collapsed): keep only the text after the last \r on
+  // each physical line — what a terminal would show — and drop consecutive
+  // duplicate lines. Progress bars then render as a single updating line
+  // instead of thousands of near-identical rows.
+  const combinedLogs = useMemo(() => {
+    const raw = allLogs + (liveLogLines ? '\n' + liveLogLines : '')
+    if (!raw) return ''
+    const lines = raw.split('\n').map(l => {
+      // Drop cursor-movement/erase and private-mode sequences (meaningless
+      // outside a terminal; ansi-to-html doesn't render them). Keep colors.
+      const clean = l
+        .replace(/\x1b\[\?[0-9;]*[a-zA-Z]/g, '')
+        .replace(/\x1b\[[0-9;]*[A-LST]/g, '')
+      // Strip trailing \r first — otherwise a line ending in \r collapses
+      // to an empty string and progress sections render as walls of blanks
+      const trimmed = clean.replace(/\r+$/, '')
+      const i = trimmed.lastIndexOf('\r')
+      return i === -1 ? trimmed : trimmed.slice(i + 1)
+    })
+    const out: string[] = []
+    let blankRun = 0
+    for (const l of lines) {
+      if (l.trim() === '') {
+        blankRun++
+        if (blankRun > 1) continue
+        out.push(l)
+        continue
+      }
+      blankRun = 0
+      if (out.length > 0 && out[out.length - 1] === l) continue
+      out.push(l)
+    }
+    return out.join('\n')
+  }, [allLogs, liveLogLines])
 
   // Convert ANSI codes to HTML
   const htmlLogs = useMemo(() => {
