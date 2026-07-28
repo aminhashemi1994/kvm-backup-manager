@@ -11,6 +11,7 @@ export interface StoragePool {
   usedGB: number
   availableGB: number
   usedPercentage: number
+  diskUsageThreshold: number
   isMountPoint: boolean
   status: 'online' | 'offline'
   lastChecked: string

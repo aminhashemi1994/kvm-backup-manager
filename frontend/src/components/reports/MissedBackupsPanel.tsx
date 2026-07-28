@@ -6,7 +6,7 @@ import { Badge } from '@/components/ui/badge'
 import { Select } from '@/components/ui/select'
 import {
   CalendarX, ChevronDown, ChevronRight, RefreshCw, CheckCircle,
-  AlertTriangle, PowerOff, XCircle, Clock,
+  AlertTriangle, Ban, PowerOff, XCircle, Clock,
 } from 'lucide-react'
 import { reportsApi } from '@/services/api'
 import { parseVmName } from '@/lib/utils'
@@ -31,6 +31,13 @@ const REASON_META: Record<string, { label: string; color: string; icon: React.Co
     label: 'Skipped',
     color: 'bg-yellow-100 text-yellow-800 border-yellow-200',
     icon: AlertTriangle,
+  },
+  // The run was declined because the VM was still backing up from an earlier
+  // run — nothing failed, so it must not read as a failure.
+  rejected: {
+    label: 'Rejected',
+    color: 'bg-amber-100 text-amber-800 border-amber-200',
+    icon: Ban,
   },
 }
 

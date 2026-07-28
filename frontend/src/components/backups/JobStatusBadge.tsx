@@ -1,5 +1,5 @@
 import { Badge } from '@/components/ui/badge'
-import { Upload, Download, RefreshCw, AlertTriangle, CheckCircle, Clock, Zap, ArrowRightLeft } from 'lucide-react'
+import { Upload, Download, RefreshCw, AlertTriangle, Ban, CheckCircle, Clock, Zap, ArrowRightLeft } from 'lucide-react'
 
 interface JobStatusBadgeProps {
   status: string
@@ -99,6 +99,15 @@ export default function JobStatusBadge({
           label: 'Skipped',
           icon: Clock,
           color: 'bg-orange-100 text-orange-800 border-orange-200',
+          pulse: false,
+        }
+      case 'rejected':
+        // Not a failure: the run was declined because the VM was already
+        // backing up. Amber, not red — nothing is wrong with the backup.
+        return {
+          label: 'Rejected',
+          icon: Ban,
+          color: 'bg-amber-100 text-amber-800 border-amber-200',
           pulse: false,
         }
       case 'queued':

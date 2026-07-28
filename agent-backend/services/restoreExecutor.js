@@ -13,6 +13,7 @@ class RestoreExecutor {
     this.config = null;
     this.activeJobs = new Map();
     this.activeProcesses = new Map();
+    this.recoveryCheckInterval = null;
   }
 
   setSocketIO(io) {
@@ -21,6 +22,110 @@ class RestoreExecutor {
 
   setConfig(config) {
     this.config = config;
+  }
+
+  /**
+   * Start recovery. Call after setSocketIO/setConfig.
+   *
+   * Re-checks periodically as well as at startup, because a job can fall out of
+   * tracking without a restart too (an error tearing the monitor down while tmux
+   * carries on). Mirrors backupExecutor's startup + 10s recovery.
+   */
+  initialize() {
+    this.recoverRunningJobs();
+    this.recoveryCheckInterval = setInterval(() => this.recoverRunningJobs(), 10000);
+    console.log('✓ Restore executor initialized (recovery active)');
+  }
+
+  shutdown() {
+    if (this.recoveryCheckInterval) {
+      clearInterval(this.recoveryCheckInterval);
+      this.recoveryCheckInterval = null;
+    }
+  }
+
+  /** True if the tmux session still exists. */
+  async isTmuxSessionAlive(tmuxSession) {
+    try {
+      await execAsync(`tmux has-session -t ${tmuxSession} 2>/dev/null`);
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * Re-adopt restores that outlived the previous agent process.
+   *
+   * A restore runs inside tmux on the hypervisor and keeps going across an agent
+   * restart, but activeJobs is in-memory only. Without this the agent forgets the
+   * job on restart: it reports no live status, sends no progress, and never sends
+   * a terminal update — so the controller is left with a job stuck on "running"
+   * for a restore that is actually healthy, or long since finished.
+   */
+  async recoverRunningJobs() {
+    const jobStatesDir = path.join(__dirname, '../data/restore_job_states');
+
+    let files;
+    try {
+      files = await fs.readdir(jobStatesDir);
+    } catch (error) {
+      if (error.code === 'ENOENT') return; // no restore has ever run
+      console.error('[Restore] Could not read job states for recovery:', error.message);
+      return;
+    }
+
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+
+      let job;
+      try {
+        job = JSON.parse(await fs.readFile(path.join(jobStatesDir, file), 'utf8'));
+      } catch (error) {
+        console.error(`[Restore] Skipping unreadable job state ${file}: ${error.message}`);
+        continue;
+      }
+
+      const restoreId = job.restoreId || file.replace(/\.json$/, '');
+
+      // Terminal records ARE the history (getHistory reads these same files).
+      // Nothing to re-adopt, and re-finalising them would double-report.
+      if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
+        continue;
+      }
+
+      // Already tracked: still running in this process, or adopted by an earlier pass.
+      if (this.activeJobs.has(restoreId)) continue;
+
+      if (!job.tmuxSession) {
+        console.warn(`[Restore] Job ${restoreId} has no tmux session recorded — cannot recover`);
+        continue;
+      }
+
+      const alive = await this.isTmuxSessionAlive(job.tmuxSession);
+
+      // Adopt either way, and let monitorRestore do the work: it resumes progress
+      // polling if the session is alive, and detects an already-ended session and
+      // finalises from the progress file if not. It reads activeJobs, so the job
+      // has to go in FIRST.
+      this.activeJobs.set(restoreId, job);
+      console.log(
+        alive
+          ? `[Restore] Re-adopting ${restoreId} — tmux session ${job.tmuxSession} still running`
+          : `[Restore] ${restoreId} outlived tmux session ${job.tmuxSession} — finalising from progress file`
+      );
+
+      this.monitorRestore(restoreId, job.tmuxSession, job);
+
+      // Tell the controller immediately, so the UI shows a live restore rather
+      // than a stale "running" it can't distinguish from a lost job.
+      if (alive) {
+        await this.updateController(
+          restoreId, 'running', null, job.progress || 0,
+          'Re-attached to running restore session'
+        );
+      }
+    }
   }
 
   /**

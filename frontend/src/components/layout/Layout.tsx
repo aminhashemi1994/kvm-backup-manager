@@ -62,6 +62,12 @@ export default function Layout({ children }: LayoutProps) {
     debouncedInvalidate(queryClient, ['backups'])
   })
 
+  // A run declined because the VM was already backing up — History has a new
+  // row and the live job gained a note, so refresh both.
+  useSocketEvent('backup-rejected', () => {
+    debouncedInvalidate(queryClient, ['backups'])
+  })
+
   useEffect(() => {
     // Socket is initialized in useSocket hook
   }, [])

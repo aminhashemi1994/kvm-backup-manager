@@ -1,13 +1,15 @@
 const {
   getBackupHosts,
   getBackupJobs,
-  saveBackupJobs,
+  getVirtualMachines,
   appendLog,
   getRestoreJobs,
   saveRestoreJobs,
 } = require('./fileStorage');
 const agentService = require('./agentService');
 const rocketChatService = require('./rocketChatService');
+const { adoptLiveTmuxSessions, canInsertAdoptedJob } = require('./liveSessionAdoption');
+const { snapshotJobs, commitJobChanges } = require('./jobReconcileCommit');
 
 // Use the unified, atomic helpers from fileStorage. The previous local
 // readRestoreJobs/writeRestoreJobs helpers used plain fs.writeFile, which
@@ -49,6 +51,32 @@ class AgentSyncService {
     const backupJobs = await getBackupJobs();
     const restoreJobs = await readRestoreJobs();
 
+    // Everything this method changes is committed as a field-level patch at the
+    // end (see jobReconcileCommit): the agent round-trips below take seconds,
+    // during which the agent itself posts progress updates for every running
+    // job. Writing this snapshot back would roll those updates back, and a
+    // concurrent writer landing after us would drop the sessions we adopt.
+    const before = snapshotJobs(backupJobs);
+
+    // First, make our records mirror the host's live tmux sessions — even with
+    // no browser tab open. This adopts/resurrects sessions the controller has no
+    // (or a finalized) record for, so a hung/long backup running on the host is
+    // never invisible until someone opens the panel.
+    let adopted = false;
+    try {
+      const vms = await getVirtualMachines();
+      adopted = await adoptLiveTmuxSessions(backupJobs, [host], vms);
+    } catch (e) {
+      console.warn(`[AgentSync] adopt live sessions failed for ${host.name}: ${e.message}`);
+    }
+
+    const commitBackupJobs = async () => {
+      const { changed } = await commitJobChanges(before, backupJobs, {
+        insertGuard: canInsertAdoptedJob,
+      });
+      return changed;
+    };
+
     const liveBackupJobs = backupJobs.filter(j =>
       j.backupHostId === host.id &&
       ['running', 'queued', 'initializing'].includes(j.status) &&
@@ -63,6 +91,7 @@ class AgentSyncService {
 
     const ids = [...liveBackupJobs.map(j => j.id), ...liveRestoreJobs.map(j => j.id)];
     if (ids.length === 0) {
+      if (adopted) await commitBackupJobs();
       return { synced: 0, finalized: 0, errors: 0 };
     }
 
@@ -70,6 +99,7 @@ class AgentSyncService {
     const result = await agentService.getJobsLiveStatusBatch(host.url, ids);
     if (!result.success || !Array.isArray(result.data)) {
       console.warn(`[AgentSync] Could not fetch live status from ${host.name}: ${result.error}`);
+      if (adopted) await commitBackupJobs();
       return { synced: 0, finalized: 0, errors: 1 };
     }
 
@@ -92,8 +122,8 @@ class AgentSyncService {
         console.error(`[AgentSync] Backup ${job.id} reconcile error:`, e.message);
       }
     }
-    if (synced > 0) {
-      await saveBackupJobs(backupJobs);
+    if (synced > 0 || adopted) {
+      await commitBackupJobs();
     }
 
     // Reconcile restore jobs
@@ -155,6 +185,10 @@ class AgentSyncService {
    */
   _applyLiveStatusToBackupJob(job, live) {
     let changed = false;
+    // True when the only thing we learned is "still can't verify it" — worth
+    // persisting, but not worth a log line or a socket event on every pass.
+    let bookkeepingOnly = false;
+    const nowIso = new Date().toISOString();
     const before = { status: job.status, phase: job.phase, progress: job.progress };
 
     // Update progress & phase regardless of terminal status — gives the user
@@ -179,6 +213,10 @@ class AgentSyncService {
         job.status = 'running';
         changed = true;
       }
+      if (job.unverifiedSince) {
+        delete job.unverifiedSince; // the agent knows it again
+        changed = true;
+      }
     } else if (live.status === 'failed' && live.phase === 'orphaned') {
       // Lock-file with no process — orphaned. Mark failed once.
       if (job.status !== 'failed') {
@@ -196,16 +234,45 @@ class AgentSyncService {
         changed = true;
       }
     } else if (live.status === 'unknown' && live.evidence && !live.evidence.jobStateFound) {
-      // Agent has no record of this job. It either finished long ago
-      // (state file deleted) or never started. Don't unilaterally fail
-      // here; the agent's startup recovery already handles cleanup. Just
-      // bookkeep that we tried to look it up.
-      job.lastSyncedAt = new Date().toISOString();
+      // The agent has no job-state, no recorded exit code, and no live tmux
+      // session for this id — it has never heard of this job. Still don't fail
+      // it on the first miss (an agent restart can briefly lose its state),
+      // but do NOT pretend it was confirmed either.
+      //
+      // `lastSyncedAt` means "the host confirmed this job is alive" and the
+      // stuck-job sweep trusts it. Stamping it here — on the one verdict that
+      // proves nothing — made a job the agent had never heard of immune to
+      // every sweep: it refreshed the timestamp every 2 minutes, so the job sat
+      // "running" for hours (holding a concurrency slot, writing a log line per
+      // pass) until someone happened to open the panel. Record the ATTEMPT
+      // separately, and finalize once it has been unverifiable for a while.
+      job.lastSyncAttemptAt = nowIso;
+      if (!job.unverifiedSince) job.unverifiedSince = nowIso;
       changed = true;
+
+      const unverifiedForMs = Date.now() - new Date(job.unverifiedSince).getTime();
+      if (unverifiedForMs > AgentSyncService.UNVERIFIABLE_GRACE_MS) {
+        const mins = Math.round(unverifiedForMs / 60000);
+        job.status = 'failed';
+        job.endTime = job.endTime || nowIso;
+        job.error = job.error ||
+          'Outcome could not be determined: the agent has no record of this job and no exit code was recorded. ' +
+          'It may have completed — check the report to confirm whether the backup exists.';
+        job.failureReason = job.failureReason || 'indeterminate';
+        job.verified = false;
+        job.unverified = true;
+        job.canRetry = true;
+        job.finalizedBy = 'agentsync-indeterminate';
+        try {
+          appendLog(job.id, `Job marked FAILED — the agent has had no record of it for ${mins} minutes (no job state, no exit code, no live session). Not assumed successful.`);
+        } catch {}
+      } else {
+        bookkeepingOnly = true;
+      }
     }
 
-    if (changed) {
-      job.lastSyncedAt = new Date().toISOString();
+    if (changed && !bookkeepingOnly) {
+      job.lastSyncedAt = nowIso;
       job.syncSource = 'agent-live-status';
       // Append a single concise log line so the trail explains the change.
       const summary = `liveSync status=${before.status}→${job.status} phase=${before.phase || '-'}→${job.phase || '-'} progress=${before.progress || 0}→${job.progress || 0}`;
@@ -247,6 +314,14 @@ class AgentSyncService {
     return changed;
   }
 }
+
+/**
+ * How long a job may stay completely unverifiable (agent has no job state, no
+ * exit code, no live session) before it is finalized as indeterminate. Long
+ * enough to ride out an agent restart, short enough that a job which never
+ * started cannot hold a concurrency slot all night.
+ */
+AgentSyncService.UNVERIFIABLE_GRACE_MS = 30 * 60 * 1000;
 
 const agentSyncService = new AgentSyncService();
 module.exports = agentSyncService;

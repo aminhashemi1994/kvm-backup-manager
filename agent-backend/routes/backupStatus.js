@@ -45,11 +45,13 @@ function sanitizeVmName(vmName) {
 async function checkTmuxSession(vmName, scheduleType) {
   const sanitizedVm = sanitizeVmName(vmName);
   const tmuxSessionPattern = `${sanitizedVm}_${scheduleType}_`;
-  
+
   try {
-    // List all tmux sessions
-    const result = await runCommand('tmux', ['list-sessions', '-F', '#{session_name}']);
-    
+    // List all tmux sessions, with their creation time — a session that was
+    // created seconds ago is a backup still setting up, which reads exactly
+    // like a long-dead one if you only look at the name.
+    const result = await runCommand('tmux', ['list-sessions', '-F', '#{session_name}|#{session_created}']);
+
     if (result.code !== 0) {
       // No tmux server running or no sessions
       return {
@@ -57,18 +59,22 @@ async function checkTmuxSession(vmName, scheduleType) {
         sessionName: null,
       };
     }
-    
+
     // Check if any session matches our pattern
-    const sessions = result.stdout.trim().split('\n').filter(s => s);
-    const matchingSession = sessions.find(s => s.startsWith(tmuxSessionPattern));
-    
-    if (matchingSession) {
+    const rows = result.stdout.trim().split('\n').filter(s => s);
+    const matching = rows.find(r => r.split('|')[0].startsWith(tmuxSessionPattern));
+
+    if (matching) {
+      const [name, createdEpoch] = matching.split('|');
+      const createdMs = /^\d+$/.test(createdEpoch || '') ? parseInt(createdEpoch, 10) * 1000 : null;
       return {
         exists: true,
-        sessionName: matchingSession,
+        sessionName: name,
+        createdAt: createdMs ? new Date(createdMs).toISOString() : null,
+        ageMs: createdMs ? Date.now() - createdMs : null,
       };
     }
-    
+
     return {
       exists: false,
       sessionName: null,
@@ -80,6 +86,30 @@ async function checkTmuxSession(vmName, scheduleType) {
       sessionName: null,
       error: error.message,
     };
+  }
+}
+
+/**
+ * Is a backup worker for this VM actually ALIVE right now?
+ *
+ * `Backup_Manager.sh --domain <vm>` is the parent script and stays alive for
+ * the whole run — including the offsite rsync stage, whose own command line
+ * carries the pool path rather than the VM name. So this one probe covers
+ * every phase of a healthy backup.
+ */
+async function checkLiveWorker(vmName) {
+  const escaped = String(vmName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  try {
+    const result = await runCommand('sh', [
+      '-c',
+      `pgrep -af "(virtnbdbackup|Backup_Manager.sh).*${escaped}" 2>/dev/null || true`,
+    ]);
+    const lines = (result.stdout || '').trim().split('\n').filter(Boolean);
+    return { alive: lines.length > 0, processes: lines.slice(0, 5) };
+  } catch (error) {
+    // Can't tell — assume alive rather than risk waving through a double start.
+    console.error('Error checking backup processes:', error.message);
+    return { alive: true, error: error.message };
   }
 }
 
@@ -116,6 +146,52 @@ function checkLockFile(vmName, scheduleType, storagePoolPath) {
       error: error.message,
     };
   }
+}
+
+/** A session younger than this is a backup still setting up. */
+const RECENT_SESSION_MS = 2 * 60 * 1000;
+/** The script rewrites its progress file every few seconds while it runs. */
+const FRESH_PROGRESS_MS = 5 * 60 * 1000;
+
+/**
+ * Decide whether a backup is genuinely IN PROGRESS, or whether the lock/session
+ * are just leftovers.
+ *
+ * This used to be `tmuxSession exists || lockFile exists` — pure artifact
+ * existence. Both artifacts outlive the run that made them: a killed script (or
+ * a host that lost power) leaves its lock behind, and a tmux session survives
+ * the death of the command it was running. So a VM with nothing running at all
+ * reported "Backup is running", the scheduled backup was refused, and the
+ * operator saw a failure for a backup that was never attempted — while a manual
+ * retry of the same job worked, because the retry path goes straight to the
+ * executor, which verifies liveness and clears the stale lock.
+ *
+ * Liveness needs real evidence: a live worker process, a progress file the
+ * script is still writing, or a session too young to have started up yet.
+ *
+ * @returns {{inProgress: boolean, stale: boolean, workerStatus: object, proof: string|null}}
+ */
+async function resolveInProgress({ vmName, tmuxStatus, lockStatus, progressStatus }) {
+  const hasArtifacts = tmuxStatus.exists || lockStatus.exists;
+  const workerStatus = hasArtifacts ? await checkLiveWorker(vmName) : { alive: false };
+
+  const sessionIsYoung = tmuxStatus.exists &&
+    typeof tmuxStatus.ageMs === 'number' && tmuxStatus.ageMs < RECENT_SESSION_MS;
+  const progressIsFresh = progressStatus.exists &&
+    typeof progressStatus.ageMs === 'number' && progressStatus.ageMs < FRESH_PROGRESS_MS;
+
+  const isAlive = workerStatus.alive || sessionIsYoung || progressIsFresh;
+  const proof = !isAlive ? null
+    : workerStatus.alive ? 'backup process alive'
+      : progressIsFresh ? `progress file updated ${Math.round((progressStatus.ageMs || 0) / 1000)}s ago`
+        : 'session just started';
+
+  return {
+    inProgress: hasArtifacts && isAlive,
+    stale: hasArtifacts && !isAlive,
+    workerStatus,
+    proof,
+  };
 }
 
 /**
@@ -168,11 +244,17 @@ function checkProgressFile(vmName, scheduleType, storagePoolPath) {
     
     const content = fs.readFileSync(progressFile, 'utf8').trim();
     const progress = JSON.parse(content);
-    
+    // The script rewrites this file every few seconds while it runs, so its
+    // mtime is the cheapest proof that a worker is still going — and the only
+    // one that survives a process name the pattern above can't match.
+    const stats = fs.statSync(progressFile);
+
     return {
       exists: true,
       path: progressFile,
       data: progress,
+      updatedAt: stats.mtime.toISOString(),
+      ageMs: Date.now() - stats.mtimeMs,
     };
   } catch (error) {
     return {
@@ -218,24 +300,56 @@ router.get('/', async (req, res, next) => {
     // Check progress file
     const progressStatus = checkProgressFile(vmName, scheduleType, storagePoolPath);
     
-    // Determine if backup is in progress
-    const inProgress = tmuxStatus.exists || lockStatus.exists;
-    
+    // Is a worker actually alive, or are these just leftovers?
+    //
+    // This used to answer "is a backup in progress?" with `tmuxSession exists
+    // || lockFile exists` — pure ARTIFACT existence. Both artifacts outlive the
+    // run that made them: a script that is killed (or whose host loses power)
+    // leaves its lock behind, and a tmux session survives the death of the
+    // command it was running. So a VM with nothing at all running reported
+    // "Backup is running", the controller refused to start the scheduled
+    // backup, and the operator saw a failure for a backup that was never
+    // attempted — while retrying it later worked, because the retry path goes
+    // straight to the executor, which DOES verify liveness and clears the
+    // stale lock.
+    //
+    // Liveness now needs real evidence: a live worker process, a progress file
+    // the script is still writing, or a session too young to have finished
+    // starting up. Artifacts with none of that are reported as `stale`, which
+    // lets the caller proceed — the executor's own per-VM lock remains the
+    // authority on whether a start is actually allowed.
+    const { inProgress, stale, workerStatus, proof } = await resolveInProgress({
+      vmName, tmuxStatus, lockStatus, progressStatus,
+    });
+    const hasArtifacts = tmuxStatus.exists || lockStatus.exists;
+
     // Generate status details
     let statusDetails = '';
     let statusSummary = '';
-    
+
     if (inProgress) {
       if (tmuxStatus.exists && lockStatus.exists) {
         statusSummary = 'running';
-        statusDetails = `Backup is running (tmux: ${tmuxStatus.sessionName}, lock: active)`;
+        statusDetails = `Backup is running (tmux: ${tmuxStatus.sessionName}, lock: active, ${proof})`;
       } else if (tmuxStatus.exists) {
         statusSummary = 'running';
-        statusDetails = `Backup is running (tmux session: ${tmuxStatus.sessionName})`;
-      } else if (lockStatus.exists) {
-        statusSummary = 'locked';
-        statusDetails = `Lock file exists (possible stale lock or starting up)`;
+        statusDetails = `Backup is running (tmux session: ${tmuxStatus.sessionName}, ${proof})`;
+      } else {
+        statusSummary = 'running';
+        statusDetails = `Backup is running (lock: active, ${proof})`;
       }
+    } else if (hasArtifacts) {
+      // Leftovers with nothing alive behind them. NOT in progress.
+      const leftovers = [
+        tmuxStatus.exists ? `tmux session ${tmuxStatus.sessionName}` : null,
+        lockStatus.exists ? 'lock file' : null,
+      ].filter(Boolean).join(' + ');
+      statusSummary = 'stale';
+      statusDetails =
+        `No backup is running for ${vmName}/${scheduleType}, but ${leftovers} was left behind ` +
+        `by an earlier run (no live process, progress file not being updated). ` +
+        `A new backup can start — the executor clears the stale lock.`;
+      console.warn(`[BackupStatus] Stale in-progress artifacts for ${vmName}/${scheduleType}: ${leftovers}`);
     } else {
       if (partialStatus.hasPartialFiles) {
         statusSummary = 'failed';
@@ -254,11 +368,15 @@ router.get('/', async (req, res, next) => {
       inProgress,
       status: statusSummary,
       details: statusDetails,
+      // Whether the artifacts have a live worker behind them. `stale: true`
+      // means the caller may proceed despite the lock/session.
+      stale,
       checks: {
         tmuxSession: tmuxStatus,
         lockFile: lockStatus,
         partialFiles: partialStatus,
         progress: progressStatus,
+        liveWorker: workerStatus,
       },
       timestamp: new Date().toISOString(),
     };
@@ -373,22 +491,21 @@ router.post('/bulk', async (req, res, next) => {
         const partialStatus = checkPartialFiles(vmName, scheduleType, storagePoolPath);
         const progressStatus = checkProgressFile(vmName, scheduleType, storagePoolPath);
 
-        const inProgress = tmuxStatus.exists || lockStatus.exists;
+        // Same liveness rule as the single check above — artifacts alone do
+        // not mean a backup is running (see the long comment there).
+        const { inProgress, stale } = await resolveInProgress({
+          vmName, tmuxStatus, lockStatus, progressStatus,
+        });
 
         let statusSummary = '';
         let statusDetails = '';
 
         if (inProgress) {
-          if (tmuxStatus.exists && lockStatus.exists) {
-            statusSummary = 'running';
-            statusDetails = `Backup is running`;
-          } else if (tmuxStatus.exists) {
-            statusSummary = 'running';
-            statusDetails = `Backup is running`;
-          } else if (lockStatus.exists) {
-            statusSummary = 'locked';
-            statusDetails = `Lock file exists`;
-          }
+          statusSummary = 'running';
+          statusDetails = `Backup is running`;
+        } else if (stale) {
+          statusSummary = 'stale';
+          statusDetails = 'Lock/session left behind by an earlier run — no live worker';
         } else {
           if (partialStatus.hasPartialFiles) {
             statusSummary = 'failed';

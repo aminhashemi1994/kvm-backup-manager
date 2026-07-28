@@ -102,7 +102,7 @@ _has_data() {
     [[ -d "$d" ]] || return 1
     local r
     # Only check root level, NOT current subdirectory (that's handled separately)
-    r=$(find "$d" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) -print -quit 2>/dev/null) || true
+    r=$(find "$d" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) ! -name "*.log" -print -quit 2>/dev/null) || true
     [[ -n "${r:-}" ]] && return 0
     return 1
 }
@@ -111,7 +111,7 @@ _find_data_dir() {
     local d="${1:-}"
     local r
     # Only check root level for legacy backups
-    r=$(find "$d" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) -print -quit 2>/dev/null) || true
+    r=$(find "$d" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) ! -name "*.log" -print -quit 2>/dev/null) || true
     [[ -n "${r:-}" ]] && { echo "$d"; return 0; }
     echo "$d"
     return 1
@@ -155,7 +155,7 @@ _infer_methods() {
         [[ "$bn" == *.full.* ]] && hf="y"
         [[ "$bn" == *.inc.*  ]] && hi="y"
         [[ "$bn" == *.copy.* ]] && hc="y"
-    done < <(find "$dir" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) -print0 2>/dev/null)
+    done < <(find "$dir" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) ! -name "*.log" -print0 2>/dev/null)
     local out='['
     local first="y"
     [[ "$hf" == "y" ]] && { [[ "$first" == "n" ]] && out+=','; out+='"full"'; first="n"; }
@@ -794,7 +794,7 @@ _proc_current() {
     fi
 
     local hc
-    hc=$(find "$current_dir" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) -print -quit 2>/dev/null) || hc=""
+    hc=$(find "$current_dir" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) ! -name "*.log" -print -quit 2>/dev/null) || hc=""
     if [[ -z "${hc:-}" ]]; then
         _write_absent "$outf" "daily" "current_directory_empty"
         return
@@ -896,7 +896,7 @@ _proc_vm() {
     # Check for "current" directory (legacy-daily backup)
     if [[ -d "$vmdir/current" ]]; then
         local current_has_data
-        current_has_data=$(find "$vmdir/current" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) -print -quit 2>/dev/null) || current_has_data=""
+        current_has_data=$(find "$vmdir/current" -maxdepth 1 -type f \( -name "*.data" -o -name "*.full.*" -o -name "*.inc.*" -o -name "*.copy.*" \) ! -name "*.log" -print -quit 2>/dev/null) || current_has_data=""
         if [[ -n "${current_has_data:-}" ]]; then
             _proc_current "$vmdir" "$edir/$(printf '%05d' $idx).json"
             idx=$((idx + 1))

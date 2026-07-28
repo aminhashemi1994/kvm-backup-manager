@@ -49,4 +49,38 @@ function sanitizeLog(content, tailLines = null) {
   return lines.join('\n');
 }
 
-module.exports = { sanitizeLog };
+/**
+ * Strip terminal escape sequences from a string headed for a plain-text
+ * surface — an error message on a job record, a notification body.
+ *
+ * Deliberately different from sanitizeLog above, which KEEPS colour codes
+ * because the log viewer renders them. Here the codes must go entirely, or a
+ * failure line scraped out of the script log surfaces in the UI and RocketChat
+ * as "[0;31m✗ Backup FAILED[0m".
+ *
+ * Mirrors controller-backend/utils/stripAnsi.js — the two services deploy
+ * separately and share no package, so keep them in step.
+ */
+const CSI = /\x1b\[[0-?]*[ -/]*[@-~]/g;            // ESC [ … final  (colours, cursor, private modes)
+const OSC = /\x1b\][\s\S]*?(?:\x07|\x1b\\)/g;      // ESC ] … BEL|ST (window titles)
+const SIMPLE_ESC = /\x1b[@-Z\\-_]?/g;              // two-char escapes + stray ESC
+const ORPHAN_COLOR = /\[[0-9]{1,3}(?:;[0-9]{1,3})*m/g; // "[0;31m" whose ESC was already lost
+const CONTROL = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;   // control chars except \t and \n
+
+function stripAnsi(input, opts = {}) {
+  if (typeof input !== 'string') return input;
+
+  let out = input
+    .replace(OSC, '')
+    .replace(CSI, '')
+    .replace(SIMPLE_ESC, '')
+    .replace(ORPHAN_COLOR, '')
+    .replace(/\r/g, '')
+    .replace(CONTROL, '');
+
+  if (opts.singleLine) out = out.replace(/\s+/g, ' ');
+
+  return out.trim();
+}
+
+module.exports = { sanitizeLog, stripAnsi };

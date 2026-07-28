@@ -113,6 +113,9 @@ export function getStatusColor(status: string): string {
       return 'text-purple-600 bg-purple-100'
     case 'skipped':
       return 'text-orange-600 bg-orange-100'
+    // Declined because the VM was already backing up — not a failure.
+    case 'rejected':
+      return 'text-amber-700 bg-amber-100'
     case 'pending':
     case 'warning':
       return 'text-yellow-600 bg-yellow-100'

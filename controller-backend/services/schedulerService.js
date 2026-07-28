@@ -6,6 +6,7 @@ const {
   getVirtualMachines,
   getBackupJobs,
   saveBackupJobs,
+  updateBackupJobs,
   getStoragePools,
   getOffsiteHosts,
   appendLog 
@@ -73,6 +74,7 @@ class SchedulerService {
           offsitePoolId: pool.id,
           ip: host.ip,
           path: pool.path || '',
+          diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         });
       }
     } else {
@@ -93,8 +95,16 @@ class SchedulerService {
     }
 
     // Encode for the agent as shell-safe "ip:path" (colon delimiter, Req 9.1);
-    // path-less entries encode as just "ip" (legacy fallback, Req 9.2).
-    const encoded = resolved.map(r => (r.path ? `${r.ip}:${r.path}` : r.ip));
+    // path-less entries encode as just "ip" (legacy fallback, Req 9.2). When a
+    // per-pool disk-usage threshold is known, a third colon field carries it —
+    // "ip:path:threshold" — so Backup_Manager.sh can enforce the pool's own
+    // limit on the remote destination (paths are absolute and contain no colon,
+    // so the third field is unambiguous).
+    const encoded = resolved.map(r => {
+      if (!r.path) return r.ip;
+      const base = `${r.ip}:${r.path}`;
+      return r.diskUsageThreshold != null ? `${base}:${r.diskUsageThreshold}` : base;
+    });
 
     return { resolved, encoded };
   }
@@ -668,6 +678,7 @@ class SchedulerService {
         scheduleType: agentScheduleType,
         storagePoolId: pool.id,
         storagePoolPath: pool.path,
+        diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
         compression: schedule.compression || 2,
@@ -862,6 +873,7 @@ class SchedulerService {
         scheduleType: agentScheduleType,
         storagePoolId: pool.id,
         storagePoolPath: pool.path,
+        diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
         compression: schedule.compression || 2,
@@ -869,6 +881,9 @@ class SchedulerService {
         noVerify: schedule.noVerify || false,
         offsiteHosts: encoded,
         verbose: schedule.verbose || false,
+        // This drains records queued earlier, which may include retries. Carry
+        // their retry flag through so they still get the pre-backup cleanup.
+        isRetry: !!(job.isRetry || job.retryOf),
         ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
           : {}),
@@ -971,6 +986,7 @@ class SchedulerService {
         scheduleType: agentScheduleType,
         storagePoolId: pool.id,
         storagePoolPath: pool.path,
+        diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
         compression: schedule.compression || 2,
@@ -978,6 +994,9 @@ class SchedulerService {
         noVerify: schedule.noVerify || false,
         offsiteHosts: encoded,
         verbose: schedule.verbose || false,
+        // Retry path: clean up partial files left by the attempt this record
+        // stands in for before starting fresh.
+        isRetry: true,
         ...(schedule.scheduleType === 'daily' || schedule.scheduleType === 'interval' || schedule.scheduleType === 'cron' || schedule.scheduleType === 'weekly'
           ? { vmId: vm.id, incrementalCount: schedule.incrementalCount }
           : {}),
@@ -1076,13 +1095,61 @@ class SchedulerService {
     return job;
   }
 
+  /**
+   * A scheduled run that was refused because the VM is already backing up.
+   *
+   * `rejected` is deliberately its own terminal status, not `failed`: nothing
+   * went wrong and nothing was attempted — the agent's per-VM lock simply
+   * declined a second concurrent run. `coveredBy` names the backup that WAS
+   * running, so the UI (and the log viewer) can send the operator to it.
+   */
+  _buildRejectedJob({ jobId, schedule, vm, hypervisor, host, method, coveredBy, reason, replayMeta }) {
+    const now = new Date().toISOString();
+    return {
+      id: jobId,
+      scheduleId: schedule.id,
+      vmId: vm.id,
+      vmName: vm.name,
+      hypervisorIp: hypervisor.ip,
+      backupHostId: host.id,
+      backupHostName: host.name,
+      scheduleType: schedule.scheduleType,
+      method,
+      status: 'rejected',
+      rejectedReason: 'already_running',
+      failureReason: 'already_running',
+      error: reason,
+      startTime: now,
+      endTime: now,
+      exitCode: null,
+      progress: 0,
+      scheduled: true,
+      canRetry: true,
+      coveredBy: coveredBy || null,
+      ...(replayMeta ? {
+        replay: true,
+        originallyScheduledAt: replayMeta.scheduledAt
+          ? new Date(replayMeta.scheduledAt).toISOString()
+          : null,
+        replayReason: replayMeta.reason || 'replay',
+        actor: replayMeta.actor || 'system:replay',
+        triggeredBy: replayMeta.triggeredBy || 'system',
+      } : {
+        actor: 'system:scheduler',
+        triggeredBy: 'system',
+      }),
+    };
+  }
+
   /** Patch a job by id against fresh store state (avoids stale-array clobber). */
   async _patchJobFresh(jobId, patch) {
-    const jobs = await getBackupJobs();
-    const job = jobs.find(j => j.id === jobId);
+    let job = null;
+    await updateBackupJobs((jobs) => {
+      job = jobs.find(j => j.id === jobId);
+      if (!job) return false;
+      Object.assign(job, patch);
+    });
     if (!job) return null;
-    Object.assign(job, patch);
-    await saveBackupJobs(jobs);
     if (this.io) this.io.emit('job-updated', job);
     return job;
   }
@@ -1283,9 +1350,7 @@ class SchedulerService {
           canRetry: true,
         };
 
-        const jobs = await getBackupJobs();
-        jobs.push(skippedJob);
-        await saveBackupJobs(jobs);
+        await updateBackupJobs((jobs) => { jobs.push(skippedJob); });
         
         await appendLog(jobId, `Backup skipped: ${skippedJob.error}`);
         
@@ -1310,22 +1375,86 @@ class SchedulerService {
 
       let job = null;
       let didQueue = false;
+      let rejected = null;
+      let rejectedBecauseOf = null;
+      let queuedNote = '';
+      let queuedJob = null;
       await this._withHostLock(host.id, async () => {
-        const jobs = await getBackupJobs();
-        const runningJobsOnHost = this.countActiveJobsOnHost(jobs, host.id);
+        // One atomic read-modify-write: the decision and the record it creates
+        // must land together, or a concurrent writer can drop the record and
+        // leave the schedule looking like it never fired (which then triggers a
+        // spurious catch-up replay for an occurrence that DID run).
+        await updateBackupJobs((jobs) => {
+          // The agent keeps ONE lock per VM (backupExecutor.vmLocks), so a second
+          // backup for a VM that is already backing up is refused no matter which
+          // schedule asked for it. Decide that HERE, before we hand the agent a
+          // job it can only reject: the old order created the record first and
+          // only discovered the collision from the agent afterwards, which left a
+          // red "failed — Backup already in progress" row for a VM that was in
+          // fact backing up perfectly well.
+          const inFlight = jobs.find(j =>
+            j.vmId === vm.id && SchedulerService.ACTIVE_STATUSES.includes(j.status)
+          );
+          if (inFlight) {
+            rejectedBecauseOf = inFlight;
+            rejected = this._buildRejectedJob({
+              jobId, schedule, vm, hypervisor, host, method,
+              coveredBy: inFlight.id,
+              reason: `A backup for ${vm.name} is already ${inFlight.status} (job ${inFlight.id}); this scheduled run was not started`,
+              replayMeta,
+            });
+            jobs.push(rejected);
+            return;
+          }
 
-        const rawMax = host.maxConcurrentBackups;
-        const maxConcurrent = (rawMax === undefined || rawMax === null) ? 20 : Number(rawMax);
-        const unlimited = maxConcurrent === 0;
+          const runningJobsOnHost = this.countActiveJobsOnHost(jobs, host.id);
 
-        if (!unlimited && runningJobsOnHost.length >= maxConcurrent) {
-          console.log(`Concurrent limit (${maxConcurrent}) reached for ${host.name}; queueing backup for ${vm.name}`);
+          const rawMax = host.maxConcurrentBackups;
+          const maxConcurrent = (rawMax === undefined || rawMax === null) ? 20 : Number(rawMax);
+          const unlimited = maxConcurrent === 0;
 
-          // Create a real QUEUED job (waiting for a free slot). It is NOT sent
-          // to the agent yet and does NOT occupy a concurrency slot
-          // (pendingStart). The drainer promotes it to running in place as
-          // soon as a slot frees up.
-          const queuedJob = {
+          if (!unlimited && runningJobsOnHost.length >= maxConcurrent) {
+            console.log(`Concurrent limit (${maxConcurrent}) reached for ${host.name}; queueing backup for ${vm.name}`);
+
+            // Create a real QUEUED job (waiting for a free slot). It is NOT sent
+            // to the agent yet and does NOT occupy a concurrency slot
+            // (pendingStart). The drainer promotes it to running in place as
+            // soon as a slot frees up.
+            queuedJob = {
+              id: jobId,
+              scheduleId: schedule.id,
+              vmId: vm.id,
+              vmName: vm.name,
+              hypervisorIp: hypervisor.ip,
+              backupHostId: host.id,
+              backupHostName: host.name,
+              method,
+              noCompression: schedule.noCompression || false,
+              noVerify: schedule.noVerify || false,
+              status: 'queued',
+              pendingStart: true,
+              queuedReason: 'concurrent_limit',
+              startTime: new Date().toISOString(),
+              endTime: null,
+              exitCode: null,
+              error: null,
+              progress: 0,
+              progressText: `Queued — waiting for a free slot (limit ${maxConcurrent})`,
+              scheduled: true,
+              canRetry: true,
+              offsiteTargets: resolved,
+              ...(replayMeta ? { replay: true, originallyScheduledAt: replayMeta.scheduledAt, replayReason: replayMeta.reason } : {}),
+            };
+
+            jobs.push(queuedJob);
+            didQueue = true;
+            queuedNote = `Backup queued: concurrent limit ${maxConcurrent} reached (currently ${runningJobsOnHost.length} active). Will start automatically when a slot frees.`;
+            return;
+          }
+
+          // Slot available — create the running job and persist it INSIDE the
+          // lock so sibling fires immediately count it against the limit.
+          job = {
             id: jobId,
             scheduleId: schedule.id,
             vmId: vm.id,
@@ -1336,68 +1465,54 @@ class SchedulerService {
             method,
             noCompression: schedule.noCompression || false,
             noVerify: schedule.noVerify || false,
-            status: 'queued',
-            pendingStart: true,
-            queuedReason: 'concurrent_limit',
+            status: 'running',
             startTime: new Date().toISOString(),
             endTime: null,
             exitCode: null,
             error: null,
-            progress: 0,
-            progressText: `Queued — waiting for a free slot (limit ${maxConcurrent})`,
             scheduled: true,
-            canRetry: true,
             offsiteTargets: resolved,
-            ...(replayMeta ? { replay: true, originallyScheduledAt: replayMeta.scheduledAt, replayReason: replayMeta.reason } : {}),
+            attemptNumber: replayMeta && replayMeta.attemptNumber ? replayMeta.attemptNumber : 1,
+            maxAttempts: (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3) + 1,
+            retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
+            ...(replayMeta ? {
+              replay: true,
+              originallyScheduledAt: replayMeta.scheduledAt
+                ? new Date(replayMeta.scheduledAt).toISOString()
+                : null,
+              replayReason: replayMeta.reason || 'replay',
+              actor: replayMeta.actor || 'system:replay',
+              triggeredBy: replayMeta.triggeredBy || 'system',
+            } : {
+              actor: 'system:scheduler',
+              triggeredBy: 'system',
+            }),
           };
+          jobs.push(job);
+        });
 
-          jobs.push(queuedJob);
-          await saveBackupJobs(jobs);
-          await appendLog(jobId, `Backup queued: concurrent limit ${maxConcurrent} reached (currently ${runningJobsOnHost.length} active). Will start automatically when a slot frees.`);
+        if (didQueue) {
+          await appendLog(jobId, queuedNote);
           if (this.io) this.io.emit('backup-queued', queuedJob);
-          didQueue = true;
-          return;
         }
-
-        // Slot available — create the running job and persist it INSIDE the
-        // lock so sibling fires immediately count it against the limit.
-        job = {
-          id: jobId,
-          scheduleId: schedule.id,
-          vmId: vm.id,
-          vmName: vm.name,
-          hypervisorIp: hypervisor.ip,
-          backupHostId: host.id,
-          backupHostName: host.name,
-          method,
-          noCompression: schedule.noCompression || false,
-          noVerify: schedule.noVerify || false,
-          status: 'running',
-          startTime: new Date().toISOString(),
-          endTime: null,
-          exitCode: null,
-          error: null,
-          scheduled: true,
-          offsiteTargets: resolved,
-          attemptNumber: replayMeta && replayMeta.attemptNumber ? replayMeta.attemptNumber : 1,
-          maxAttempts: (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3) + 1,
-          retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
-          ...(replayMeta ? {
-            replay: true,
-            originallyScheduledAt: replayMeta.scheduledAt
-              ? new Date(replayMeta.scheduledAt).toISOString()
-              : null,
-            replayReason: replayMeta.reason || 'replay',
-            actor: replayMeta.actor || 'system:replay',
-            triggeredBy: replayMeta.triggeredBy || 'system',
-          } : {
-            actor: 'system:scheduler',
-            triggeredBy: 'system',
-          }),
-        };
-        jobs.push(job);
-        await saveBackupJobs(jobs);
       });
+
+      // Refused because the VM is already backing up. This is NOT a failure —
+      // nothing was attempted and nothing is wrong with the backup that IS
+      // running, so it is recorded as `rejected` and points at that run.
+      if (rejected) {
+        console.log(`[Scheduler] Rejected scheduled backup for ${vm.name}: already ${rejectedBecauseOf.status} (job ${rejectedBecauseOf.id})`);
+        await appendLog(jobId, `Scheduled run rejected: ${rejected.error}`);
+        await appendLog(jobId, `Logs for the backup that is running: job ${rejectedBecauseOf.id}`);
+        try {
+          await appendLog(
+            rejectedBecauseOf.id,
+            `A scheduled run for ${vm.name} (${schedule.scheduleType}) was rejected at ${new Date().toISOString()} because this backup is still ${rejectedBecauseOf.status}`
+          );
+        } catch (_) { /* best-effort */ }
+        if (this.io) this.io.emit('backup-rejected', rejected);
+        return;
+      }
 
       // Queued for later — a freed slot will promote it. Try an immediate
       // drain in case a slot opened up since we counted.
@@ -1480,6 +1595,7 @@ class SchedulerService {
         scheduleType: agentScheduleType,
         storagePoolId: pool.id,
         storagePoolPath: pool.path,
+        diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
         compression: schedule.compression || 2,
@@ -1503,28 +1619,72 @@ class SchedulerService {
         );
 
         if (statusCheck.inProgress) {
-          console.error(`[Scheduler] Backup already in progress for ${vm.name}/${agentScheduleType}: ${statusCheck.details}`);
-          
-          // Mark job as failed
-          const jobs = await getBackupJobs();
-          const job = jobs.find(j => j.id === jobId);
-          if (job) {
-            job.status = 'failed';
-            job.error = `Backup already in progress: ${statusCheck.details}`;
-            job.endTime = new Date().toISOString();
-            job.failureReason = 'already_running';
-            await saveBackupJobs(jobs);
+          console.log(`[Scheduler] Backup already in progress on ${host.name} for ${vm.name}/${agentScheduleType}: ${statusCheck.details}`);
+
+          // The HOST says this VM is mid-backup, but the controller had no
+          // active record for it (the guard above would have caught that) — so
+          // the live run is one we are not tracking yet. Adopt it NOW, before
+          // deciding anything: the operator's question is "what is this backup
+          // doing?", and only the adopted record can answer it (it carries the
+          // tmux session and the pool whose script log holds the output).
+          let liveJob = null;
+          try {
+            await require('./liveSessionMirrorService').runOnce();
+            const fresh = await getBackupJobs();
+            liveJob = fresh.find(j =>
+              j.vmId === vm.id &&
+              SchedulerService.ACTIVE_STATUSES.includes(j.status) &&
+              j.id !== jobId
+            ) || null;
+          } catch (e) {
+            console.warn(`[Scheduler] Could not adopt the live session for ${vm.name}: ${e.message}`);
           }
-          
-          await appendLog(jobId, `ERROR: Backup already in progress`);
-          await appendLog(jobId, `Status: ${statusCheck.status}`);
-          await appendLog(jobId, `Details: ${statusCheck.details}`);
-          
+
+          // Nothing failed here: the backup this run collided with is healthy,
+          // and this run was never attempted. Record it as REJECTED pointing at
+          // the live run, so History shows the truth instead of a red failure.
+          const reason = `Another backup is in progress for ${vm.name}: ${statusCheck.details}`;
+          const rejectedJob = await this._patchJobFresh(jobId, {
+            status: 'rejected',
+            rejectedReason: 'already_running',
+            failureReason: 'already_running',
+            error: reason,
+            endTime: new Date().toISOString(),
+            progress: 0,
+            progressText: null,
+            canRetry: true,
+            ...(liveJob ? { coveredBy: liveJob.id } : {}),
+            ...(statusCheck.checks?.tmuxSession?.sessionName
+              ? { collidedWithSession: statusCheck.checks.tmuxSession.sessionName }
+              : {}),
+          });
+
+          await appendLog(jobId, `Rejected: ${reason}`);
+          await appendLog(jobId, `Status on host: ${statusCheck.status}`);
+          if (liveJob) {
+            await appendLog(jobId, `The running backup is tracked as job ${liveJob.id} — its logs are shown here.`);
+            try {
+              await appendLog(
+                liveJob.id,
+                `A scheduled run for ${vm.name} (${schedule.scheduleType}) was rejected at ${new Date().toISOString()} because this backup is still running`
+              );
+            } catch (_) { /* best-effort */ }
+          }
+
           if (this.io) {
-            this.io.emit('backup-error', job);
+            this.io.emit('backup-rejected', rejectedJob || { id: jobId, status: 'rejected', vmName: vm.name });
           }
-          
+
           return; // Don't trigger backup
+        }
+
+        if (statusCheck.stale) {
+          // The host found a lock/session with no live worker behind it. That
+          // is debris from an earlier run, not a backup — record it on the job
+          // so the trail explains why we started anyway (the executor clears
+          // the stale lock as it starts).
+          console.warn(`[Scheduler] Stale in-progress artifacts for ${vm.name}/${agentScheduleType}: ${statusCheck.details}`);
+          await appendLog(jobId, `Note: ${statusCheck.details}`);
         }
 
         console.log(`[Scheduler] ✓ No backup in progress, proceeding with scheduled backup`);
@@ -1653,9 +1813,7 @@ class SchedulerService {
           canRetry: true,
         };
 
-        const jobs = await getBackupJobs();
-        jobs.push(skippedJob);
-        await saveBackupJobs(jobs);
+        await updateBackupJobs((jobs) => { jobs.push(skippedJob); });
         
         await appendLog(jobId, `Backup skipped: ${skippedJob.error}`);
         
@@ -1733,6 +1891,7 @@ class SchedulerService {
       }
       backupData.storagePoolId = pool.id;
       backupData.storagePoolPath = pool.path;
+      backupData.diskUsageThreshold = pool.diskUsageThreshold ?? 80;
       backupData.retention = schedule.retention || schedule.retentionCount || 7;
       backupData.keepArchive = schedule.keepArchive || 2;
       backupData.compression = schedule.compression || 2;
@@ -1896,6 +2055,12 @@ class SchedulerService {
 
 // ── Concurrency reconciler tuning ────────────────────────────────────────────
 // How often the periodic reconcile + queue drain runs.
+/**
+ * Statuses that mean "this VM currently has a run in flight". The agent's lock
+ * is per VM, so any of these blocks a new run for the same VM.
+ */
+SchedulerService.ACTIVE_STATUSES = ['running', 'queued', 'initializing', 'retrying'];
+
 SchedulerService.QUEUE_RECONCILE_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 // Running/queued jobs older than this no longer occupy a concurrency slot
 // (treated as dead/superseded so phantom jobs can't starve the scheduler).

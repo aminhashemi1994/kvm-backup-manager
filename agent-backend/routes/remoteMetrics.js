@@ -26,8 +26,12 @@ router.post('/hypervisor', async (req, res, next) => {
 
     const { stdout, stderr } = await execAsync(diskCommand, { timeout: 15000 });
     
-    if (stderr && stderr.trim()) {
-      console.warn(`[RemoteMetrics] SSH stderr for ${ip}:`, stderr);
+    // Many hosts print a login/legal banner on stderr for every SSH session.
+    // That is not an error, and logging it on each metrics poll floods the
+    // error log. Only warn when stderr carries something beyond a banner
+    // (i.e. the command actually failed to produce disk output).
+    if (stderr && stderr.trim() && (!stdout || !stdout.trim())) {
+      console.warn(`[RemoteMetrics] SSH stderr for ${ip}:`, stderr.trim());
     }
 
     const lines = stdout.trim().split('\n');

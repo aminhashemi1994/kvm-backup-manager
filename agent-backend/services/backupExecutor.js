@@ -4,7 +4,7 @@ const fs = require('fs');
 const axios = require('axios');
 const controllerAuthService = require('./controllerAuthService');
 const concurrencyConfigSyncService = require('./concurrencyConfigSyncService');
-const { sanitizeLog } = require('../utils/logSanitizer');
+const { sanitizeLog, stripAnsi } = require('../utils/logSanitizer');
 
 class BackupExecutor {
   constructor() {
@@ -22,6 +22,46 @@ class BackupExecutor {
     this.jobStateDir = null;
     this.recoveryCheckInterval = null;
     this._concurrencyUnsubscribe = null;
+
+    // Start mutex: serializes the STARTUP of backups (the fork/exec-heavy tmux
+    // setup + process spawn) even when concurrency is unlimited and N schedules
+    // fire in the same instant. Backups still run fully in parallel once
+    // started — only their launch is staggered, which removes the thundering
+    // herd (fork/exec spikes, tmux-server contention) and closes the same-VM
+    // start race window. It self-paces: the next start begins a small gap after
+    // the previous one's setup finishes, so 2 backups cost ~1-2s, not 5s each.
+    this._startMutex = Promise.resolve();
+    // Gap between consecutive startups. Overridable via env; capped so a
+    // misconfiguration can't stall a large burst for minutes.
+    const rawGap = parseInt(process.env.BACKUP_START_GAP_MS || '', 10);
+    this._startGapMs = Number.isFinite(rawGap)
+      ? Math.min(Math.max(rawGap, 0), 5000)
+      : 1000;
+  }
+
+  /**
+   * Serialize the startup of backups through a single shared chain. `fn` runs
+   * the fork/exec-heavy setup; the caller receives its result as soon as `fn`
+   * resolves, while the chain is held for an extra `_startGapMs` before the
+   * next queued startup begins. A failing `fn` never breaks the chain.
+   */
+  _serializeStart(fn) {
+    const prev = this._startMutex;
+    let resolveResult, rejectResult;
+    const resultP = new Promise((res, rej) => { resolveResult = res; rejectResult = rej; });
+    this._startMutex = prev.then(async () => {
+      try {
+        resolveResult(await fn());
+      } catch (e) {
+        rejectResult(e);
+      }
+      // Enforce the gap AFTER this startup, before the next one begins —
+      // regardless of success/failure — so spawns never stack up.
+      if (this._startGapMs > 0) {
+        await new Promise(res => setTimeout(res, this._startGapMs));
+      }
+    });
+    return resultP;
   }
 
   /**
@@ -217,9 +257,12 @@ class BackupExecutor {
       const { promisify } = require('util');
       const execAsync = promisify(exec);
       
-      // Find backup_manager.sh processes with matching VM name and hypervisor IP
+      // Find backup_manager.sh processes with matching VM name and hypervisor IP.
+      // `auxww` (not plain `aux`) keeps the COMMAND column unlimited-width —
+      // `ps aux` truncates long command lines, which can make a live process
+      // silently fail to match once --domain/--ip are past the cutoff.
       const { stdout } = await execAsync(
-        `ps aux | grep -E "Backup_Manager.sh.*--domain ${vmName}.*--ip ${hypervisorIp}" | grep -v grep || true`
+        `ps auxww | grep -E "Backup_Manager.sh.*--domain ${vmName}.*--ip ${hypervisorIp}" | grep -v grep || true`
       );
       
       if (stdout.trim()) {
@@ -250,7 +293,32 @@ class BackupExecutor {
     
     for (const jobState of jobStates) {
       const { jobId, vmName, hypervisorIp, tmuxSession, scheduleType } = jobState;
-      
+
+      // A job still carrying the `queued` marker never reached executeBackup
+      // (which overwrites the state without that flag). The in-memory queue it
+      // was waiting in is gone after a restart, so it will never start on its
+      // own. Before this branch such jobs vanished with no trace and the
+      // controller filed them as indeterminate failures. Give it a real,
+      // logged failure — unless a worker is somehow already alive for it
+      // (defensive: an unexpected early start), in which case fall through to
+      // the normal reattach logic below.
+      if (jobState.queued === true) {
+        const aliveSession = (tmuxSession && await this.findRunningTmuxSession(tmuxSession))
+          || (vmName && scheduleType && await this.findTmuxSessionForVM(vmName, scheduleType));
+        if (!aliveSession) {
+          console.warn(`[BackupExecutor] Recovering dropped queued job ${jobId} (${vmName}) — agent restarted before it started`);
+          await this.failJobEarly(
+            jobState,
+            new Error('Agent restarted while this backup was still queued; it never started and was not run.')
+          );
+          continue;
+        }
+        // A live worker exists despite the queued marker — treat it as running.
+        console.log(`[BackupExecutor] Queued job ${jobId} has a live session ${aliveSession}; reattaching`);
+        await this.reattachToTmuxSession(jobId, jobState, aliveSession);
+        continue;
+      }
+
       // First check if we have a stored tmux session name
       let session = null;
       if (tmuxSession) {
@@ -274,22 +342,10 @@ class BackupExecutor {
           console.log(`Found running backup process for job ${jobId} (PID: ${pid}) without tmux`);
           await this.reattachToJob(jobId, jobState, pid);
         } else {
-          // Check if progress file exists - if yes, backup might still be running
-          const basePath = jobState.storagePoolPath || this.config.backupPath;
-          const progressFile = path.join(basePath, '.progress', `${vmName}_${scheduleType}.progress`);
-          if (fs.existsSync(progressFile)) {
-            console.log(`Progress file exists for job ${jobId}, but no tmux session or process found.`);
-            console.log(`This might indicate the backup is running but we lost tracking. Marking as failed.`);
-            
-            // Clean up progress file
-            try {
-              fs.unlinkSync(progressFile);
-            } catch (err) {
-              console.error(`Failed to delete orphaned progress file: ${err.message}`);
-            }
-          }
-          
-          // Process finished while agent was down - check log for final status
+          // No tmux session, no process by PID. handleCompletedJobWhileDown
+          // makes the final call — it checks the exit-code file first, then
+          // falls back to progress/lock file freshness before ever declaring
+          // the job dead, so we must NOT delete any evidence here first.
           console.log(`No running process found for job ${jobId}, checking completion status...`);
           await this.handleCompletedJobWhileDown(jobId, jobState);
         }
@@ -328,25 +384,118 @@ class BackupExecutor {
   }
 
   /**
+   * Best-effort human-readable failure detail from a job's log. Used only to
+   * describe a failure we have ALREADY established from the exit code — never
+   * to decide whether the job failed.
+   */
+  _extractErrorFromLog(jobId) {
+    try {
+      const logFile = path.join(this.config.logDir, `${jobId}.log`);
+      if (!fs.existsSync(logFile)) return null;
+      const lines = fs.readFileSync(logFile, 'utf8').split('\n');
+      for (let i = lines.length - 1; i >= Math.max(0, lines.length - 50); i--) {
+        const clean = stripAnsi(lines[i], { singleLine: true });
+        if (/error|failed|exception/i.test(clean)) return clean.slice(0, 300);
+      }
+    } catch (e) {
+      // best effort only
+    }
+    return null;
+  }
+
+  /**
+   * True if the given file was modified within the last `maxAgeMs`. Used to
+   * tell an actively-updated progress/lock file (job still running — rsync
+   * and the offsite writers rewrite it every few seconds) apart from one
+   * left behind by a process that already died.
+   */
+  _isFileRecentlyModified(filePath, maxAgeMs) {
+    try {
+      const stat = fs.statSync(filePath);
+      return (Date.now() - stat.mtimeMs) < maxAgeMs;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
    * Handle jobs that completed while agent was down
    */
   async handleCompletedJobWhileDown(jobId, jobState) {
     const { vmName, scheduleType } = jobState;
-    
-    // Double-check: if progress file still exists, backup might still be running
+
+    // The shell wrote `echo $? > <jobId>.exitcode` when the script ended, so if
+    // that file is here it is the script's own verdict — hard evidence, and it
+    // outranks everything below. Everything after this point only *infers* an
+    // outcome by pattern-matching log prose, which is how a run that ended
+    // "✗ Backup FAILED ... (exit code: 1)" could still be filed as completed.
+    const exitCodeFile = path.join(this.config.logDir, `${jobId}.exitcode`);
+    if (fs.existsSync(exitCodeFile)) {
+      let recorded = null;
+      try {
+        const raw = fs.readFileSync(exitCodeFile, 'utf8').trim();
+        if (/^-?\d+$/.test(raw)) recorded = parseInt(raw, 10);
+      } catch (err) {
+        console.error(`Failed to read exit code file for ${jobId}: ${err.message}`);
+      }
+
+      if (recorded !== null) {
+        try { fs.unlinkSync(exitCodeFile); } catch (e) { /* best effort */ }
+        this.deleteJobState(jobId);
+
+        if (recorded === 0) {
+          console.log(`Job ${jobId} finished while agent was down — exit code 0 (success)`);
+          await this.updateController(jobId, 'completed', 0);
+        } else {
+          console.log(`Job ${jobId} finished while agent was down — exit code ${recorded} (failure)`);
+          const detail = this._extractErrorFromLog(jobId) || `Backup script exited with code ${recorded}`;
+          await this.updateController(jobId, 'failed', recorded, detail);
+        }
+        return;
+      }
+    }
+
+    // Double-check: if progress file or lock file still exists AND is being
+    // actively written to, the backup is almost certainly still running (the
+    // shell rewrites both every few seconds during rsync/offsite sync) — we
+    // just lost track of the tmux session/process. Do NOT delete evidence or
+    // mark failed in that case: leave the job-state file in place so the next
+    // recovery pass (every 10s) re-checks, and don't touch controller status.
     const basePath = jobState.storagePoolPath || this.config.backupPath;
     const progressFile = path.join(basePath, '.progress', `${vmName}_${scheduleType}.progress`);
-    if (fs.existsSync(progressFile)) {
-      console.log(`WARNING: Progress file exists for job ${jobId}, but no tmux session found.`);
-      console.log(`This indicates the backup might still be running but we lost tracking.`);
-      console.log(`Marking as failed and cleaning up progress file.`);
-      
-      try {
-        fs.unlinkSync(progressFile);
-      } catch (err) {
-        console.error(`Failed to delete orphaned progress file: ${err.message}`);
+    const lockFile = path.join(basePath, 'in_progress_backups', `${vmName}_${scheduleType}_backup`);
+    const PROGRESS_FRESH_MS = 5 * 60 * 1000; // 5 minutes
+
+    const progressExists = fs.existsSync(progressFile);
+    const lockExists = fs.existsSync(lockFile);
+
+    if (progressExists || lockExists) {
+      const progressFresh = progressExists && this._isFileRecentlyModified(progressFile, PROGRESS_FRESH_MS);
+      const lockFresh = lockExists && this._isFileRecentlyModified(lockFile, PROGRESS_FRESH_MS);
+
+      if (progressFresh || lockFresh) {
+        console.log(`Job ${jobId}: tmux/process not found, but progress/lock file was modified within the last ${PROGRESS_FRESH_MS / 1000}s — treating as still running, not marking failed. Will re-check on next pass.`);
+        return;
       }
-      
+
+      console.log(`WARNING: Progress/lock file exists for job ${jobId} but is stale (no tmux session, no process, no recent writes).`);
+      console.log(`Marking as failed and cleaning up.`);
+
+      if (progressExists) {
+        try {
+          fs.unlinkSync(progressFile);
+        } catch (err) {
+          console.error(`Failed to delete orphaned progress file: ${err.message}`);
+        }
+      }
+      if (lockExists) {
+        try {
+          fs.unlinkSync(lockFile);
+        } catch (err) {
+          console.error(`Failed to delete orphaned lock file: ${err.message}`);
+        }
+      }
+
       this.deleteJobState(jobId);
       await this.updateController(jobId, 'failed', 1, 'Lost tracking of backup process - please check manually');
       return;
@@ -474,7 +623,7 @@ class BackupExecutor {
     const jobStates = this.getAllJobStates();
 
     for (const jobState of jobStates) {
-      const { jobId, vmName, hypervisorIp } = jobState;
+      const { jobId, vmName, hypervisorIp, scheduleType } = jobState;
 
       // Skip if already attached
       if (this.activeJobs.has(jobId)) {
@@ -484,29 +633,44 @@ class BackupExecutor {
       if (this.activeProcesses.has(jobId)) {
         continue;
       }
+      // Skip jobs still waiting in the in-memory queue. Their `queued` marker is
+      // a durable breadcrumb for STARTUP recovery only — while the process is
+      // alive the in-memory jobQueue is the authority, and the job will start
+      // (and overwrite this marker) when a slot frees. Treating it as an
+      // orphan here would hand a genuinely-waiting job to
+      // handleCompletedJobWhileDown and wrongly finalize it within seconds.
+      if (jobState.queued === true) {
+        continue;
+      }
 
-      // FIRST check the tmux session by its exact recorded name — it is
-      // authoritative. During setup phases (retry cleanup, checksumming)
-      // no virtnbdbackup process matches yet, so the process check below
-      // would wrongly conclude the job died and mark it completed/failed
-      // while it is in fact running. Re-adopt and resume full monitoring.
+      // FIRST check the tmux session — by its exact recorded name, then by
+      // VM+schedule pattern if the exact name lookup misses (e.g. the stored
+      // name was slightly off, or a transient tmux error). During setup
+      // phases (retry cleanup, checksumming) no virtnbdbackup process matches
+      // yet, so the process check below would wrongly conclude the job died
+      // and mark it completed/failed while it is in fact running. Re-adopt
+      // and resume full monitoring.
+      let liveSession = null;
       if (jobState.tmuxSession) {
-        const liveSession = await this.findRunningTmuxSession(jobState.tmuxSession);
-        if (liveSession) {
-          console.log(`Re-adopting job ${jobId} — tmux session ${liveSession} is alive but was untracked`);
-          this.activeJobs.set(jobId, {
-            ...jobState,
-            progress: jobState.progress || 0,
-            progressText: jobState.progressText || 'Re-attached...',
-            recovered: true,
-          });
-          this.vmLocks.set(vmName, jobId);
-          const logFile = path.join(this.config.logDir, `${jobId}.log`);
-          const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-          this.monitorTmuxSession(jobId, liveSession, jobState, logFile, logStream);
-          await this.updateController(jobId, 'running', null, null, jobState.progress || 0, 'Re-attached to running backup session');
-          continue;
-        }
+        liveSession = await this.findRunningTmuxSession(jobState.tmuxSession);
+      }
+      if (!liveSession && vmName && scheduleType) {
+        liveSession = await this.findTmuxSessionForVM(vmName, scheduleType);
+      }
+      if (liveSession) {
+        console.log(`Re-adopting job ${jobId} — tmux session ${liveSession} is alive but was untracked`);
+        this.activeJobs.set(jobId, {
+          ...jobState,
+          progress: jobState.progress || 0,
+          progressText: jobState.progressText || 'Re-attached...',
+          recovered: true,
+        });
+        this.vmLocks.set(vmName, jobId);
+        const logFile = path.join(this.config.logDir, `${jobId}.log`);
+        const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+        this.monitorTmuxSession(jobId, liveSession, jobState, logFile, logStream);
+        await this.updateController(jobId, 'running', null, null, jobState.progress || 0, 'Re-attached to running backup session');
+        continue;
       }
 
       // Check if process is still running
@@ -809,15 +973,32 @@ class BackupExecutor {
   async queueBackup(jobData) {
     const { vmName } = jobData;
 
-    // Check if VM is already being backed up. A vmLock can go stale if a
-    // previous job died in a way that skipped lock cleanup (agent crash,
-    // SIGKILL). Before refusing, verify the lock is backed by a REAL live
-    // worker (tmux session or backup process). If nothing is alive, the
-    // lock is stale — clear it and let this backup proceed. Without this,
-    // a stale lock permanently blocks retries with a false "already in
-    // progress" (the exact symptom users hit after a crash).
+    // Check if VM is already being backed up.
+    //
+    // The reservation must be ATOMIC to prevent a same-VM double-start: the
+    // lock used to be checked here but only SET later, inside executeBackup(),
+    // with an `await` in between — so two triggers/retries for the same VM
+    // arriving close together both passed the check and both started. We close
+    // that window by distinguishing two cases with NO await before we reserve:
+    //
+    //   • The lock is held by a job THIS process already knows (running in
+    //     activeJobs, or waiting in jobQueue). That is a genuine in-flight
+    //     reservation — reject immediately, no host probe needed.
+    //   • The lock is held by a jobId with no in-memory job (a stale lock left
+    //     by a crashed/SIGKILLed run, or one recovered without a live worker).
+    //     Only then do the async host liveness probe before clearing it.
     if (this.vmLocks.has(vmName)) {
       const existingJobId = this.vmLocks.get(vmName);
+      const knownInMemory = this.activeJobs.has(existingJobId)
+        || this.jobQueue.some(j => j && j.jobId === existingJobId);
+      if (knownInMemory) {
+        console.log(`VM ${vmName} is already reserved by job ${existingJobId}; rejecting duplicate`);
+        return {
+          queued: false,
+          error: `Another backup is already in progress for VM: ${vmName}`,
+          existingJobId,
+        };
+      }
       const stillRunning = await this._isVmBackupAlive(vmName, jobData.scheduleType);
       if (stillRunning) {
         console.log(`VM ${vmName} is already being backed up (job: ${existingJobId})`);
@@ -832,7 +1013,27 @@ class BackupExecutor {
       this.deleteJobState(existingJobId);
     }
 
+    // Reserve the VM synchronously NOW — before pushing to the queue and before
+    // any further await — so a concurrent same-VM trigger observes the lock and
+    // is rejected by the knownInMemory branch above. executeBackup re-sets this
+    // to the same value when it starts; failJobEarly / the inner catch release
+    // it if the job never runs.
+    this.vmLocks.set(vmName, jobData.jobId);
+
     this.jobQueue.push(jobData);
+    // Persist a durable queued marker BEFORE the job runs. The in-memory queue
+    // is otherwise the only record of a waiting job — an agent restart wiped it
+    // silently, leaving no log, no job-state and no exit code, so the controller
+    // could only file it as an indeterminate failure. With this marker on disk,
+    // startup recovery (recoverRunningJobs) can give every dropped queued job a
+    // real, logged failure instead of a traceless disappearance. executeBackup
+    // overwrites this state (without the `queued` flag) the moment it starts.
+    this.saveJobState(jobData.jobId, {
+      ...jobData,
+      queued: true,
+      queuedAt: new Date().toISOString(),
+      progressText: 'Queued...',
+    });
     this.processQueue();
     return { queued: true, position: this.jobQueue.length };
   }
@@ -849,25 +1050,76 @@ class BackupExecutor {
       const execAsync = promisify(exec);
       const esc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-      // Live tmux session for this VM (optionally scoped to schedule)
-      const sanitized = vmName.replace(/[^a-zA-Z0-9-]/g, '_');
-      try {
-        const { stdout } = await execAsync(`tmux list-sessions -F "#{session_name}" 2>/dev/null || true`);
-        const prefix = scheduleType ? `${sanitized}_${scheduleType}_` : `${sanitized}_`;
-        if (stdout.split('\n').some(s => s.startsWith(prefix))) return true;
-      } catch (_) { /* no tmux server */ }
-
-      // Live backup process for this VM
+      // Live backup process for this VM. `Backup_Manager.sh --domain <vm>` is
+      // the parent and stays up for every phase (including the offsite rsync,
+      // whose own command line carries the pool path, not the VM name), so
+      // this is the strongest signal — check it FIRST.
       const { stdout: procs } = await execAsync(
         `pgrep -af "(virtnbdbackup|Backup_Manager.sh).*${esc(vmName)}" 2>/dev/null || true`
       );
-      return procs.trim().length > 0;
+      if (procs.trim().length > 0) return true;
+
+      // A tmux session on its own is NOT proof of life: the session outlives
+      // the command it ran, so a script that died (or was killed) leaves one
+      // behind forever. Treating that as "alive" is what made a VM with
+      // nothing running refuse every new backup. Require corroboration —
+      // either the session is too young to have finished starting up, or the
+      // progress file is still being written.
+      const sanitized = vmName.replace(/[^a-zA-Z0-9-]/g, '_');
+      try {
+        const { stdout } = await execAsync(
+          `tmux list-sessions -F "#{session_name}|#{session_created}" 2>/dev/null || true`
+        );
+        const prefix = scheduleType ? `${sanitized}_${scheduleType}_` : `${sanitized}_`;
+        const row = stdout.split('\n').find(s => s.split('|')[0].startsWith(prefix));
+        if (row) {
+          const createdEpoch = row.split('|')[1];
+          const createdMs = /^\d+$/.test((createdEpoch || '').trim())
+            ? parseInt(createdEpoch, 10) * 1000
+            : null;
+          // Still starting up — the worker may not have spawned yet.
+          if (createdMs && (Date.now() - createdMs) < 2 * 60 * 1000) return true;
+          if (this._isProgressFileFresh(vmName, scheduleType)) return true;
+          console.warn(`[BackupExecutor] tmux session ${row.split('|')[0]} for ${vmName} has no live worker and no fresh progress — treating as stale`);
+          return false;
+        }
+      } catch (_) { /* no tmux server */ }
+
+      return false;
     } catch (err) {
       // On any error, be conservative and assume it IS alive (don't clear a
       // lock we can't verify — better a false block than a double-start).
       console.error(`[BackupExecutor] _isVmBackupAlive check failed for ${vmName}: ${err.message}`);
       return true;
     }
+  }
+
+  /**
+   * Is the VM's progress file still being written? The backup script rewrites
+   * it every few seconds for the whole run, so a recent mtime proves a worker
+   * is alive even when no process name matches. Searches every configured pool
+   * because the caller does not know which one this run is using.
+   */
+  _isProgressFileFresh(vmName, scheduleType, maxAgeMs = 5 * 60 * 1000) {
+    const sanitized = String(vmName).replace(/[^a-zA-Z0-9-]/g, '_');
+    const roots = new Set();
+    if (this.config && this.config.backupPath) roots.add(this.config.backupPath);
+    for (const job of this.activeJobs.values()) {
+      if (job && job.storagePoolPath) roots.add(job.storagePoolPath);
+    }
+    for (const root of roots) {
+      let dir;
+      try {
+        dir = require('path').join(root, '.progress');
+        for (const file of fs.readdirSync(dir)) {
+          if (scheduleType && !file.endsWith(`_${scheduleType}.progress`)) continue;
+          if (!file.replace(/[^a-zA-Z0-9-]/g, '_').startsWith(sanitized)) continue;
+          const stats = fs.statSync(require('path').join(dir, file));
+          if (Date.now() - stats.mtimeMs < maxAgeMs) return true;
+        }
+      } catch (_) { /* pool has no .progress dir — try the next */ }
+    }
+    return false;
   }
 
   /**
@@ -884,10 +1136,69 @@ class BackupExecutor {
     }
 
     const jobData = this.jobQueue.shift();
-    await this.executeBackup(jobData);
-    
-    // Continue processing
+    try {
+      await this.executeBackup(jobData);
+    } catch (err) {
+      // A job that throws BEFORE it sets up its own logging/cleanup (e.g. a
+      // missing storagePoolPath, a failed saveJobState, a synchronous bug)
+      // must never take the whole queue down with it. Historically this
+      // rejection escaped here, the trailing processQueue() never ran, and
+      // every job behind it silently froze — while the failed job itself left
+      // no log, no job-state and no exit code, so the controller could only
+      // file it as an indeterminate failure with "no logs". Record a real,
+      // durable failure for it, then keep draining.
+      await this.failJobEarly(jobData, err);
+    }
+
+    // Continue processing regardless of how the job above resolved.
     this.processQueue();
+  }
+
+  /**
+   * Guarantee that a job which failed before executeBackup could establish its
+   * own log always leaves a trace: a populated <jobId>.log, a <jobId>.exitcode,
+   * released locks, and a best-effort controller notification. This is what
+   * makes "the log always exists and has data" true even on the earliest
+   * failures — a dropped job must never be indistinguishable from a lost one.
+   */
+  async failJobEarly(jobData, err) {
+    const jobId = jobData && jobData.jobId;
+    const vmName = jobData && jobData.vmName;
+    const message = (err && err.message) ? err.message : String(err);
+    console.error(`[BackupExecutor] Job ${jobId || '(unknown)'} failed before execution: ${message}`);
+
+    if (jobId) {
+      // Durable, local evidence first — this survives even if the controller
+      // is unreachable (the exact situation catch-up replays run in).
+      try {
+        const logFile = path.join(this.config.logDir, `${jobId}.log`);
+        const ts = new Date().toISOString();
+        const lines = [
+          `[${ts}] Backup failed before it could start.`,
+          `[${ts}] VM: ${vmName || 'unknown'}`,
+          `[${ts}] Error: ${message}`,
+          err && err.stack ? `[${ts}] ${err.stack}` : null,
+        ].filter(Boolean).join('\n') + '\n';
+        fs.appendFileSync(logFile, lines);
+      } catch (e) {
+        console.error(`[BackupExecutor] Could not write early-failure log for ${jobId}: ${e.message}`);
+      }
+      // A recorded exit code lets live-status report a definitive FAILED
+      // (script_error) instead of the ambiguous "indeterminate" verdict.
+      try {
+        fs.writeFileSync(path.join(this.config.logDir, `${jobId}.exitcode`), '1');
+      } catch (_) { /* best effort */ }
+    }
+
+    // Release whatever executeBackup may have half-acquired before throwing.
+    if (vmName && this.vmLocks.get(vmName) === jobId) this.vmLocks.delete(vmName);
+    if (jobId) {
+      this.activeJobs.delete(jobId);
+      this.deleteJobState(jobId);
+      try {
+        await this.updateController(jobId, 'failed', 1, message);
+      } catch (_) { /* controller may be down; local evidence already written */ }
+    }
   }
 
   /**
@@ -908,13 +1219,36 @@ class BackupExecutor {
       offsiteHosts = [],
       verbose = false,
       storagePoolPath = null,
+      diskUsageThreshold = null,  // Per-pool disk-usage guard (percent)
       isRetry = false  // NEW: Flag to indicate this is a retry attempt
     } = jobData;
 
     console.log(`[BackupExecutor] Starting backup for ${vmName}, jobId: ${jobId}, isRetry: ${isRetry}`);
 
-    // Validate storage pool path is provided
+    // Create the log file and log() helper FIRST — before any validation that
+    // could throw. Guaranteeing the log stream exists this early means every
+    // failure path from here on leaves a populated <jobId>.log to debug from,
+    // instead of the traceless "no log file at all" that made failed jobs
+    // impossible to diagnose.
+    const logFile = path.join(this.config.logDir, `${jobId}.log`);
+    const logStream = fs.createWriteStream(logFile, { flags: 'a' });
+
+    const log = (message) => {
+      const timestamp = new Date().toISOString();
+      const entry = `[${timestamp}] ${message}\n`;
+      logStream.write(entry);
+
+      // Emit to socket
+      this.io.to(`job-${jobId}`).emit('backup-log', { jobId, timestamp, message });
+      this.io.emit('backup-progress', { jobId, message });
+    };
+
+    // Validate storage pool path is provided. Log the reason before throwing so
+    // the failure is visible in the job's own log (processQueue's catch will
+    // also record it and release resources).
     if (!storagePoolPath) {
+      log('ERROR: Storage pool path is required for backup execution');
+      logStream.end();
       throw new Error('Storage pool path is required for backup execution');
     }
 
@@ -939,20 +1273,6 @@ class BackupExecutor {
     // runs, even though the job is genuinely executing. Fire-and-forget so a
     // slow controller can't delay the backup itself.
     this.updateController(jobId, 'running', null, null, 0, 'Starting backup process...').catch(() => {});
-
-    // Create log file
-    const logFile = path.join(this.config.logDir, `${jobId}.log`);
-    const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-
-    const log = (message) => {
-      const timestamp = new Date().toISOString();
-      const entry = `[${timestamp}] ${message}\n`;
-      logStream.write(entry);
-      
-      // Emit to socket
-      this.io.to(`job-${jobId}`).emit('backup-log', { jobId, timestamp, message });
-      this.io.emit('backup-progress', { jobId, message });
-    };
 
     log(`Starting backup for VM: ${vmName}`);
     log(`Hypervisor: ${hypervisorIp}`);
@@ -982,6 +1302,17 @@ class BackupExecutor {
       '--schedule', scriptSchedule,
       '--backup-path', storagePoolPath
     ];
+
+    // Per-pool disk-usage threshold. Applies to both the local pool pre-flight
+    // check and the offsite destination check inside Backup_Manager.sh. When
+    // unset the script falls back to its built-in default (80%).
+    if (diskUsageThreshold !== null && diskUsageThreshold !== undefined && diskUsageThreshold !== '') {
+      const t = parseInt(diskUsageThreshold, 10);
+      if (Number.isFinite(t) && t >= 1 && t <= 100) {
+        args.push('--disk-threshold', String(t));
+        log(`Disk usage threshold: ${t}%`);
+      }
+    }
 
     // Pass through the user-selected method when one was chosen. The
     // Backup_Manager.sh script accepts --method full | inc | copy. For
@@ -1046,86 +1377,32 @@ class BackupExecutor {
       args.push('--verbose');
     }
 
-    // Retry logic - Run cleanup script first, then start fresh backup
+    // Retry: clean partial files from the failed attempt before backing up again.
+    //
+    // This delegates to Backup_Manager.sh's own --retry handling rather than
+    // running scripts/Cleanup_Backup.sh, which is NOT safe here: that script
+    // deletes the newest checkpoint's data files whenever it finds a .partial.
+    // A run that dies mid-transfer leaves .partial debris WITHOUT having written
+    // its own checkpoint, so "newest checkpoint" is the last GOOD backup — and
+    // retrying would destroy it and break the chain. It also sweeps every
+    // schedule for the VM, not just the one being retried.
+    //
+    // --retry runs cleanup_retry_partial_files instead: scoped to this schedule's
+    // directory, removes *.partial only, never touches checkpoints, and aborts
+    // if a tmux session or lock shows a backup is genuinely running. It also runs
+    // inside the script, after method resolution and before the backup lock —
+    // the correct point in the sequence.
+    //
+    // (Cleanup_Backup.sh remains in place for the manual cleanup endpoint, where
+    // an operator explicitly asks to reclaim a broken chain.)
     if (isRetry) {
       log('');
       log('='.repeat(70));
-      log('RETRY MODE: Cleaning up partial files before retry');
+      log('RETRY MODE: Backup_Manager.sh will clear *.partial files for this');
+      log(`schedule (${scheduleType}) before starting the backup.`);
       log('='.repeat(70));
       log('');
-      
-      try {
-        const cleanupScriptPath = path.join(__dirname, '../scripts/Cleanup_Backup.sh');
-        
-        if (!fs.existsSync(cleanupScriptPath)) {
-          throw new Error(`Cleanup script not found: ${cleanupScriptPath}`);
-        }
-        
-        log(`Running cleanup script: ${cleanupScriptPath}`);
-        log(`  VM: ${vmName}`);
-        log(`  Storage Pool: ${storagePoolPath}`);
-        log(`  Schedule: ${scheduleType}`);
-        
-        // Execute cleanup script synchronously
-        const cleanupResult = await new Promise((resolve, reject) => {
-          const cleanupProc = spawn('bash', [
-            cleanupScriptPath,
-            '--domain', vmName,
-            '--backup-path', storagePoolPath
-          ]);
-          
-          let stdout = '';
-          let stderr = '';
-          
-          cleanupProc.stdout.on('data', (data) => {
-            const output = data.toString();
-            stdout += output;
-            log(`[Cleanup] ${output.trim()}`);
-          });
-          
-          cleanupProc.stderr.on('data', (data) => {
-            const output = data.toString();
-            stderr += output;
-            log(`[Cleanup Error] ${output.trim()}`);
-          });
-          
-          cleanupProc.on('close', (code) => {
-            resolve({ code, stdout, stderr });
-          });
-          
-          cleanupProc.on('error', (err) => {
-            reject(err);
-          });
-        });
-        
-        log('');
-        log(`Cleanup script exited with code: ${cleanupResult.code}`);
-        
-        if (cleanupResult.code === 0) {
-          log('✓ Cleanup completed successfully');
-          log('✓ Partial files and checkpoints removed');
-        } else if (cleanupResult.code === 11) {
-          log('✓ Backup is healthy (no partial files found)');
-        } else if (cleanupResult.code === 10) {
-          log('⚠ No backup directory found for this VM');
-        } else {
-          log(`⚠ Cleanup script exited with code ${cleanupResult.code}`);
-        }
-        
-        log('');
-        log('='.repeat(70));
-        log('Proceeding with fresh backup...');
-        log('='.repeat(70));
-        log('');
-        
-      } catch (cleanupError) {
-        log(`⚠ Cleanup failed: ${cleanupError.message}`);
-        log('⚠ Proceeding with backup anyway (script lock will protect)');
-        log('');
-      }
-      
-      // Note: Do NOT add --retry flag to args
-      // We've already cleaned up manually, now start a fresh backup
+      args.push('--retry');
     }
 
     const command = `bash ${scriptPath} ${args.join(' ')}`;
@@ -1140,45 +1417,66 @@ class BackupExecutor {
     await this.updateController(jobId, 'running');
 
     try {
-      const { exec } = require('child_process');
-      const { promisify } = require('util');
-      const execAsync = promisify(exec);
-      
-      // Kill existing session if it exists
-      await execAsync(`tmux kill-session -t ${tmuxSession} 2>/dev/null || true`);
-      
-      // Create tmux session
-      await execAsync(`tmux new-session -d -s ${tmuxSession}`);
-      log(`Tmux session ${tmuxSession} created`);
-      
-      // Start the backup process inside tmux using tmux send-keys
-      // Write exit code to a file so we can detect kills vs normal exits
-      const exitCodeFile = path.join(this.config.logDir, `${jobId}.exitcode`);
-      await execAsync(`tmux send-keys -t ${tmuxSession} "cd '${storagePoolPath}' && ${command}; echo \\$? > '${exitCodeFile}'; exit" C-m`);
-      
-      // Capture tmux output to log file
-      await execAsync(`tmux pipe-pane -t ${tmuxSession} -o "cat >> '${logFile}'"`);
-      
+      // Serialize the fork/exec-heavy startup across ALL concurrent backups so
+      // a burst of simultaneous scheduled fires doesn't spawn every tmux
+      // session + backup process in the same instant. Runs through the shared
+      // start mutex; other jobs' setups wait their turn (staggered by
+      // _startGapMs), but once started every backup runs fully in parallel.
+      await this._serializeStart(async () => {
+        const { exec } = require('child_process');
+        const { promisify } = require('util');
+        const execAsync = promisify(exec);
+
+        // Kill existing session if it exists
+        await execAsync(`tmux kill-session -t ${tmuxSession} 2>/dev/null || true`);
+
+        // Create tmux session
+        await execAsync(`tmux new-session -d -s ${tmuxSession}`);
+        log(`Tmux session ${tmuxSession} created`);
+
+        // Start the backup process inside tmux using tmux send-keys
+        // Write exit code to a file so we can detect kills vs normal exits
+        const exitCodeFile = path.join(this.config.logDir, `${jobId}.exitcode`);
+        // Clear any stale exit code from a prior attempt. Scheduled retries reuse
+        // the same jobId, and an early-failure/inner-catch may have recorded a `1`
+        // here; leaving it would let this fresh run be judged by the previous
+        // attempt's verdict (a running retry wrongly reconciled as failed) before
+        // the shell writes its own code below.
+        try { if (fs.existsSync(exitCodeFile)) fs.unlinkSync(exitCodeFile); } catch (_) { /* best effort */ }
+        await execAsync(`tmux send-keys -t ${tmuxSession} "cd '${storagePoolPath}' && ${command}; echo \\$? > '${exitCodeFile}'; exit" C-m`);
+
+        // Capture tmux output to log file
+        await execAsync(`tmux pipe-pane -t ${tmuxSession} -o "cat >> '${logFile}'"`);
+      });
+
       log(`Backup started in tmux session: ${tmuxSession}`);
       log(`You can attach with: tmux attach -t ${tmuxSession}`);
-      
+
       // Monitor the tmux session and parse log file for progress
       this.monitorTmuxSession(jobId, tmuxSession, jobData, logFile, logStream);
-      
+
       return { success: true, tmuxSession };
-      
+
     } catch (error) {
       log(`Failed to start backup: ${error.message}`);
       logStream.end();
-      
+
+      // Record a definitive exit code so live-status reports a real FAILED
+      // (script_error) rather than an ambiguous "indeterminate" verdict.
+      try {
+        fs.writeFileSync(path.join(this.config.logDir, `${jobId}.exitcode`), '1');
+      } catch (_) { /* best effort */ }
+
       // Cleanup
       this.vmLocks.delete(vmName);
       this.activeJobs.delete(jobId);
       this.deleteJobState(jobId);
-      
+
       await this.updateController(jobId, 'failed', 1, error.message);
-      this.processQueue();
-      
+      // Note: do NOT call processQueue() here — the caller (processQueue)
+      // always continues the queue after executeBackup resolves. Draining
+      // twice could start two jobs into a single freed slot.
+
       return { success: false, error: error.message };
     }
   }
@@ -1313,9 +1611,13 @@ class BackupExecutor {
               const logContent = fs.readFileSync(logFile, 'utf8');
               const lines = logContent.split('\n');
               for (let i = lines.length - 1; i >= Math.max(0, lines.length - 30); i--) {
-                const line = lines[i].toLowerCase();
-                if (line.includes('error') || line.includes('failed') || line.includes('exception')) {
-                  errorMessage = lines[i].trim();
+                // The script colourises its output, so strip escapes before the
+                // line becomes an error message — otherwise it reaches the UI and
+                // RocketChat as "[0;31m✗ Backup FAILED[0m". Match on the cleaned
+                // text too: escapes can sit between the keyword and the line start.
+                const clean = stripAnsi(lines[i], { singleLine: true });
+                if (/error|failed|exception/i.test(clean)) {
+                  errorMessage = clean;
                   break;
                 }
               }
@@ -1736,7 +2038,19 @@ class BackupExecutor {
     const logFile = path.join(this.config.logDir, `${jobId}.log`);
     let content = '';
     try {
-      content = fs.readFileSync(logFile, 'utf8');
+      // pipe-pane captures every \r progress redraw, so a long-running
+      // backup's log can reach tens/hundreds of MB. A tail request (the
+      // common case — history/log-viewer default to the last 2000 lines)
+      // has no business reading the whole file into memory and running the
+      // sanitizer regexes over all of it first. Bound the disk read itself:
+      // seek to a generous tail window and only sanitize that. Full-log
+      // requests (tailLines falsy) still read everything, as intended.
+      const tail = Number(tailLines);
+      if (Number.isFinite(tail) && tail > 0) {
+        content = this._readTailBytes(logFile, 4 * 1024 * 1024); // 4MB, generous vs. 2000 lines
+      } else {
+        content = fs.readFileSync(logFile, 'utf8');
+      }
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
       // fall through to the durable script log
@@ -1763,6 +2077,27 @@ class BackupExecutor {
     // Collapse in-place progress renders and optionally tail — see
     // utils/logSanitizer.js for the full rationale.
     return sanitizeLog(content, tailLines);
+  }
+
+  /**
+   * Read at most the last `maxBytes` of a file synchronously, without ever
+   * loading the full file into memory. Used to bound tail-log reads on
+   * large pipe-pane captures. Throws ENOENT like readFileSync when the file
+   * doesn't exist, so callers' existing error handling still applies.
+   */
+  _readTailBytes(filePath, maxBytes) {
+    const stat = fs.statSync(filePath); // throws ENOENT if missing
+    const start = Math.max(0, stat.size - maxBytes);
+    const length = stat.size - start;
+    if (length <= 0) return '';
+    const fd = fs.openSync(filePath, 'r');
+    try {
+      const buf = Buffer.alloc(length);
+      fs.readSync(fd, buf, 0, length, start);
+      return buf.toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
   }
 
   /**

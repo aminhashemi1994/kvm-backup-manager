@@ -24,6 +24,7 @@ router.get('/scan', async (req, res, next) => {
       logFiles: [],
       lockFiles: [],
       tempFiles: [],
+      backupLogFiles: [],
       totalCount: 0,
       totalSize: 0
     };
@@ -140,6 +141,34 @@ router.get('/scan', async (req, res, next) => {
       }
     }
     
+    // Scan backup-job logs (<logDir>/<jobId>.log). mtime naturally excludes
+    // logs for jobs still running — pipe-pane keeps appending to them, so an
+    // active job's log never ages past olderThanHours.
+    try {
+      const logDir = config.logDir;
+      const files = await fs.readdir(logDir);
+      for (const file of files) {
+        if (!file.endsWith('.log')) continue;
+        const filePath = path.join(logDir, file);
+        try {
+          const stats = await fs.stat(filePath);
+          const ageMs = Date.now() - stats.mtimeMs;
+          if (ageMs < minutes * 60 * 1000) continue;
+          results.backupLogFiles.push({
+            path: filePath,
+            name: file,
+            size: stats.size,
+            age: ageMs,
+            type: 'backupLog'
+          });
+        } catch (err) {
+          // Skip files that vanish mid-scan
+        }
+      }
+    } catch (err) {
+      // logDir might not exist
+    }
+
     // Scan /tmp/restore-manager for restore event files
     try {
       const { stdout } = await execAsync(
@@ -222,7 +251,8 @@ router.get('/scan', async (req, res, next) => {
       ...results.progressFiles,
       ...results.logFiles,
       ...results.lockFiles,
-      ...results.tempFiles
+      ...results.tempFiles,
+      ...results.backupLogFiles
     ];
     
     results.totalCount = allFiles.length;
@@ -421,6 +451,26 @@ router.get('/stats', async (req, res, next) => {
       stats.totalFiles += stats.tempFiles;
     } catch (err) {
       stats.tempFiles = 0;
+    }
+
+    // Count backup-job logs (<logDir>/*.log)
+    try {
+      const files = await fs.readdir(config.logDir);
+      let backupLogCount = 0;
+      let backupLogSize = 0;
+      for (const file of files) {
+        if (!file.endsWith('.log')) continue;
+        try {
+          const s = await fs.stat(path.join(config.logDir, file));
+          backupLogCount++;
+          backupLogSize += s.size;
+        } catch (err) { /* skip */ }
+      }
+      stats.backupLogFiles = backupLogCount;
+      stats.totalFiles += backupLogCount;
+      stats.totalSize += backupLogSize;
+    } catch (err) {
+      stats.backupLogFiles = 0;
     }
     
     res.json({

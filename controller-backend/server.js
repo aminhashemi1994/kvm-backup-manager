@@ -49,6 +49,7 @@ const startupRecoveryService = require('./services/startupRecoveryService');
 const heartbeatService = require('./services/heartbeatService');
 const missedRunService = require('./services/missedRunService');
 const agentSyncService = require('./services/agentSyncService');
+const liveSessionMirrorService = require('./services/liveSessionMirrorService');
 const reportEnrichmentService = require('./services/reportEnrichmentService');
 const auditService = require('./services/auditService');
 const { initializeDataFiles } = require('./services/fileStorage');
@@ -223,6 +224,11 @@ missedRunService.initialize(io, schedulerService);
 // Initialize agent sync service (Item 2)
 agentSyncService.initialize(io);
 
+// Mirror live tmux sessions into the job list on a background interval, so the
+// Active Jobs / History panels render them from the store immediately instead
+// of waiting on an agent round-trip inside the request.
+liveSessionMirrorService.initialize(io);
+
 // Initialize report enrichment service (Item 7)
 reportEnrichmentService.initialize().catch(err => {
   console.error('[ReportEnrich] Failed to initialize:', err.message);
@@ -293,6 +299,33 @@ server.listen(config.port, config.host, () => {
 ╚════════════════════════════════════════════════════════════╝
   `);
 });
+
+// ── Event-loop health monitor ────────────────────────────────────────────────
+// Diagnostic fingerprint for "the API intermittently won't respond". We schedule
+// a timer for a fixed interval and measure how late it actually fires: the extra
+// delay is time the event loop spent blocked (sync JSON of a huge file, a tight
+// loop, etc.) and unable to answer requests. If the loop is healthy during a
+// stall, the problem is upstream (nginx/proxy/network), not the controller. We
+// also log the live server connection count, so socket/FD exhaustion is visible.
+(() => {
+  const TICK_MS = 5000;
+  let last = Date.now();
+  setInterval(() => {
+    const now = Date.now();
+    const lag = now - last - TICK_MS; // ms the loop was blocked beyond the interval
+    last = now;
+    if (lag > 1000) {
+      console.warn(`[EventLoop] ⚠ Blocked ~${lag}ms (loop stalled — the controller could not process requests during this window)`);
+    }
+    try {
+      server.getConnections((err, count) => {
+        if (!err && count > 200) {
+          console.warn(`[EventLoop] ⚠ High open connection count: ${count}`);
+        }
+      });
+    } catch { /* getConnections unavailable — ignore */ }
+  }, TICK_MS).unref();
+})();
 
 // Graceful shutdown
 process.on('SIGTERM', () => {

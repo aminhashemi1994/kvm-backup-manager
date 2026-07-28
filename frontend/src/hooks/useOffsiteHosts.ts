@@ -115,7 +115,7 @@ export function useCreateOffsitePool() {
       data,
     }: {
       hostId: string
-      data: { name: string; path: string }
+      data: { name: string; path: string; diskUsageThreshold?: number }
     }) => {
       const response = await offsiteHostsApi.createPool(hostId, data)
       return response.data
@@ -141,7 +141,7 @@ export function useUpdateOffsitePool() {
     }: {
       hostId: string
       poolId: string
-      data: { name?: string; path?: string }
+      data: { name?: string; path?: string; diskUsageThreshold?: number }
     }) => {
       const response = await offsiteHostsApi.updatePool(hostId, poolId, data)
       return response.data

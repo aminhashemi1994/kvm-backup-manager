@@ -79,6 +79,11 @@ class SocketService {
       this.emit('backup-skipped', data)
     })
 
+    // A scheduled run declined because the VM was already backing up.
+    this.socket.on('backup-rejected', (data) => {
+      this.emit('backup-rejected', data)
+    })
+
     this.socket.on('job-removed', (data) => {
       this.emit('job-removed', data)
     })

@@ -56,10 +56,17 @@ archives_to_keep=""
 compress_backup=""
 verbose="false"
 offsite_ips=""
+# Disk-usage guard rail (percent). A backup is refused when the target pool
+# — or an offsite destination — is already used above this level. Configurable
+# per storage pool from the controller; defaults to 80 when not supplied.
+disk_usage_threshold="80"
 # Maps an offsite IP → its custom destination base path (empty = mirror the
 # source pool path). Populated from the "ip:path" entries in --offsite-ip
 # (colon delimiter — IPv4-safe since IPv4 addresses contain no colons).
 declare -A OFFSITE_PATH_BY_IP=()
+# Maps an offsite IP → its per-pool disk-usage threshold (percent). Empty when
+# the controller didn't supply one; the global disk_usage_threshold is used then.
+declare -A OFFSITE_THRESHOLD_BY_IP=()
 backup_path=""
 events_file=""
 log_file_path=""
@@ -79,6 +86,10 @@ vm_shutdown_status=""
 _archived_this_run=""
 _pruned_archives=()
 is_retry="false" # NEW: Flag to indicate this is a retry attempt
+# Marker written by the fix-backup endpoint after KVM_Fix_Backup.sh has reset a
+# VM's checkpoint metadata. Its presence means the next backup MUST be full.
+# Resolved once vm_base_dir is known (see DIRECTORY LAYOUT).
+needs_full_marker=""
 
 # ─── Argument parsing ────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -129,6 +140,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--backup-path)
 		backup_path="$2"
+		shift 2
+		;;
+	--disk-threshold)
+		disk_usage_threshold="$2"
 		shift 2
 		;;
 	--retry)
@@ -208,6 +223,17 @@ emit_event() {
 [[ -z "$remote_ip" ]] && die "--ip is required."
 [[ -z "$schedule" ]] && die "--schedule is required."
 [[ -z "$backup_path" ]] && die "--backup-path is required."
+
+# Normalize the disk-usage threshold: must be an integer 1–100, else fall
+# back to the historical default of 80 so a bad value never disables the guard.
+if ! [[ "$disk_usage_threshold" =~ ^[0-9]+$ ]] || \
+	[[ "$disk_usage_threshold" -lt 1 ]] || [[ "$disk_usage_threshold" -gt 100 ]]; then
+	disk_usage_threshold="80"
+fi
+# Warning level is always a fixed 60% "getting full" notice; the hard stop uses
+# the configurable disk_usage_threshold. The stop check runs first, so this fixed
+# warn stays correct even if a pool's threshold is set below 60.
+disk_usage_warn_threshold=60
 
 # Validate backup path exists
 if [[ ! -d "$backup_path" ]]; then
@@ -380,6 +406,10 @@ esac
 scheduler_file="$backup_dir/scheduler"
 lock_file="$lock_dir/${vm_name}_${schedule}_backup"
 
+# Per VM, not per schedule: libvirt checkpoints are VM-global, so a backup fix
+# invalidates the daily, weekly and custom chains simultaneously.
+needs_full_marker="$vm_base_dir/.needs-full"
+
 destination_ip="$remote_ip"
 hostName="$vm_name"
 
@@ -485,13 +515,13 @@ check_available_disk() {
 		return 0
 	fi
 
-	if [[ "$percentage_usage" -gt 80 ]]; then
-		echo -e "${Red}${CROSS} Disk usage ${percentage_usage}% (>80%) on $check_path. Stopping.${NC}"
-		emit_event "disk_check" "error" "Disk >80% (${percentage_usage}%)"
+	if [[ "$percentage_usage" -gt "$disk_usage_threshold" ]]; then
+		echo -e "${Red}${CROSS} Disk usage ${percentage_usage}% (>${disk_usage_threshold}%) on $check_path. Stopping.${NC}"
+		emit_event "disk_check" "error" "Disk >${disk_usage_threshold}% (${percentage_usage}%)"
 		return 1
-	elif [[ "$percentage_usage" -gt 60 ]]; then
-		warn "Disk usage ${percentage_usage}% (>60%) on $check_path"
-		emit_event "disk_check" "warning" "Disk >60% (${percentage_usage}%)"
+	elif [[ "$percentage_usage" -gt "$disk_usage_warn_threshold" ]]; then
+		warn "Disk usage ${percentage_usage}% (>${disk_usage_warn_threshold}%) on $check_path"
+		emit_event "disk_check" "warning" "Disk >${disk_usage_warn_threshold}% (${percentage_usage}%)"
 	fi
 	return 0
 }
@@ -644,21 +674,34 @@ cleanup_retry_partial_files() {
 	# All safety checks passed - proceed with cleanup
 	info "Safety checks passed. Cleaning up partial files..."
 
-	# Find and remove *.partial files in backup directory
-	local partial_files_found=0
+	# Remove *.partial files — and ONLY those.
+	#
+	# This deliberately does NOT delete checkpoints. The previous version removed
+	# the newest checkpoint's data files whenever it found a .partial, assuming the
+	# newest checkpoint belonged to the failed run. It usually doesn't: a run that
+	# dies mid-transfer leaves .partial debris WITHOUT having registered its own
+	# checkpoint, so the newest checkpoint is the last GOOD backup. Retrying then
+	# deleted that backup — while logging "Older checkpoints preserved (backup
+	# chain intact)", which made the loss invisible.
+	#
+	# Cleaning up after a failed attempt means removing that attempt's debris.
+	# Deleting real backup data belongs to retention/archive, never to the retry
+	# path. A stale checkpoint left behind is recoverable (method resolution
+	# detects and cleans a broken chain); a deleted backup is not.
+	local partial_count=0
 	if [[ -d "$backup_dir" ]]; then
-		# Use find to locate all .partial files
-		local partial_files=$(find "$backup_dir" -type f -name "*.partial" 2>/dev/null)
+		# Process substitution rather than a pipe: piping into `while` runs the loop
+		# in a subshell, so the counter was always lost and this reported "Removed 0
+		# partial file(s)" no matter how many it actually deleted.
+		while IFS= read -r partial_file; do
+			[[ -f "$partial_file" ]] || continue
+			info "Removing partial file: $(basename "$partial_file")"
+			rm -f "$partial_file"
+			partial_count=$((partial_count + 1))
+		done < <(find "$backup_dir" -type f -name "*.partial" 2>/dev/null)
 
-		if [[ -n "$partial_files" ]]; then
-			echo "$partial_files" | while read -r partial_file; do
-				if [[ -f "$partial_file" ]]; then
-					info "Removing partial file: $(basename "$partial_file")"
-					rm -f "$partial_file"
-					((partial_files_found++))
-				fi
-			done
-			info "✓ Removed $partial_files_found partial file(s)"
+		if [[ $partial_count -gt 0 ]]; then
+			info "✓ Removed $partial_count partial file(s)"
 		else
 			info "✓ No partial files found in $backup_dir"
 		fi
@@ -666,63 +709,7 @@ cleanup_retry_partial_files() {
 		info "✓ Backup directory does not exist yet: $backup_dir"
 	fi
 
-	# Smart checkpoint cleanup: Only remove the latest checkpoint files
-	# Find the latest checkpoint by using virtnbdrestore to dump metadata
-	if [[ -d "$backup_dir" ]] && command -v virtnbdrestore &>/dev/null; then
-		info "Analyzing backup chain to identify latest checkpoint..."
-
-		# Use virtnbdrestore to get backup metadata
-		local metadata=$(virtnbdrestore -i "$backup_dir" -o dump 2>/dev/null | grep -A 20 '"checkpointName"' || true)
-
-		if [[ -n "$metadata" ]]; then
-			# Extract the latest checkpoint name (highest number)
-			# Example: virtnbdbackup.5
-			local latest_checkpoint=$(echo "$metadata" | grep -o '"checkpointName": "virtnbdbackup\.[0-9]*"' |
-				grep -o 'virtnbdbackup\.[0-9]*' | sort -t. -k2 -n | tail -n1)
-
-			if [[ -n "$latest_checkpoint" ]]; then
-				info "Latest checkpoint found: $latest_checkpoint"
-				info "Removing only the latest checkpoint files to preserve backup chain..."
-
-				# Remove checkpoint files for ONLY the latest checkpoint
-				# This preserves the older checkpoints which are part of the valid backup chain
-				local checkpoint_dir="$backup_dir"
-				local removed_count=0
-				local checkpoint_xml_dir="${backup_dir}/checkpoints"
-
-				rm -f ${checkpoint_xml_dir}/${latest_checkpoint}*
-
-				if [[ -d "$checkpoint_dir" ]]; then
-					# Remove files matching the latest checkpoint pattern
-					# Example: virtnbdbackup.5.* or any file containing virtnbdbackup.5
-					for ckpt_file in "$checkpoint_dir"/*"${latest_checkpoint}"* "$checkpoint_dir"/*.checkpoint; do
-						if [[ -f "$ckpt_file" ]] && [[ "$ckpt_file" == *"${latest_checkpoint}"* ]]; then
-							info "Removing latest checkpoint file: $(basename "$ckpt_file")"
-							rm -f "$ckpt_file"
-							((removed_count++))
-						fi
-					done
-
-					if [[ $removed_count -gt 0 ]]; then
-						info "✓ Removed $removed_count checkpoint file(s) for $latest_checkpoint"
-						info "✓ Older checkpoints preserved (backup chain intact)"
-					else
-						info "✓ No checkpoint files found for $latest_checkpoint"
-					fi
-				fi
-			else
-				info "✓ No checkpoints found in backup metadata"
-			fi
-		else
-			info "✓ Could not read backup metadata (might be first backup)"
-		fi
-	else
-		if [[ ! -d "$backup_dir" ]]; then
-			info "✓ Backup directory does not exist yet"
-		else
-			info "✓ virtnbdrestore not available, skipping checkpoint cleanup"
-		fi
-	fi
+	info "✓ Checkpoints left untouched (only the failed attempt's debris is removed)"
 
 	info "✓ Retry cleanup completed successfully"
 	return 0
@@ -923,15 +910,441 @@ count_existing_backups() {
 	fi
 }
 
+# Cache: virtnbdrestore costs a subprocess and has_full_backup is consulted from
+# both resolve_method and validate_method_state within a single run.
+_HAS_FULL_CACHE_DIR=""
+_HAS_FULL_CACHE_RC=""
+
 has_full_backup() {
 	local dir="$1"
-	if compgen -G "$dir"/*.full.* >/dev/null 2>&1; then
+
+	if [[ -n "$_HAS_FULL_CACHE_RC" && "$dir" == "$_HAS_FULL_CACHE_DIR" ]]; then
+		return "$_HAS_FULL_CACHE_RC"
+	fi
+
+	_has_full_backup_uncached "$dir"
+	local rc=$?
+	_HAS_FULL_CACHE_DIR="$dir"
+	_HAS_FULL_CACHE_RC="$rc"
+	return "$rc"
+}
+
+# Does this directory hold a real full backup?
+#
+# Answered from evidence, in order of authority. It used to be a filename glob
+# (`*.full.*`), which also matched virtnbdbackup's OWN log file
+# "backup.full.<ts>.log". So a full backup that FAILED and produced nothing but
+# a log still looked like a successful full: every later run picked inc, and
+# virtnbdbackup died with "No full backup found in target directory" — forever,
+# because each failure dropped another log that kept the directory looking
+# populated. The script even printed the contradiction it was ignoring:
+# "Full backup exists (0/7 backups)".
+_has_full_backup_uncached() {
+	local dir="$1"
+	[[ -d "$dir" ]] || return 1
+
+	# 1. virtnbdrestore is authoritative: it reads the actual data files instead
+	#    of inferring from names. "No data files found" + non-zero exit is proof
+	#    that not one backup data file exists here, whatever the logs suggest.
+	if command -v virtnbdrestore &>/dev/null; then
+		local out="" rc=0
+		out=$(virtnbdrestore -o dump -i "$dir" 2>&1)
+		rc=$?
+
+		if [[ $rc -eq 0 ]]; then
+			# A readable chain exists. virtnbdbackup cannot write an inc without a
+			# full, so readable data implies a full.
+			return 0
+		fi
+		if grep -qi "No data files found" <<<"$out"; then
+			return 1
+		fi
+		# Non-zero for some other reason (corrupt chain, tool error): inconclusive,
+		# so fall through rather than act on a result we do not understand.
+	fi
+
+	# 2. The scheduler ledger. record_scheduler only writes after a backup has
+	#    actually succeeded, so a "full" entry is a record of a real full.
+	if [[ -f "$dir/scheduler" ]] && grep -qiw "full" "$dir/scheduler" 2>/dev/null; then
 		return 0
 	fi
-	if [[ -f "$dir/scheduler" ]] && grep -qi "full" "$dir/scheduler" 2>/dev/null; then
-		return 0
-	fi
+
+	# 3. Nothing evidences a full. Safe because the broken-chain path quarantines
+	#    rather than deletes — see quarantine_broken_chain.
 	return 1
+}
+
+# Move a broken chain's contents aside instead of deleting them.
+#
+# This path is reached when a directory has content but no provable full backup.
+# It used to run `rm -rf` over everything but logs/, which is unacceptable when
+# the decision rests on inference: one wrong call and real backups are gone with
+# no way back. Quarantining is equally effective at unblocking a fresh full, and
+# a human can inspect (and delete) the leftovers at their leisure.
+#
+# Quarantine lives OUTSIDE the schedule directory so it cannot be mistaken for
+# backup content by later runs.
+quarantine_broken_chain() {
+	local dir="$1"
+	local sched_name=""
+	sched_name=$(basename "$dir")
+
+	# Gather first: only create the quarantine directory if there is something
+	# to put in it, so repeated failures do not litter empty folders.
+	local -a items=()
+	local entry="" base=""
+	while IFS= read -r -d '' entry; do
+		base=$(basename "$entry")
+		[[ "$base" == "logs" ]] && continue
+		items+=("$entry")
+	done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+	if [[ ${#items[@]} -eq 0 ]]; then
+		info "Nothing to quarantine in $dir"
+		return 0
+	fi
+
+	local stamp=""
+	stamp=$(date +"%Y-%m-%d_%H-%M-%S")
+	local qdir="$vm_base_dir/.broken/${sched_name}_${stamp}"
+
+	if ! mkdir -p "$qdir" 2>/dev/null; then
+		warn "Could not create quarantine directory $qdir"
+		warn "Leaving $dir untouched — nothing was deleted. Backup will likely fail; please clear it manually."
+		return 1
+	fi
+
+	local moved=0
+	for entry in "${items[@]}"; do
+		if mv "$entry" "$qdir/" 2>/dev/null; then
+			moved=$((moved + 1))
+		else
+			warn "Could not move $(basename "$entry") into quarantine"
+		fi
+	done
+
+	info "Quarantined $moved item(s) to $qdir"
+	info "Nothing was deleted — remove that directory once you have reviewed it."
+	return 0
+}
+
+###############################################################################
+# HYPERVISOR-SIDE CHAIN INTEGRITY
+#
+# A virtnbdbackup incremental chain lives in two places:
+#
+#   1. The target directory — data files plus checkpoints/, the on-disk
+#      checkpoint definitions.
+#   2. The hypervisor — libvirt checkpoints plus the persistent qemu dirty
+#      bitmaps they describe.
+#
+# has_full_backup only ever inspects (1). KVM_Fix_Backup.sh only ever destroys
+# (2) — that is its entire job, and its closing message says so. So after a
+# backup fix the target directory still looks perfect (virtnbdrestore reads it
+# happily), auto_detect_method concluded "full exists, under retention → inc",
+# and virtnbdbackup died putting the chain back onto the VM:
+#
+#   Loaded checkpoint list from: <dir>/checkpoints
+#   Redefine missing checkpoint: [virtnbdbackup.0]
+#   Redefining checkpoint failed: checkpoint inconsistent: missing or broken
+#     bitmap 'virtnbdbackup.0' for disk 'vda'
+#
+# And it never recovered on its own: a failed inc leaves the directory untouched
+# by design, so nothing recorded that the chain was dead and every later run
+# reached the same verdict and failed the same way, indefinitely.
+#
+# These helpers ask the hypervisor the question the target directory cannot
+# answer: can this chain still be extended?
+###############################################################################
+
+# The checkpoint names this chain expects the VM to still hold.
+#
+# Primary source is <dir>/checkpoints — the very directory virtnbdbackup reports
+# loading its list from. Diffing the same set it diffs reproduces its decision
+# instead of approximating it. Deliberately NOT the scheduler ledger: that file
+# records Day/Date/Method with no checkpoint names at all, its counts drift by
+# design (record_scheduler dedupes per day, validate_scheduler rebuilds it with
+# N/A placeholders), and the system already treats it as derived — so it can
+# only ever support a count comparison, and an unreliable one.
+expected_chain_checkpoints() {
+	local dir="$1"
+	local cp_dir="$dir/checkpoints"
+
+	if [[ -d "$cp_dir" ]]; then
+		local names=""
+		names=$(find "$cp_dir" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null |
+			sed 's/\.xml$//' | awk 'NF' | sort -u)
+		if [[ -n "$names" ]]; then
+			printf '%s\n' "$names"
+			return 0
+		fi
+	fi
+
+	# Fallback when checkpoints/ is absent or unreadable: virtnbdrestore reads
+	# the data files themselves and reports each checkpointName.
+	#
+	# The array is located by a line that is *only* an opening bracket (or a
+	# bracket immediately opening an object). Anchoring on a bare '[' the way
+	# `sed -n '/^ *\[/,$p'` does is too loose: every virtnbdbackup log line
+	# begins with "[2026-07-27 12:38:01] INFO ...", so the moment one of them
+	# reaches stdout the captured text starts with a log line, jq rejects it,
+	# and the chain silently appears to expect nothing — which would wave a
+	# broken incremental straight through.
+	if command -v virtnbdrestore &>/dev/null && command -v jq &>/dev/null; then
+		local dump=""
+		dump=$(virtnbdrestore -o dump -i "$dir" 2>/dev/null |
+			sed 's/\x1b\[[0-9;]*m//g' |
+			sed -n '/^[[:space:]]*\[[[:space:]]*\({\|$\)/,$p')
+		if [[ -n "$dump" ]] && jq empty <<<"$dump" 2>/dev/null; then
+			jq -r '.[].checkpointName' <<<"$dump" 2>/dev/null | awk 'NF' | sort -u
+			return 0
+		fi
+	fi
+
+	return 0
+}
+
+# Checkpoint names the VM actually holds. Non-zero exit means we could not ask,
+# which must be treated as inconclusive rather than as "none".
+hypervisor_checkpoints() {
+	local out=""
+	if ! out=$(virsh -c "qemu+ssh://root@$destination_ip/system" \
+		checkpoint-list --name "$vm_name" 2>/dev/null); then
+		return 1
+	fi
+	printf '%s\n' "$out" | awk 'NF' | sort -u
+	return 0
+}
+
+# Dirty bitmaps qemu has flagged inconsistent.
+#
+# Only `inconsistent` is treated as broken. A bitmap that is merely not
+# recording is normal (they are disabled while a backup runs), so testing for
+# that would condemn healthy chains.
+inconsistent_chain_bitmaps() {
+	command -v jq &>/dev/null || return 0
+
+	local qmp=""
+	qmp=$(virsh -c "qemu+ssh://root@$destination_ip/system" qemu-monitor-command \
+		"$vm_name" --cmd '{"execute":"query-block"}' 2>/dev/null) || return 0
+	[[ -n "$qmp" ]] || return 0
+	jq empty <<<"$qmp" 2>/dev/null || return 0
+
+	jq -r '
+		[ .return[]?
+		  | .inserted?
+		  | select(. != null)
+		  | (.["dirty-bitmaps"]? // [])
+		  | .[]
+		  | select(.inconsistent == true)
+		  | .name
+		] | unique | .[]
+	' <<<"$qmp" 2>/dev/null | awk 'NF' | sort -u
+	return 0
+}
+
+# Can this chain be extended? 0 = yes, 1 = no, 2 = could not determine.
+# The reason is left in _CHAIN_HEALTH_REASON for logging.
+#
+# Cached: consulted from both validate_method_state and the full-side stale
+# check within a single run, and each call costs an SSH round trip.
+_CHAIN_HEALTH_CACHE_DIR=""
+_CHAIN_HEALTH_CACHE_RC=""
+_CHAIN_HEALTH_REASON=""
+
+hypervisor_chain_intact() {
+	local dir="$1"
+
+	if [[ -n "$_CHAIN_HEALTH_CACHE_RC" && "$dir" == "$_CHAIN_HEALTH_CACHE_DIR" ]]; then
+		return "$_CHAIN_HEALTH_CACHE_RC"
+	fi
+
+	_hypervisor_chain_intact_uncached "$dir"
+	local rc=$?
+	_CHAIN_HEALTH_CACHE_DIR="$dir"
+	_CHAIN_HEALTH_CACHE_RC="$rc"
+	return "$rc"
+}
+
+_hypervisor_chain_intact_uncached() {
+	local dir="$1"
+	_CHAIN_HEALTH_REASON=""
+
+	local expected=""
+	expected=$(expected_chain_checkpoints "$dir")
+	if [[ -z "$expected" ]]; then
+		# The chain expects nothing of the VM, so there is nothing to redefine
+		# and nothing that can be missing.
+		return 0
+	fi
+
+	local actual=""
+	if ! actual=$(hypervisor_checkpoints); then
+		_CHAIN_HEALTH_REASON="could not read the checkpoint list from $destination_ip"
+		return 2
+	fi
+
+	# expected ⊆ actual. ANY missing member breaks the redefine, not just the
+	# base checkpoint: virtnbdbackup redefines every checkpoint the target knows
+	# about and the VM does not, and one failure aborts the run.
+	local missing=""
+	missing=$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") |
+		awk 'NF' | paste -sd, -)
+	if [[ -n "$missing" ]]; then
+		_CHAIN_HEALTH_REASON="checkpoint(s) missing on the hypervisor: $missing"
+		return 1
+	fi
+
+	# Names all present is necessary but not sufficient — note the error is
+	# "missing OR BROKEN bitmap". A checkpoint can be listed while the bitmap it
+	# describes is inconsistent, which fails in exactly the same place.
+	local broken=""
+	broken=$(inconsistent_chain_bitmaps)
+	if [[ -n "$broken" ]]; then
+		local overlap=""
+		overlap=$(comm -12 <(printf '%s\n' "$expected") <(printf '%s\n' "$broken") |
+			awk 'NF' | paste -sd, -)
+		if [[ -n "$overlap" ]]; then
+			_CHAIN_HEALTH_REASON="inconsistent dirty bitmap(s) on the hypervisor: $overlap"
+			return 1
+		fi
+	fi
+
+	return 0
+}
+
+# The mirror drift: checkpoints the VM carries that no local chain accounts for.
+#
+# These do not break an incremental — they break a FULL. A fresh chain colliding
+# with leftover virtnbdbackup.N state is exactly what KVM_Fix_Backup.sh's
+# offline path sweeps with `qemu-img bitmap --remove`. Reported, never acted on:
+# deleting checkpoints on a live hypervisor is not this script's call to make.
+stale_hypervisor_checkpoints() {
+	local dir="$1"
+
+	local actual=""
+	actual=$(hypervisor_checkpoints) || return 0
+	[[ -n "$actual" ]] || return 0
+
+	local expected=""
+	expected=$(expected_chain_checkpoints "$dir")
+
+	comm -13 <(printf '%s\n' "$expected" | sort -u) <(printf '%s\n' "$actual") | awk 'NF'
+	return 0
+}
+
+warn_stale_hypervisor_state() {
+	local stale=""
+	stale=$(stale_hypervisor_checkpoints "$backup_dir" | paste -sd, -)
+	[[ -z "$stale" ]] && return 0
+
+	warn "Hypervisor holds checkpoint(s) no local chain accounts for: $stale"
+	warn "A fresh full may collide with them. If this backup fails, run the backup fix for '$vm_name' and retry."
+	emit_event "stale_hypervisor_checkpoints" "warning" \
+		"Stale checkpoints on hypervisor" "checkpoints=$stale"
+	return 0
+}
+
+###############################################################################
+# "NEXT BACKUP MUST BE FULL" MARKER
+#
+# KVM_Fix_Backup.sh knows for certain that it has invalidated every chain for a
+# VM. Until now that knowledge died with the SSH session, leaving this script to
+# rediscover it the hard way (or not at all). The fix endpoint now records it
+# beside the VM's backup directories, and this script honours it without needing
+# to ask the hypervisor anything.
+###############################################################################
+
+needs_full_marker_present() {
+	[[ -n "$needs_full_marker" && -f "$needs_full_marker" ]]
+}
+
+needs_full_marker_reason() {
+	local reason=""
+	if needs_full_marker_present && command -v jq &>/dev/null; then
+		reason=$(jq -r '.reason // empty' "$needs_full_marker" 2>/dev/null)
+	fi
+	[[ -z "$reason" ]] && reason="a backup fix reset this VM's checkpoint metadata"
+	printf '%s' "$reason"
+}
+
+clear_needs_full_marker() {
+	needs_full_marker_present || return 0
+	if rm -f "$needs_full_marker" 2>/dev/null; then
+		info "Cleared the 'next backup must be full' marker."
+		emit_event "needs_full_cleared" "info" "Marker cleared after a successful backup"
+	else
+		warn "Could not remove $needs_full_marker — the next run will force a full again."
+	fi
+	return 0
+}
+
+# Set aside the current chain and switch to full.
+#
+# ARCHIVE, not quarantine. This chain is still perfectly restorable — it simply
+# cannot be extended. .broken/ is for data whose integrity is in doubt; this
+# data's integrity is not in doubt, so it belongs in archived/ alongside every
+# other rotated chain, visible to restore and subject to --keep-archive pruning.
+promote_chain_to_full() {
+	local reason="$1"
+
+	warn "Incremental is not possible: $reason"
+	info "Archiving the existing chain and starting a new full backup."
+
+	archive_current_chain "$backup_dir" "$schedule"
+	prune_archives "$schedule" "$archives_to_keep"
+	mkdir -p "$backup_dir" "$log_dir" 2>/dev/null
+
+	method="full"
+	emit_event "chain_promoted_full" "warning" "Promoted inc → full: $reason" "reason=$reason"
+	return 0
+}
+
+# Gate an incremental on the hypervisor half of the chain.
+#
+# Runs for BOTH an auto-resolved 'inc' and an explicit --method inc (custom-days
+# sends one). Refusing an operator's explicit inc guarantees a failed job;
+# promoting it produces a working backup, and there is precedent for that right
+# next door in validate_method_state ("No existing backup. Switching to full.").
+enforce_inc_chain_health() {
+	if needs_full_marker_present; then
+		promote_chain_to_full "$(needs_full_marker_reason)"
+		return 0
+	fi
+
+	local rc=0
+	hypervisor_chain_intact "$backup_dir"
+	rc=$?
+
+	case "$rc" in
+	1)
+		promote_chain_to_full "$_CHAIN_HEALTH_REASON"
+		;;
+	2)
+		# Inconclusive. Do not act on a result we do not understand: archiving a
+		# healthy chain costs a full backup and a restore path. Proceed with the
+		# inc and let virtnbdbackup be the authority — the reactive path in
+		# main() catches it if it does fail.
+		warn "Could not verify hypervisor checkpoint state (${_CHAIN_HEALTH_REASON:-unknown}). Proceeding with inc."
+		;;
+	*)
+		info "Hypervisor still holds this chain's checkpoints. Incremental is safe."
+		;;
+	esac
+	return 0
+}
+
+# Guards the reactive recovery in main() to a single attempt, so a chain that is
+# broken for a reason archiving cannot fix can never loop.
+_chain_recovery_attempted="false"
+
+# Signatures that mean "this chain cannot be extended", taken from
+# virtnbdbackup's own output. These are its verdicts, not our inferences.
+chain_failure_detected() {
+	local log="$1"
+	[[ -n "$log" && -f "$log" ]] || return 1
+	grep -qiE 'Failed to redefine checkpoints|checkpoint inconsistent|missing or broken bitmap|No full backup found in target directory' \
+		"$log" 2>/dev/null
 }
 
 check_method_conflicts() {
@@ -969,6 +1382,14 @@ validate_method_state() {
 			else
 				die "No full backup but data exists in $backup_dir. Broken chain. Remove contents."
 			fi
+		fi
+
+		# A readable full on disk is only half the requirement. The hypervisor
+		# must still hold the checkpoints this chain expects, or virtnbdbackup
+		# fails redefining them — a non-empty directory containing a perfectly
+		# good full is exactly the state that used to slip through here.
+		if [[ "$method" == "inc" ]]; then
+			enforce_inc_chain_health
 		fi
 		;;
 	auto)
@@ -1012,13 +1433,27 @@ prune_archives() {
 	fi
 	_pruned_archives=()
 
+	# Match both the current naming scheme (<timestamp>_<vm_name>_<sched>)
+	# and the legacy scheme (archived-<vm_name>_<timestamp>) used by older
+	# versions of this script, so old-style archives are counted and pruned
+	# too instead of accumulating forever.
 	local matching_archives=()
-	local line=""
-	while IFS= read -r line; do
-		if [[ -n "$line" ]]; then
-			matching_archives+=("$line")
-		fi
-	done < <(find "$archived_backup_dir" -maxdepth 1 -mindepth 1 -type d -name "*_${vm_name}_${sched}" 2>/dev/null | sort)
+	local entry=""
+	local mtime=""
+	local dated=()
+	while IFS= read -r -d '' entry; do
+		mtime=$(stat -c '%Y' "$entry" 2>/dev/null || stat -f '%m' "$entry" 2>/dev/null)
+		[[ -z "$mtime" ]] && mtime=0
+		dated+=("${mtime} ${entry}")
+	done < <(find "$archived_backup_dir" -maxdepth 1 -mindepth 1 -type d \
+		\( -name "*_${vm_name}_${sched}" -o -name "archived-${vm_name}_*" \) \
+		-print0 2>/dev/null)
+
+	if [[ ${#dated[@]} -gt 0 ]]; then
+		while IFS= read -r line; do
+			[[ -n "$line" ]] && matching_archives+=("${line#* }")
+		done < <(printf '%s\n' "${dated[@]}" | sort -n)
+	fi
 
 	local count=${#matching_archives[@]}
 	if [[ "$count" -gt "$keep" ]]; then
@@ -1082,13 +1517,15 @@ auto_detect_method() {
 		return 0
 	fi
 
-	# Case 2: Data exists but no full backup → broken state
+	# Case 2: Content exists but no provable full backup → broken state.
+	# Quarantine rather than delete: this decision rests on inference, and the
+	# cost of being wrong must never be destroyed backups.
 	if ! has_full_backup "$backup_dir"; then
-		warn "Data exists but no full backup found. Cleaning and starting fresh."
-		find "$backup_dir" -mindepth 1 -maxdepth 1 ! -name 'logs' -exec rm -rf {} + 2>/dev/null
+		warn "Content exists but no full backup found. Quarantining and starting fresh."
+		quarantine_broken_chain "$backup_dir"
 		method="full"
-		info "Cleaned broken chain. Method: full (fresh start)"
-		emit_event "method_auto" "warning" "Auto-selected: full (broken chain cleaned)"
+		info "Broken chain set aside. Method: full (fresh start)"
+		emit_event "method_auto" "warning" "Auto-selected: full (broken chain quarantined)"
 		return 0
 	fi
 
@@ -1491,9 +1928,16 @@ run_rsync_with_progress() {
 # VIRTNBDBACKUP RUNNER
 ###############################################################################
 
+# Detail log of the most recent virtnbdbackup invocation, so the caller can read
+# virtnbdbackup's own verdict on a failure. Empty under --verbose, where output
+# goes straight to the terminal and there is no file to scan.
+_virtnbd_last_detail_log=""
+
 run_virtnbdbackup() {
 	local target_dir="$1"
 	local level="$2"
+
+	_virtnbd_last_detail_log=""
 
 	local cmd=(
 		virtnbdbackup --raw
@@ -1525,6 +1969,7 @@ run_virtnbdbackup() {
 	fi
 
 	local virtnbd_detail_log="$log_dir/${log_timestamp}_${schedule}_${level}_virtnbdbackup_detail.log"
+	_virtnbd_last_detail_log="$virtnbd_detail_log"
 	local exit_code_file="$BACKUP_TMP_EXIT/.virtnbdbackup_exit_$$"
 	rm -f "$exit_code_file"
 
@@ -1756,18 +2201,23 @@ offsite_sync() {
 	for entry in "${OFFSITE_HOSTS[@]}"; do
 		entry=$(echo "$entry" | xargs)
 		[[ -z "$entry" ]] && continue
-		# Entry format: "ip" or "ip:/custom/base/path" (colon delimiter — safe
-		# because IPv4 addresses contain no colons).
-		local oip="${entry%%:*}"
-		local opath=""
-		if [[ "$entry" == *":"* ]]; then
-			opath="${entry#*:}"
-		fi
+		# Entry format: "ip", "ip:/custom/base/path", or
+		# "ip:/custom/base/path:threshold" (colon delimiter — safe because IPv4
+		# addresses and absolute paths contain no colons). The optional third
+		# field is a per-pool disk-usage threshold (percent).
+		local oip="" opath="" othresh=""
+		IFS=':' read -r oip opath othresh <<<"$entry"
 		oip=$(echo "$oip" | xargs)
 		opath=$(echo "$opath" | xargs)
+		othresh=$(echo "$othresh" | xargs)
 		if [[ -n "$oip" ]]; then
 			offsite_host_list+=("$oip")
 			OFFSITE_PATH_BY_IP["$oip"]="$opath"
+			# Only keep a valid integer 1–100; otherwise leave unset so the
+			# global threshold applies.
+			if [[ "$othresh" =~ ^[0-9]+$ ]] && [[ "$othresh" -ge 1 ]] && [[ "$othresh" -le 100 ]]; then
+				OFFSITE_THRESHOLD_BY_IP["$oip"]="$othresh"
+			fi
 		fi
 	done
 
@@ -2136,6 +2586,12 @@ offsite_sync_single_host() {
 	[[ -z "$remote_base" ]] && remote_base="$backup_path"
 	local remote_vm_dir="$remote_base/$vm_name"
 
+	# Per-pool disk-usage guard for this offsite destination. Falls back to the
+	# global threshold when the controller didn't send a per-pool value. The
+	# warning level is always a fixed 60% (stop check runs first).
+	local remote_threshold="${OFFSITE_THRESHOLD_BY_IP[$oip]:-$disk_usage_threshold}"
+	local remote_warn=60
+
 	# ── Progress-file writer (for the per-host monitor bars) ─────────────
 	write_progress() {
 		local pct="${1:-0}"
@@ -2374,14 +2830,14 @@ offsite_sync_single_host() {
 		remote_usage=$(ssh "${remote_user}@${oip}" \
 			"mkdir -p '$remote_base'; df '$remote_base' | awk 'NR>1 {print \$5}' | sed 's/%//g'" 2>/dev/null)
 
-		if [[ -n "$remote_usage" ]] && [[ "$remote_usage" -gt 85 ]]; then
-			echo "✗ Remote disk ${remote_usage}% (>85%)."
+		if [[ -n "$remote_usage" ]] && [[ "$remote_usage" -gt "$remote_threshold" ]]; then
+			echo "✗ Remote disk ${remote_usage}% (>${remote_threshold}%)."
 			write_progress 0 "" "0B" "" "failed"
-			offsite_emit "offsite_fail" "error" "Remote disk >85%"
+			offsite_emit "offsite_fail" "error" "Remote disk >${remote_threshold}%"
 			rm -f "$offsite_lock"
-			echo "FAILED|Remote disk ${remote_usage}% (>85%)" >"$status_file"
+			echo "FAILED|Remote disk ${remote_usage}% (>${remote_threshold}%)" >"$status_file"
 			return 1
-		elif [[ -n "$remote_usage" ]] && [[ "$remote_usage" -gt 70 ]]; then
+		elif [[ -n "$remote_usage" ]] && [[ "$remote_usage" -gt "$remote_warn" ]]; then
 			echo "⚠ Remote disk ${remote_usage}%"
 		fi
 		echo "✓ Disk OK (${remote_usage:-?}%)"
@@ -2726,6 +3182,13 @@ main() {
 		;;
 	esac
 
+	# ── Warn about the mirror drift before a full ────────────────────
+	# Checkpoints left on the VM that no local chain accounts for can collide
+	# with a fresh chain. Reported so a failure here has an obvious next step.
+	if [[ "$method" == "full" ]]; then
+		warn_stale_hypervisor_state
+	fi
+
 	# ── Retry cleanup ────────────────────────────────────────────────
 	# If this is a retry attempt, perform safety checks and clean up
 	# partial files from the previous failed attempt
@@ -2751,6 +3214,38 @@ main() {
 	else
 		echo -e "${Red}${CROSS} ${method^} backup FAILED for $vm_name on $destination_ip${NC}"
 		emit_event "backup_fail" "error" "${method^} backup failed"
+
+		# ── Reactive chain recovery ───────────────────────────────────
+		# The pre-flight check cannot cover everything: the hypervisor's state
+		# can change between detection and execution, and a bitmap can be
+		# unusable in a way neither checkpoint-list nor query-block reports.
+		# When virtnbdbackup itself says the chain cannot be extended, act on
+		# that verdict rather than burning the backup window — and rather than
+		# leaving a dead chain that fails identically every day from here on.
+		#
+		# _chain_recovery_attempted makes this strictly one retry.
+		if [[ "$method" == "inc" ]] && [[ "$_chain_recovery_attempted" != "true" ]] &&
+			chain_failure_detected "$_virtnbd_last_detail_log"; then
+			_chain_recovery_attempted="true"
+
+			echo ""
+			warn "virtnbdbackup reports this checkpoint chain cannot be extended."
+			promote_chain_to_full "virtnbdbackup could not redefine the chain onto the VM"
+			warn_stale_hypervisor_state
+			info "Retrying once as a full backup ..."
+			echo ""
+
+			if run_virtnbdbackup "$backup_dir" "$method"; then
+				backup_success=true
+				record_scheduler "$backup_dir" "$method"
+				echo ""
+				info "${method^} backup succeeded for $vm_name on $destination_ip (after chain recovery)"
+				emit_event "backup_complete" "success" "${method^} backup succeeded after chain recovery"
+			else
+				echo -e "${Red}${CROSS} ${method^} backup FAILED after chain recovery${NC}"
+				emit_event "backup_fail" "error" "${method^} backup failed after chain recovery"
+			fi
+		fi
 	fi
 
 	if [[ "$backup_success" != "true" ]]; then
@@ -2774,6 +3269,10 @@ main() {
 
 		exit 1
 	fi
+
+	# ── Clear the "must be full" marker ──────────────────────────────
+	# A backup just succeeded, so whatever the fix invalidated is resolved.
+	clear_needs_full_marker
 
 	# ── Verify ───────────────────────────────────────────────────────
 	verify_created_backups "$backup_dir" || {

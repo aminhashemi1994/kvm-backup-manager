@@ -1,0 +1,40 @@
+
+the get of tmux sync is taking a bit time, but want to show the active jobs exactly i open the active jobs and history
+
+retry a backup will lead to this error 
+Original job has no storage pool on record; cannot retry. Edit the schedule and trigger a fresh backup instead. but we know the storage pool each of them in the scheduler, the only situation that we dont know the storage pool is that when we delete the scheduelr, even if we updated the scheduler we will get the latest storage pool of the backup
+
+there is another issue that 
+backup
+AI-core.prod.cando.farashenasa.ai
+2025922-108893909791790
+FULL	Backup Server Site2 (HV85)	
+Syncing offsite
+12%
+Offsite sync (192.168.28.243): 41,939,652,617 @ 1.05MB/s
+12h 13m	
+View Logs
+Cancel
+backup
+cando-neobankdatabase-1-prod-site2.psg.network
+20240810-180037679768662-140
+FULL	Backup Server Site2 (HV85)	
+Backing up
+12%
+Offsite sync (192.168.28.243): 176,344,161,601 @ 1.36MB/s
+36h 13m	
+View Logs
+Cancel
+backup
+cando-neobankcore-1-prod-site2.psg.network
+20240810-175902488935015-29
+DAILY	Backup Server Site2 (HV85)	
+Syncing offsite
+48%
+Offsite sync (192.168.28.243): 3,790,766,369,672 @ 1.10MB/s
+132h 13m	
+View Logs
+Cancel
+
+
+the backup is in rsync state but the backups state is at back up, but refreshing the page will fix that too.

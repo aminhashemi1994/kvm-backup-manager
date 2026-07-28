@@ -99,6 +99,12 @@ export default function StoragePoolCard({ pool }: StoragePoolCardProps) {
             </span>
           </div>
 
+          {/* Disk Usage Threshold */}
+          <div className="flex items-center justify-between py-2 border-t">
+            <span className="text-sm text-gray-600">Usage Threshold</span>
+            <span className="text-sm font-medium">{pool.diskUsageThreshold ?? 80}%</span>
+          </div>
+
           {/* Mount Point Status */}
           <div className="flex items-center justify-between py-2 border-t">
             <span className="text-sm text-gray-600">Mount Point</span>

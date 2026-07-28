@@ -183,6 +183,37 @@ class FileStorage {
     return _runExclusive(filePath, () => this._writeJSONLocked(filePath, data));
   }
 
+  /**
+   * Atomic read-modify-write.
+   *
+   * readJSON and writeJSON are each serialized, but a caller that does
+   * `read → mutate → write` is NOT: any other writer that lands between the
+   * two steps is silently overwritten by the second one (classic lost update).
+   * With the agent posting a progress update every second and the /active
+   * reconciler holding a snapshot for several seconds while it talks to the
+   * agents, that window is hit constantly — which is how a job adopted from a
+   * live tmux session vanishes from the panel and then pops back on the next
+   * reconcile.
+   *
+   * This runs the whole sequence inside the file's queue, so nothing can
+   * interleave. `mutator(data)` mutates `data` in place; return `false` from it
+   * to skip the write entirely.
+   *
+   * The mutator MUST NOT call any other fileStorage method for the same file —
+   * that would await a promise queued behind this one and deadlock.
+   *
+   * @returns {Promise<{data: any, written: boolean}>}
+   */
+  async mutateJSON(filePath, mutator) {
+    return _runExclusive(filePath, async () => {
+      const data = await this._readJSONLocked(filePath);
+      const result = await mutator(data);
+      if (result === false) return { data, written: false };
+      await this._writeJSONLocked(filePath, data);
+      return { data, written: true };
+    });
+  }
+
   async _writeJSONLocked(filePath, data) {
     const json = JSON.stringify(data, null, 2);
     const tmpPath = `${filePath}.tmp`;
@@ -230,6 +261,7 @@ class FileStorage {
   // Backup Jobs
   async getBackupJobs() { return await this.readJSON(config.backupJobsFile); }
   async saveBackupJobs(jobs) { await this.writeJSON(config.backupJobsFile, jobs); }
+  async updateBackupJobs(mutator) { return await this.mutateJSON(config.backupJobsFile, mutator); }
 
   // Offsite Hosts
   async getOffsiteHosts() { 
@@ -288,6 +320,7 @@ module.exports = {
   saveBackupSchedules: (schedules) => fileStorage.saveBackupSchedules(schedules),
   getBackupJobs: () => fileStorage.getBackupJobs(),
   saveBackupJobs: (jobs) => fileStorage.saveBackupJobs(jobs),
+  updateBackupJobs: (mutator) => fileStorage.updateBackupJobs(mutator),
   getOffsiteHosts: () => fileStorage.getOffsiteHosts(),
   saveOffsiteHosts: (hosts) => fileStorage.saveOffsiteHosts(hosts),
   getStoragePools: () => fileStorage.getStoragePools(),
@@ -361,6 +394,7 @@ module.exports = {
   // without re-inventing the temp-file/rename dance.
   readJSON: (filePath) => fileStorage.readJSON(filePath),
   writeJSON: (filePath, data) => fileStorage.writeJSON(filePath, data),
+  mutateJSON: (filePath, mutator) => fileStorage.mutateJSON(filePath, mutator),
   // Restore Jobs (stored in data/restore-jobs.json with { jobs: [] } wrapper).
   // Uses the same atomic write path as everything else; readers transparently
   // unwrap the { jobs: [...] } envelope.

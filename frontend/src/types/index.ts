@@ -51,6 +51,7 @@ export interface OffsiteStoragePool {
   usedGB?: number
   availableGB?: number
   usagePercent?: number
+  diskUsageThreshold?: number
   mounted?: boolean
   status: 'active' | 'error'
   lastError?: string | null
@@ -155,7 +156,9 @@ export interface BackupJob {
   compression: number
   noCompression: boolean
   noVerify: boolean
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'skipped'
+  // 'rejected' = the run was declined because the VM was already backing up
+  // (the agent holds one lock per VM). Nothing was attempted; not a failure.
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'skipped' | 'rejected' | 'retrying'
   phase?: 'queued' | 'starting' | 'backup' | 'rsync' | 'completed' | 'failed' | 'orphaned' | 'restore' | 'unknown'
   startTime: string
   endTime?: string
@@ -165,6 +168,10 @@ export interface BackupJob {
   progress?: number
   progressText?: string
   skippedReason?: string // Reason for skipping (e.g., 'agent_offline')
+  rejectedReason?: string // Why the run was declined (e.g., 'already_running')
+  coveredBy?: string // ID of the backup that was already running when this run was rejected
+  collidedWithSession?: string // tmux session of that running backup
+  storagePoolPath?: string // Pool a tmux-adopted run is writing into (for log lookup)
   canRetry?: boolean // Whether this job can be retried
   retryOf?: string // ID of the original job if this is a retry
   supersededBy?: string // ID of the retry job that superseded this skipped record
@@ -173,6 +180,7 @@ export interface BackupJob {
   offsiteResults?: Array<{ ip: string; poolPath?: string; status: string; reason?: string }>
   verified?: boolean // True when the terminal status came from the agent's own exit-code detection
   unverified?: boolean // True when completion was inferred by the reconciler without a confirmed exit code
+  failureReason?: string // Why it failed: 'script_error' | 'orphaned' | 'interrupted' | 'indeterminate' (outcome unprovable — shown as failed, may have succeeded) | ...
   replay?: boolean // Whether this is a missed-run replay
   originallyScheduledAt?: string // Original scheduled time for replays
   replayReason?: string

@@ -104,6 +104,7 @@ export default function CleanupPage() {
       case 'log': return <FileText className="h-4 w-4 text-green-600" />
       case 'lock': return <Lock className="h-4 w-4 text-red-600" />
       case 'temp': return <FileText className="h-4 w-4 text-gray-600" />
+      case 'backupLog': return <FileText className="h-4 w-4 text-purple-600" />
       default: return <FileText className="h-4 w-4" />
     }
   }
@@ -304,6 +305,7 @@ export default function CleanupPage() {
                               ...agent.logFiles,
                               ...agent.lockFiles,
                               ...agent.tempFiles,
+                              ...agent.backupLogFiles,
                             ].map(f => f.path)
                             if (allFiles.length === 0) continue
                             try {
@@ -344,6 +346,7 @@ export default function CleanupPage() {
                               ...agent.logFiles,
                               ...agent.lockFiles,
                               ...agent.tempFiles,
+                              ...agent.backupLogFiles,
                             ].map(f => f.path)
                             if (allFiles.length > 0) {
                               newMap.set(agent.agentId, new Set(allFiles))
@@ -500,6 +503,7 @@ function AgentCleanupCard({
     ...agent.logFiles,
     ...agent.lockFiles,
     ...agent.tempFiles,
+    ...agent.backupLogFiles,
   ]
 
   const allSelected = allFiles.length > 0 && allFiles.every(f => selectedFiles.has(f.path))
@@ -550,6 +554,7 @@ function AgentCleanupCard({
             <TabsTrigger value="logs">Logs ({agent.logFiles.length})</TabsTrigger>
             <TabsTrigger value="locks">Locks ({agent.lockFiles.length})</TabsTrigger>
             <TabsTrigger value="temp">Temp ({agent.tempFiles.length})</TabsTrigger>
+            <TabsTrigger value="backupLogs">Backup Logs ({agent.backupLogFiles.length})</TabsTrigger>
           </TabsList>
 
           <TabsContent value="all">
@@ -599,6 +604,17 @@ function AgentCleanupCard({
           <TabsContent value="temp">
             <FileTable
               files={agent.tempFiles}
+              selectedFiles={selectedFiles}
+              onToggleFile={onToggleFile}
+              formatBytes={formatBytes}
+              formatAge={formatAge}
+              getFileIcon={getFileIcon}
+            />
+          </TabsContent>
+
+          <TabsContent value="backupLogs">
+            <FileTable
+              files={agent.backupLogFiles}
               selectedFiles={selectedFiles}
               onToggleFile={onToggleFile}
               formatBytes={formatBytes}

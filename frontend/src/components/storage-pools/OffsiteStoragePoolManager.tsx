@@ -121,13 +121,14 @@ function OffsitePoolCard({ offsiteHost, pool }: OffsitePoolCardProps) {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const validateMutation = useValidateOffsitePool()
 
+  const limit = pool.diskUsageThreshold ?? USAGE_LIMIT
   const hasMetrics = pool.usagePercent != null
   const usagePercent = pool.usagePercent ?? 0
-  const isOverLimit = hasMetrics && usagePercent >= USAGE_LIMIT
+  const isOverLimit = hasMetrics && usagePercent >= limit
 
   const getUsageColor = (percentage: number) => {
-    if (percentage >= 90) return 'bg-red-500'
-    if (percentage >= USAGE_LIMIT) return 'bg-yellow-500'
+    if (percentage >= limit) return 'bg-red-500'
+    if (percentage >= 60) return 'bg-yellow-500'
     return 'bg-green-500'
   }
 
@@ -190,10 +191,14 @@ function OffsitePoolCard({ offsiteHost, pool }: OffsitePoolCardProps) {
                 <span>{pool.totalGB} GB</span>
               </div>
             )}
+            <div className="flex items-center justify-between text-xs text-gray-500 pt-1 border-t">
+              <span>Usage Threshold</span>
+              <span>{limit}%</span>
+            </div>
             {isOverLimit && (
               <p className="flex items-center gap-1 text-xs text-red-600 font-medium">
                 <AlertTriangle className="h-3.5 w-3.5" />
-                At or over {USAGE_LIMIT}% — too full for new backups
+                At or over {limit}% — too full for new backups
               </p>
             )}
           </div>
@@ -260,6 +265,7 @@ interface AddOffsitePoolDialogProps {
 interface PoolFormData {
   name: string
   path: string
+  diskUsageThreshold: number
 }
 
 function AddOffsitePoolDialog({
@@ -274,11 +280,16 @@ function AddOffsitePoolDialog({
     handleSubmit,
     reset,
     formState: { errors },
-  } = useForm<PoolFormData>()
+  } = useForm<PoolFormData>({
+    defaultValues: { diskUsageThreshold: 80 },
+  })
 
   const onSubmit = async (data: PoolFormData) => {
     try {
-      await createMutation.mutateAsync({ hostId: offsiteHost.id, data })
+      await createMutation.mutateAsync({
+        hostId: offsiteHost.id,
+        data: { ...data, diskUsageThreshold: Number(data.diskUsageThreshold) },
+      })
       reset()
       onOpenChange(false)
     } catch (error) {
@@ -336,6 +347,29 @@ function AddOffsitePoolDialog({
             </p>
           </div>
 
+          <div className="space-y-2">
+            <Label htmlFor="offsite-pool-threshold">Disk Usage Threshold (%)</Label>
+            <Input
+              id="offsite-pool-threshold"
+              type="number"
+              min={1}
+              max={100}
+              {...register('diskUsageThreshold', {
+                required: 'Threshold is required',
+                min: { value: 1, message: 'Must be between 1 and 100' },
+                max: { value: 100, message: 'Must be between 1 and 100' },
+                valueAsNumber: true,
+              })}
+            />
+            {errors.diskUsageThreshold && (
+              <p className="text-sm text-red-600">{errors.diskUsageThreshold.message}</p>
+            )}
+            <p className="text-sm text-gray-500">
+              Offsite sync is refused when this destination is used above this
+              percentage. Defaults to 80%.
+            </p>
+          </div>
+
           <DialogFooter>
             <Button
               type="button"
@@ -383,21 +417,29 @@ function EditOffsitePoolDialog({
     reset,
     formState: { errors },
   } = useForm<PoolFormData>({
-    defaultValues: { name: pool.name, path: pool.path },
+    defaultValues: {
+      name: pool.name,
+      path: pool.path,
+      diskUsageThreshold: pool.diskUsageThreshold ?? 80,
+    },
   })
 
   useEffect(() => {
     if (open) {
-      reset({ name: pool.name, path: pool.path })
+      reset({
+        name: pool.name,
+        path: pool.path,
+        diskUsageThreshold: pool.diskUsageThreshold ?? 80,
+      })
     }
-  }, [open, pool.name, pool.path, reset])
+  }, [open, pool.name, pool.path, pool.diskUsageThreshold, reset])
 
   const onSubmit = async (data: PoolFormData) => {
     try {
       await updateMutation.mutateAsync({
         hostId: offsiteHost.id,
         poolId: pool.id,
-        data,
+        data: { ...data, diskUsageThreshold: Number(data.diskUsageThreshold) },
       })
       onOpenChange(false)
     } catch (error) {
@@ -442,6 +484,29 @@ function EditOffsitePoolDialog({
             {errors.path && (
               <p className="text-sm text-red-600">{errors.path.message}</p>
             )}
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="edit-offsite-pool-threshold">Disk Usage Threshold (%)</Label>
+            <Input
+              id="edit-offsite-pool-threshold"
+              type="number"
+              min={1}
+              max={100}
+              {...register('diskUsageThreshold', {
+                required: 'Threshold is required',
+                min: { value: 1, message: 'Must be between 1 and 100' },
+                max: { value: 100, message: 'Must be between 1 and 100' },
+                valueAsNumber: true,
+              })}
+            />
+            {errors.diskUsageThreshold && (
+              <p className="text-sm text-red-600">{errors.diskUsageThreshold.message}</p>
+            )}
+            <p className="text-sm text-gray-500">
+              Offsite sync is refused when this destination is used above this
+              percentage.
+            </p>
           </div>
 
           <DialogFooter>
