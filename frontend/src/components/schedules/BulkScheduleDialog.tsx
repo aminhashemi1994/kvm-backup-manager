@@ -195,9 +195,11 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
       .map(id => ({ offsiteHostId: id, offsitePoolId: formData.offsitePoolByHost[id] }))
       .filter(t => !!t.offsitePoolId)
 
-    // Create schedule for each VM
-    for (const vm of selectedVMs) {
-      try {
+    // Build one payload per selected VM, then create them all in PARALLEL.
+    // Creating them one-by-one (sequential await) made bulk creation take
+    // roughly N× a single request — the "adding a schedule takes ~10s"
+    // symptom when several VMs were selected.
+    const payloads = selectedVMs.map((vm) => {
         const data: any = {
           vmId: vm.id,
           storagePoolId: formData.storagePoolId,
@@ -249,21 +251,25 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
             break
         }
 
-        await createSchedule.mutateAsync(data)
-        setCreatedCount(prev => prev + 1)
-      } catch (error) {
-        console.error(`Failed to create schedule for ${vm.name}:`, error)
-        setFailedCount(prev => prev + 1)
-      }
-    }
+        return data
+    })
+
+    // Fire all creations concurrently instead of one at a time.
+    const results = await Promise.allSettled(
+      payloads.map((d) => createSchedule.mutateAsync(d))
+    )
+    const created = results.filter((r) => r.status === 'fulfilled').length
+    const failed = results.length - created
+    setCreatedCount(created)
+    setFailedCount(failed)
 
     setIsCreating(false)
-    
-    if (failedCount === 0) {
-      toast.success(`Successfully created ${createdCount} schedules`)
+
+    if (failed === 0) {
+      toast.success(`Successfully created ${created} schedules`)
       onClose()
     } else {
-      toast.warning(`Created ${createdCount} schedules, ${failedCount} failed`)
+      toast.warning(`Created ${created} schedules, ${failed} failed`)
     }
   }
 

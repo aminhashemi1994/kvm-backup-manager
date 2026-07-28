@@ -4,8 +4,7 @@ const {
   getHypervisors,
   getVirtualMachines,
   getStoragePools,
-  getBackupJobs,
-  saveBackupJobs,
+  updateBackupJobs,
   appendLog,
 } = require('./fileStorage');
 const agentService = require('./agentService');
@@ -374,7 +373,6 @@ class MissedRunService {
    * actually triggering a backup.
    */
   async recordMissed(schedule, runs, reason) {
-    const jobs = await getBackupJobs();
     const vms = await getVirtualMachines();
     const hosts = await getBackupHosts();
     const hypervisors = await getHypervisors();
@@ -382,9 +380,13 @@ class MissedRunService {
     const host = vm ? hosts.find(h => h.id === vm.backupHostId) : null;
     const hypervisor = vm ? hypervisors.find(h => h.id === vm.hypervisorId) : null;
 
-    for (const run of runs) {
+    // Build the records first, then insert them all in one atomic write. This
+    // runs during startup recovery, while agents are reconnecting and posting
+    // updates and live tmux sessions are being adopted — appending to a stale
+    // array and saving it would drop those.
+    const records = runs.map((run) => {
       const id = uuidv4();
-      jobs.push({
+      return {
         id,
         scheduleId: schedule.id,
         vmId: schedule.vmId,
@@ -404,10 +406,20 @@ class MissedRunService {
         canRetry: false,
         triggeredBy: 'system',
         actor: 'system:missed-run',
-      });
-      await appendLog(id, `Missed run for schedule ${schedule.id} at ${run.scheduledAt.toISOString()} — recorded as skipped (${reason})`);
+        _logLine: `Missed run for schedule ${schedule.id} at ${run.scheduledAt.toISOString()} — recorded as skipped (${reason})`,
+      };
+    });
+
+    await updateBackupJobs((jobs) => {
+      for (const record of records) {
+        const { _logLine, ...job } = record;
+        jobs.push(job);
+      }
+    });
+
+    for (const record of records) {
+      await appendLog(record.id, record._logLine);
     }
-    await saveBackupJobs(jobs);
   }
 
   /**

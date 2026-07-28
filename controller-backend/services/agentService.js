@@ -248,11 +248,15 @@ class AgentService {
     try {
       console.log(`[AgentService] Checking schedule conflict for ${vmName} (${scheduleType})`);
       const client = this.createAgentClient(agentUrl);
+      // Bound this call hard. It is a best-effort UX guard (the caller catches
+      // failures and proceeds), so it must never dominate schedule creation —
+      // the default agent client timeout is minutes. A short cap keeps "add
+      // schedule" snappy even when the agent is briefly slow/unreachable.
       const response = await client.post('/api/schedule-validation/check-conflict', {
         vmName,
         scheduleType,
         storagePoolPath
-      });
+      }, { timeout: 4000 });
       
       console.log(`[AgentService] Conflict check result:`, response.data);
       return response.data;

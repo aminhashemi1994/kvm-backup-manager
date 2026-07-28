@@ -21,6 +21,7 @@ router.post('/trigger', async (req, res, next) => {
       offsiteHosts,
       verbose,
       storagePoolPath,
+      diskUsageThreshold,
       isRetry  // Extract isRetry flag
     } = req.body;
 
@@ -69,6 +70,7 @@ router.post('/trigger', async (req, res, next) => {
       offsiteHosts: offsiteHosts || [],
       verbose: verbose || false,
       storagePoolPath: storagePoolPath,
+      diskUsageThreshold: diskUsageThreshold != null ? diskUsageThreshold : null,
       isRetry: isRetry || false,  // Pass isRetry flag to executor
     });
 

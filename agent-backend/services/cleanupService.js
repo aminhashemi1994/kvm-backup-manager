@@ -181,7 +181,24 @@ class CleanupService {
         }
       } catch (e) {}
     }
-    
+
+    // Automatic age-based retention for backup-job logs (<logDir>/*.log).
+    // Manual cleanup is also always available via the Cleanup page — this is
+    // just the "don't let logs accumulate forever" default. 0 = disabled.
+    try {
+      const retentionDays = await this._getJobLogRetentionDays();
+      if (retentionDays > 0) {
+        const logService = require('./logService');
+        const { deleted } = await logService.cleanOldLogs(retentionDays);
+        if (deleted > 0) {
+          totalCleaned += deleted;
+          console.log(`[Cleanup:${trigger}] Removed ${deleted} backup-job log(s) older than ${retentionDays}d`);
+        }
+      }
+    } catch (e) {
+      console.error(`[Cleanup:${trigger}] Job log retention failed:`, e.message);
+    }
+
     if (totalCleaned > 0) {
       console.log(`[Cleanup:${trigger}] Cleaned ${totalCleaned} stale artifact(s)`);
     } else {
@@ -189,6 +206,26 @@ class CleanupService {
     }
     
     return { cleaned: totalCleaned, trigger };
+  }
+
+  /**
+   * Fetch the global jobLogRetentionDays setting from the controller.
+   * Falls back to a sane default (90 days) if the controller is unreachable
+   * or the value is missing/invalid — this only ever runs as part of the
+   * best-effort periodic cleanup, never blocks anything.
+   */
+  async _getJobLogRetentionDays() {
+    const DEFAULT_DAYS = 90;
+    const controllerUrl = this.config?.controllerUrl;
+    if (!controllerUrl) return DEFAULT_DAYS;
+    try {
+      const controllerAuthService = require('./controllerAuthService');
+      const response = await controllerAuthService.get(controllerUrl, '/settings', { timeout: 5000 });
+      const value = Number(response.data?.data?.jobLogRetentionDays);
+      return Number.isFinite(value) && value >= 0 ? value : DEFAULT_DAYS;
+    } catch (e) {
+      return DEFAULT_DAYS;
+    }
   }
 
   async _getStoragePools() {
@@ -248,12 +285,26 @@ class CleanupService {
       const sessions = stdout.trim().split('\n');
       const orphaned = [];
       
-      // Get all known job IDs from the executor
+      // Get all known job IDs from the executor. Cross-check BOTH the
+      // in-memory activeJobs map AND the on-disk job-state files, not just
+      // activeJobs — activeJobs is only repopulated once recoverRunningJobs()
+      // finishes re-adopting sessions, and that happens concurrently with
+      // this startup cleanup pass (backupExecutor.initialize() doesn't await
+      // it). Relying on activeJobs alone races: a genuinely running backup's
+      // tmux session can still be un-adopted at the moment this runs and gets
+      // misclassified as orphaned and killed outright. Job-state files are
+      // written synchronously the instant a job starts, so checking them too
+      // closes that window regardless of init ordering.
       const knownJobIds = new Set();
       if (this.backupExecutor) {
         for (const [jobId] of this.backupExecutor.activeJobs) {
           knownJobIds.add(jobId.substring(0, 8));
         }
+        try {
+          for (const state of this.backupExecutor.getAllJobStates()) {
+            if (state && state.jobId) knownJobIds.add(state.jobId.substring(0, 8));
+          }
+        } catch (e) { /* best effort */ }
       }
       
       for (const session of sessions) {

@@ -22,6 +22,7 @@ interface EditStoragePoolDialogProps {
 
 interface FormData {
   name: string
+  diskUsageThreshold: number
 }
 
 export default function EditStoragePoolDialog({
@@ -39,20 +40,24 @@ export default function EditStoragePoolDialog({
   } = useForm<FormData>({
     defaultValues: {
       name: pool.name,
+      diskUsageThreshold: pool.diskUsageThreshold ?? 80,
     },
   })
 
   useEffect(() => {
     if (open) {
-      reset({ name: pool.name })
+      reset({ name: pool.name, diskUsageThreshold: pool.diskUsageThreshold ?? 80 })
     }
-  }, [open, pool.name, reset])
+  }, [open, pool.name, pool.diskUsageThreshold, reset])
 
   const onSubmit = async (data: FormData) => {
     try {
       await updateMutation.mutateAsync({
         id: pool.id,
-        data,
+        data: {
+          name: data.name,
+          diskUsageThreshold: Number(data.diskUsageThreshold),
+        },
       })
       onOpenChange(false)
     } catch (error) {
@@ -80,6 +85,29 @@ export default function EditStoragePoolDialog({
             {errors.name && (
               <p className="text-sm text-red-600">{errors.name.message}</p>
             )}
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="diskUsageThreshold">Disk Usage Threshold (%)</Label>
+            <Input
+              id="diskUsageThreshold"
+              type="number"
+              min={1}
+              max={100}
+              {...register('diskUsageThreshold', {
+                required: 'Threshold is required',
+                min: { value: 1, message: 'Must be between 1 and 100' },
+                max: { value: 100, message: 'Must be between 1 and 100' },
+                valueAsNumber: true,
+              })}
+            />
+            {errors.diskUsageThreshold && (
+              <p className="text-sm text-red-600">{errors.diskUsageThreshold.message}</p>
+            )}
+            <p className="text-sm text-gray-500">
+              Backups (including offsite syncs) are refused when this pool — or an
+              offsite destination — is used above this percentage.
+            </p>
           </div>
 
           <div className="space-y-2">

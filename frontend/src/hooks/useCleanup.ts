@@ -7,7 +7,7 @@ export interface CleanupFile {
   name: string
   size: number
   age: number
-  type: 'progress' | 'log' | 'lock' | 'temp'
+  type: 'progress' | 'log' | 'lock' | 'temp' | 'backupLog'
 }
 
 export interface AgentCleanupData {
@@ -18,6 +18,7 @@ export interface AgentCleanupData {
   logFiles: CleanupFile[]
   lockFiles: CleanupFile[]
   tempFiles: CleanupFile[]
+  backupLogFiles: CleanupFile[]
   totalCount: number
   totalSize: number
 }

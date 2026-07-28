@@ -151,8 +151,18 @@ async function buildActualBackupIndex(vmsInScope, hostById) {
         if (!sched || !sched.schedule) continue;
         const dates = extractBackupDatesFromSchedule(sched);
         if (!dates.length) continue;
-        const prev = schedMap.get(sched.schedule) || [];
-        schedMap.set(sched.schedule, prev.concat(dates));
+        // Archived chains are reported under schedule "archived" with the real
+        // schedule in `original_schedule` (e.g. "daily"). Retention rotates a
+        // full chain into /archived and starts a fresh one, so a daily VM's
+        // older runs live there. Key those dates under the ORIGINAL schedule so
+        // they still count toward adherence — otherwise every run that has since
+        // been archived is falsely reported as "missed" (the exact symptom:
+        // backups plainly exist in the archive but show as missed).
+        const key = (sched.schedule === 'archived' && sched.original_schedule)
+          ? sched.original_schedule
+          : sched.schedule;
+        const prev = schedMap.get(key) || [];
+        schedMap.set(key, prev.concat(dates));
       }
       if (schedMap.size) index.set(vm.id, schedMap);
     }
@@ -290,10 +300,15 @@ async function getMissedBackups(opts = {}) {
     const successDayKeys = new Set(successTimes.map(t => localDayKey(new Date(t))));
     const isCalendar = CALENDAR_TYPES.has(schedule.scheduleType);
 
-    // Failed / skipped attempts (for reason annotation).
+    // Failed / skipped / rejected attempts (for reason annotation).
     const failedJobs = vmJobs
-      .filter(j => j.status === 'failed' || j.status === 'skipped')
-      .map(j => ({ t: toDate(j.startTime).getTime(), status: j.status, error: j.error, skippedReason: j.skippedReason }))
+      .filter(j => j.status === 'failed' || j.status === 'skipped' || j.status === 'rejected')
+      .map(j => ({
+        t: toDate(j.startTime).getTime(),
+        status: j.status,
+        error: j.error,
+        skippedReason: j.skippedReason || j.rejectedReason,
+      }))
       .filter(j => Number.isFinite(j.t))
       .sort((a, b) => a.t - b.t);
 
@@ -325,6 +340,14 @@ async function getMissedBackups(opts = {}) {
           detail = attempt.error
             ? `Backup attempt failed: ${String(attempt.error).slice(0, 200)}`
             : 'Backup attempt failed';
+        } else if (attempt.status === 'rejected') {
+          // The run never started: the VM was still backing up from an earlier
+          // run. Reported as its own reason so it is not read as a failure —
+          // the fix is a longer interval or a faster backup, not a repair.
+          reason = 'rejected';
+          detail = attempt.error
+            ? String(attempt.error).slice(0, 200)
+            : 'Run declined: another backup for this VM was still in progress';
         } else {
           reason = 'skipped';
           detail = attempt.skippedReason

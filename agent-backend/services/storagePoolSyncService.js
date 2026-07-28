@@ -131,7 +131,7 @@ class StoragePoolSyncService {
       }
 
       // Get all backup hosts
-      const response = await controllerAuthService.get(controllerUrl, '/backup-hosts', { timeout: 5000 });
+      const response = await controllerAuthService.get(controllerUrl, '/backup-hosts', { timeout: 15000 });
       const backupHosts = response.data.data || [];
       
       console.log(`[StoragePoolSync] Attempting to discover identity from ${backupHosts.length} backup hosts`);
@@ -216,7 +216,7 @@ class StoragePoolSyncService {
       // Fetch storage pools for this backup host
       const endpoint = `/storage-pools/backup-host/${this.backupHostId}`;
       console.log(`[StoragePoolSync] Fetching from: ${controllerUrl}${endpoint}`);
-      const response = await controllerAuthService.get(controllerUrl, endpoint, { timeout: 5000 });
+      const response = await controllerAuthService.get(controllerUrl, endpoint, { timeout: 15000 });
       
       if (response.data.success) {
         const storagePools = response.data.data || [];

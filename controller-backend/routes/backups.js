@@ -2,10 +2,12 @@ const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
-const { 
-  getBackupJobs, 
-  saveBackupJobs, 
-  getBackupHosts, 
+const { stripAnsi } = require('../utils/stripAnsi');
+const {
+  getBackupJobs,
+  saveBackupJobs,
+  updateBackupJobs,
+  getBackupHosts,
   getHypervisors, 
   getVirtualMachines,
   getBackupSchedules,
@@ -23,6 +25,41 @@ const auditService = require('../services/auditService');
 const schedulerService = require('../services/schedulerService');
 const { validateBackupTrigger } = require('../utils/validator');
 const { requireUser, requireAdmin } = require('../middleware/rbac');
+
+// The /active (and /history) GET handlers reconcile job state against the agents
+// — an HTTP fan-out to every host plus a full rewrite of the jobs file. Every
+// open browser tab polls these on a short interval, so without a guard the
+// controller ends up doing that expensive work many times a second, fans out to
+// slow agents, and starves its own event loop (the API then intermittently
+// stops answering). Since the periodic agentSyncService and the manual "Sync
+// from agents" button already reconcile, we cap the per-request reconcile to at
+// most once every few seconds GLOBALLY; other requests just serve current state
+// from disk. Real-time changes still reach the UI via socket events.
+let _lastActiveReconcileAt = 0;
+const ACTIVE_RECONCILE_MIN_INTERVAL_MS = 4000;
+
+// The reconcile also runs DETACHED from the response. Every agent round-trip
+// inside a GET is latency the user watches: opening Active Jobs had to wait for
+// the slowest agent before a single row appeared, even though the rows were
+// already sitting in the store. So the handlers answer from the store straight
+// away and kick the reconcile off behind the response — its results land via
+// socket events and the next 5s poll. `liveSessionMirrorService` is doing the
+// same discovery on a background timer anyway, so the data is fresh regardless.
+let _reconcileInFlight = null;
+
+function runReconcileDetached(label, fn) {
+  if (_reconcileInFlight) return;
+  _lastActiveReconcileAt = Date.now();
+  _reconcileInFlight = Promise.resolve()
+    .then(fn)
+    .catch(e => console.warn(`[${label}] background reconcile failed:`, e.message))
+    .finally(() => {
+      // Stamp again on completion: a pass that took 8s shouldn't allow the
+      // next one to start the instant it finishes.
+      _lastActiveReconcileAt = Date.now();
+      _reconcileInFlight = null;
+    });
+}
 
 /**
  * Sync job status with agent
@@ -82,14 +119,25 @@ async function syncJobStatusWithAgent(job, hosts, agentActiveCache = null) {
     // "completed, exit code -, no logs" records users could not trust).
     //
     // Ask the agent's live-status endpoint, which inspects the REAL on-host
-    // state (tmux sessions, live processes, lock + progress files):
-    //   running            → the backup is still going; leave the job alone.
+    // state (recorded exit code, tmux sessions, live processes, lock + progress
+    // files):
+    //   running             → the backup is still going; leave the job alone.
     //   failed/orphaned     → mark failed.
-    //   completed           → mark completed, exitCode 0 (trustworthy).
-    //   unknown (no record) → the agent finished & cleaned up; most likely a
-    //                         success we simply never got the exit code for.
-    //                         Mark completed but flag it UNVERIFIED so the UI
-    //                         can show that its success wasn't confirmed.
+    //   completed           → mark completed.
+    //   unknown (no record) → we genuinely cannot tell. Mark FAILED for review.
+    //
+    // That last rule is the important one. This used to infer "completed" from
+    // a missing agent record, on the theory that a finished-and-cleaned-up job
+    // was probably a success. It isn't: a backup that died (e.g. "No full backup
+    // found in target directory", exit 1) leaves exactly the same absence, and
+    // was filed as a green "completed" in the history — the worst possible
+    // failure mode for a backup system, because it hides a real data-loss risk.
+    // Absence of evidence is not evidence of success. An unknown outcome is
+    // surfaced as failed-needs-review: a false "failed" costs a retry, a false
+    // "completed" costs a backup you only discover you never had when you need
+    // it. Note the missed-backups report is disk-driven, so a job wrongly marked
+    // failed here does NOT produce a phantom missed run.
+    //
     // This runs at most once per job (once terminal, this function returns
     // early), so it doesn't add per-request agent load at steady state.
     if (!isActiveOnAgent) {
@@ -105,47 +153,88 @@ async function syncJobStatusWithAgent(job, hosts, agentActiveCache = null) {
       }
 
       if (live && live.status === 'running') {
+        // Keep the live phase/progress in sync even when the status itself
+        // didn't change. The phase drives the "Backing up" vs "Syncing
+        // offsite" badge, and it only ever moved when the agent happened to
+        // include progressType on an update — so a job that switched to the
+        // offsite rsync kept claiming "Backing up" while its own progress text
+        // read "Offsite sync (...)". live-status reads the same progress file
+        // the script writes, so this is the authoritative answer.
+        let changed = false;
         if (job.status !== 'running') {
           job.status = 'running';
-          if (live.phase) job.phase = live.phase;
+          changed = true;
           await appendLog(job.id, 'Job still running (verified via live-status)');
-          return true;
         }
-        return false;
+        if (live.phase && live.phase !== job.phase) {
+          job.phase = live.phase;
+          changed = true;
+        }
+        if (typeof live.progress === 'number' && live.progress !== job.progress) {
+          job.progress = live.progress;
+          changed = true;
+        }
+        if (live.progressText && live.progressText !== job.progressText) {
+          job.progressText = live.progressText;
+          changed = true;
+        }
+        return changed;
       }
+      // The shell's recorded exit code, when the agent still has it, is hard
+      // evidence — it's the script's own verdict, not an inference from
+      // leftover artifacts. Trust it over everything else.
+      const recordedExit = typeof live?.exitCode === 'number' ? live.exitCode : null;
+
       if (live && live.status === 'failed') {
         job.status = 'failed';
         job.endTime = job.endTime || new Date().toISOString();
-        job.error = job.error || 'Backup orphaned: lock file present without active process';
-        job.failureReason = job.failureReason || 'orphaned';
+        if (recordedExit !== null) job.exitCode = recordedExit;
+        job.error = job.error || (recordedExit !== null
+          ? `Backup script exited with code ${recordedExit}`
+          : 'Backup orphaned: lock file present without active process');
+        job.failureReason = job.failureReason || (recordedExit !== null ? 'script_error' : 'orphaned');
         job.verified = true;
         job.finalizedBy = 'reconciler-livestatus';
-        await appendLog(job.id, 'Job marked failed (evidence-based via live-status: orphaned)');
+        delete job.unverified;
+        await appendLog(job.id, recordedExit !== null
+          ? `Job marked failed (shell recorded exit code ${recordedExit})`
+          : 'Job marked failed (evidence-based via live-status: orphaned)');
         return true;
       }
+
       if (live && live.status === 'completed') {
-        // Evidence-based: live-status saw the backup reach 100% with no
-        // orphaned lock. Trustworthy, but we still never captured the
-        // script's real exit code — do NOT fabricate exitCode 0, or an
-        // inferred completion would masquerade as an agent-confirmed one.
-        // `verified` reflects host-evidence; exitCode stays unknown ("-").
         job.status = 'completed';
         job.endTime = job.endTime || new Date().toISOString();
         job.progress = 100;
         job.verified = true;
         job.finalizedBy = 'reconciler-livestatus';
         delete job.unverified;
-        await appendLog(job.id, 'Job completed (evidence-based via live-status; exit code not captured)');
+        if (recordedExit !== null) {
+          // Proven: the script itself reported success.
+          job.exitCode = recordedExit;
+          await appendLog(job.id, `Job completed (shell recorded exit code ${recordedExit})`);
+        } else {
+          // Inferred from host evidence (progress reached 100%, no orphaned
+          // lock). Do NOT fabricate exitCode 0 — an inferred completion must
+          // never masquerade as one the script confirmed.
+          await appendLog(job.id, 'Job completed (evidence-based via live-status; exit code not captured)');
+        }
         return true;
       }
 
-      // Unknown / no agent record — infer completion but do NOT claim it's
-      // verified. exitCode stays null; the UI shows an "unverified" marker.
-      job.status = 'completed';
+      // Unknown: no agent record AND no recorded exit code. We cannot prove this
+      // backup succeeded, so we must not claim it did. Surface it as failed and
+      // needing review — it stays retryable, and the report/disk is the place to
+      // confirm whether a backup actually exists.
+      job.status = 'failed';
       job.endTime = job.endTime || new Date().toISOString();
-      job.unverified = true;
+      job.error = job.error || 'Outcome could not be determined: the agent has no record of this job and no exit code was recorded. It may have completed — check the report to confirm whether the backup exists.';
+      job.failureReason = job.failureReason || 'indeterminate';
       job.verified = false;
-      await appendLog(job.id, 'Job marked completed but UNVERIFIED (agent has no record; exit code unknown). Check the report to confirm the backup exists.');
+      job.unverified = true;
+      job.canRetry = true;
+      job.finalizedBy = 'reconciler-indeterminate';
+      await appendLog(job.id, 'Job marked FAILED — outcome indeterminate (agent has no record, no exit code recorded). Not assumed successful.');
       return true;
     }
   } catch (error) {
@@ -163,6 +252,231 @@ async function syncJobStatusWithAgent(job, hosts, agentActiveCache = null) {
   }
   
   return false;
+}
+
+/**
+ * Correct jobs wrongly marked `failed` while their backup is in fact STILL
+ * RUNNING in a tmux session on the host (data drift).
+ *
+ * The reconciler that finalizes jobs can misfire — e.g. an agent restart during
+ * a long offsite rsync, where the lock file is gone but the tmux session and
+ * the progress file are alive. syncJobStatusWithAgent only re-checks
+ * running/queued jobs, so once such a job is stamped `failed` it never
+ * self-corrects and the panel shows "failed, 0s, no logs" for a backup that is
+ * actively syncing.
+ *
+ * On every history/active load we grep the host's live tmux sessions for these
+ * failed jobs (one `tmux ls` per host, batched) and, when a session for the job
+ * is found, flip it back to `running`. Lock-file absence is deliberately NOT
+ * treated as death — a live session + progress file is proof of life.
+ *
+ * Matching is by unique jobId (session name contains it), so we never resurrect
+ * the wrong job. Returns true if any job was changed.
+ */
+async function resurrectRunningFailedJobs(jobs, hosts, maxAgeMs = 3 * 24 * 60 * 60 * 1000) {
+  // Only recently-failed jobs are worth checking — an old failure won't have a
+  // live session, and this bounds the batch we send to each agent. The window is
+  // caller-tunable: the frequent /active poll keeps it short (steady-state load),
+  // while the manual "Sync from agents" action widens it to catch a long-running
+  // backup (e.g. a multi-day offsite rsync) that was wrongly marked failed.
+  const now = Date.now();
+  const candidates = jobs.filter(j => {
+    if (j.status !== 'failed') return false;
+    const ref = j.endTime || j.startTime;
+    if (!ref) return false;
+    return (now - new Date(ref).getTime()) <= maxAgeMs;
+  });
+  if (candidates.length === 0) return false;
+
+  // Group by host so each agent gets a single batched call.
+  const byHost = new Map();
+  for (const j of candidates) {
+    const host = hosts.find(h => h.id === j.backupHostId);
+    if (!host) continue;
+    if (!byHost.has(host.id)) byHost.set(host.id, { host, jobs: [] });
+    byHost.get(host.id).jobs.push(j);
+  }
+  if (byHost.size === 0) return false;
+
+  let changed = false;
+  await Promise.allSettled(Array.from(byHost.values()).map(async ({ host, jobs: hostJobs }) => {
+    let active;
+    try {
+      const client = agentService.createAgentClient(host.url, host.id, host.name);
+      const r = await client.post('/api/jobs/active-sessions', {
+        jobs: hostJobs.map(j => ({
+          jobId: j.id,
+          vmName: j.vmName,
+          scheduleType: j.scheduleType || j.method,
+        })),
+      }, { timeout: 5000 });
+      active = r.data?.data || {};
+    } catch (e) {
+      return; // host unreachable — leave jobs as-is
+    }
+
+    for (const j of hostJobs) {
+      // Never revive a job that dedupe finalized as a duplicate — its "live"
+      // session belongs to the winning run, not to it.
+      if (j.supersededBy) continue;
+      // Nor one the script itself gave a verdict on. A tmux session survives a
+      // few seconds after the shell records its exit code and exits, so a
+      // genuinely failed backup can still be "live" here — flipping it back to
+      // running makes it pop into Active and then fall out again a moment
+      // later. A recorded exit code is proof, a lingering session is not.
+      if (typeof j.exitCode === 'number') continue;
+      const info = active[j.id];
+      if (!info || !info.active) continue;
+      j.status = 'running';
+      delete j.endTime;
+      delete j.unverified;
+      j.verified = false;
+      if (info.phase) j.phase = info.phase;
+      if (typeof info.progress === 'number') j.progress = info.progress;
+      if (info.progressText) j.progressText = info.progressText;
+      j.error = null;
+      j.failureReason = null;
+      j.resurrectedFromFailed = true;
+      changed = true;
+      await appendLog(j.id, `Job restored to running — live tmux session ${info.session} found on host (was wrongly marked failed)`);
+    }
+  }));
+
+  return changed;
+}
+
+// Adoption of live tmux sessions with no (or finalized) controller record lives
+// in a shared service so the periodic headless agentSyncService uses the exact
+// same logic as the panel's /active poll.
+const { adoptLiveTmuxSessions, canInsertAdoptedJob } = require('../services/liveSessionAdoption');
+const { snapshotJobs, commitJobChanges } = require('../services/jobReconcileCommit');
+
+/**
+ * Collapse duplicate ACTIVE jobs for the same VM + schedule down to one.
+ *
+ * The agent runs at most one backup per VM+schedule (its per-VM lock), so two
+ * jobs both showing "running/queued" for the same VM+schedule cannot both be
+ * real — the extra one is a stale record (e.g. a pre-guard retry, or a zombie an
+ * agent restart left behind) that live-status can't kill on its own because the
+ * winning run's tmux session collides with it on the VM+schedule name.
+ *
+ * Deterministic rule: keep the most recently STARTED active job (tie → the one
+ * already 'running') and finalize the rest as superseded. `supersededBy` marks
+ * them so the resurrector never flips them back. Controller-side queued jobs
+ * still waiting for a concurrency slot (`pendingStart`) are not runners and are
+ * left out of the contest.
+ *
+ * @returns {boolean} true if any job was changed
+ */
+function dedupeActiveBackupJobs(jobs) {
+  const ACTIVE = ['running', 'queued', 'initializing', 'retrying'];
+  const groups = new Map();
+  for (const j of jobs) {
+    if (!ACTIVE.includes(j.status)) continue;
+    if (j.status === 'queued' && j.pendingStart) continue;
+    const key = `${j.vmId || j.vmName}::${j.scheduleType || j.method || ''}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(j);
+  }
+
+  let changed = false;
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    // Winner: latest startTime; tie-break prefers an already-running job.
+    group.sort((a, b) => {
+      const ta = new Date(a.startTime || 0).getTime();
+      const tb = new Date(b.startTime || 0).getTime();
+      if (tb !== ta) return tb - ta;
+      return (b.status === 'running' ? 1 : 0) - (a.status === 'running' ? 1 : 0);
+    });
+    const winner = group[0];
+    for (let i = 1; i < group.length; i++) {
+      const loser = group[i];
+      loser.status = 'failed';
+      loser.endTime = loser.endTime || new Date().toISOString();
+      loser.error = loser.error ||
+        'Superseded by a newer run for the same VM and schedule (duplicate active job cleaned up)';
+      loser.failureReason = loser.failureReason || 'superseded';
+      loser.supersededBy = winner.id;
+      loser.finalizedBy = 'dedupe';
+      loser.canRetry = false;
+      changed = true;
+      try { appendLog(loser.id, `Job superseded by newer run ${winner.id} for the same VM/schedule; removed from active list`); } catch {}
+    }
+  }
+  return changed;
+}
+
+/**
+ * Work out which storage pool a retry of `originalJob` should write to.
+ *
+ * "The job record says so" is only one of several places this is known, and
+ * often the weakest: a job adopted from a live tmux session never had a
+ * storagePoolId, older records predate the field, and after a schedule is
+ * edited the pool on the old job is no longer where this VM backs up. Refusing
+ * the retry in those cases ("Original job has no storage pool on record")
+ * throws away information the controller demonstrably has.
+ *
+ * Tried in order, always restricted to pools that exist on THIS backup host:
+ *   1. the job's own schedule — its CURRENT pool, so an edited schedule wins;
+ *   2. any other live schedule for the same VM (same scheduleType preferred) —
+ *      covers a job whose scheduleId is missing or points at a deleted record;
+ *   3. the pool recorded on the job itself (manual triggers store it);
+ *   4. the pool used by the most recent other job for this VM on this host;
+ *   5. the host's only pool, when it has exactly one — then there is nothing
+ *      to choose.
+ *
+ * Only a deleted schedule with no backup history left AND a multi-pool host is
+ * genuinely ambiguous; that's the one case the caller still has to refuse.
+ *
+ * @returns {{pool: object|null, source: string, schedule: object|null}}
+ */
+function resolveRetryStoragePool({ originalJob, host, pools, schedules, jobs }) {
+  const onHost = (pools || []).filter(p => p.backupHostId === host.id);
+  const byId = (id) => (id ? onHost.find(p => p.id === id) || null : null);
+
+  // 1. The job's own schedule, at its current settings.
+  const ownSchedule = originalJob.scheduleId
+    ? (schedules || []).find(s => s.id === originalJob.scheduleId) || null
+    : null;
+  const fromOwnSchedule = byId(ownSchedule?.storagePoolId);
+  if (fromOwnSchedule) return { pool: fromOwnSchedule, source: 'schedule', schedule: ownSchedule };
+
+  // 2. Another schedule for the same VM. Same scheduleType first — a VM can
+  //    have a daily and a monthly schedule pointing at different pools.
+  const vmSchedules = (schedules || []).filter(s =>
+    s.vmId === originalJob.vmId && byId(s.storagePoolId)
+  );
+  const sameType = vmSchedules.find(s => s.scheduleType === originalJob.scheduleType);
+  const vmSchedule = sameType || vmSchedules[0] || null;
+  if (vmSchedule) {
+    return { pool: byId(vmSchedule.storagePoolId), source: `schedule ${vmSchedule.id} (matched by VM)`, schedule: vmSchedule };
+  }
+
+  // 3. The job's own record.
+  const fromJob = byId(originalJob.storagePoolId);
+  if (fromJob) return { pool: fromJob, source: 'job', schedule: ownSchedule };
+
+  // 4. The VM's backup history on this host — the schedule may be gone, but
+  //    where its backups actually landed is still on record.
+  const previous = (jobs || [])
+    .filter(j =>
+      j.id !== originalJob.id &&
+      j.backupHostId === host.id &&
+      (originalJob.vmId ? j.vmId === originalJob.vmId : j.vmName === originalJob.vmName) &&
+      byId(j.storagePoolId)
+    )
+    .sort((a, b) => new Date(b.startTime || 0) - new Date(a.startTime || 0))[0];
+  if (previous) {
+    return { pool: byId(previous.storagePoolId), source: `previous backup ${previous.id}`, schedule: ownSchedule };
+  }
+
+  // 5. Unambiguous by elimination.
+  if (onHost.length === 1) {
+    return { pool: onHost[0], source: 'only pool on host', schedule: ownSchedule };
+  }
+
+  return { pool: null, source: 'none', schedule: ownSchedule };
 }
 
 /**
@@ -362,37 +676,107 @@ async function ingestOffsiteSyncResults(job, offsiteResults) {
   return changed;
 }
 
+/**
+ * One full reconcile pass against the agents, shared by /active and /history.
+ *
+ * Runs detached from any response, so it may take as long as the agents do:
+ *   1. verify every running/queued job against the agent's real state;
+ *   2. resurrect jobs wrongly marked failed while their session is alive;
+ *   3. mirror `tmux ls` (adopt sessions we have no record of);
+ *   4. collapse duplicate active jobs for the same VM+schedule.
+ *
+ * Changes are committed as a field-level patch (never a stale snapshot) and
+ * announced over the socket so open panels update without waiting for a poll.
+ */
+async function reconcileJobsAgainstAgents(io) {
+  const jobs = await getBackupJobs();
+  const hosts = await getBackupHosts();
+  const before = snapshotJobs(jobs);
+
+  const activeJobs = jobs.filter(j =>
+    j.status === 'running' || j.status === 'queued' || j.status === 'retrying'
+  );
+
+  let statusUpdated = false;
+  if (activeJobs.length > 0) {
+    const SYNC_BUDGET_MS = 15000;
+    const agentActiveCache = new Map(); // one agent call per host, shared by all jobs
+    const results = await Promise.race([
+      Promise.allSettled(activeJobs.map(j => syncJobStatusWithAgent(j, hosts, agentActiveCache))),
+      new Promise(resolve => setTimeout(() => resolve(null), SYNC_BUDGET_MS)),
+    ]);
+    if (Array.isArray(results)) {
+      statusUpdated = results.some(r => r.status === 'fulfilled' && r.value);
+    } else {
+      console.warn('[Reconcile] Agent status sync exceeded budget; committing what we have');
+      statusUpdated = true; // partial results are still worth persisting
+    }
+  }
+
+  // Correct jobs wrongly marked failed while still running in tmux, so they
+  // reappear in the active list instead of sitting failed in history.
+  let resurrected = false;
+  try {
+    resurrected = await resurrectRunningFailedJobs(jobs, hosts);
+  } catch (e) {
+    console.warn('[Reconcile] resurrect check failed:', e.message);
+  }
+
+  // Mirror `tmux ls`: adopt/refresh live sessions the controller isn't already
+  // showing as running (records lost, superseded, or finalized while the
+  // session kept running). Runs regardless of activeJobs.length — the case we
+  // fix is "zero active jobs shown, but sessions alive on the host".
+  let adopted = false;
+  try {
+    const vms = await getVirtualMachines();
+    adopted = await adoptLiveTmuxSessions(jobs, hosts, vms);
+  } catch (e) {
+    console.warn('[Reconcile] adopt live sessions failed:', e.message);
+  }
+
+  // Collapse any duplicate active jobs for the same VM+schedule down to the
+  // single real run. Runs LAST so it wins over any status the agent sync or
+  // resurrector produced (both can be fooled into keeping a zombie "running"
+  // when a newer run's tmux session collides on the VM+schedule name).
+  let deduped = false;
+  try {
+    deduped = dedupeActiveBackupJobs(jobs);
+  } catch (e) {
+    console.warn('[Reconcile] dedupe check failed:', e.message);
+  }
+
+  if (!(statusUpdated || resurrected || adopted || deduped)) return false;
+
+  const commit = await commitJobChanges(before, jobs, { insertGuard: canInsertAdoptedJob });
+  if (!commit.changed) return false;
+
+  if (io) {
+    // Push what changed to open panels; the next poll confirms it.
+    for (const job of commit.jobs) {
+      const prev = before.get(job.id);
+      if (!prev || prev.status !== job.status || prev.phase !== job.phase || prev.progress !== job.progress) {
+        io.emit('job-updated', job);
+      }
+    }
+  }
+  return true;
+}
+
 // GET /api/backups/active - Get active backup jobs
 router.get('/active', async (req, res, next) => {
   try {
     const jobs = await getBackupJobs();
-    const hosts = await getBackupHosts();
+
+    // Reconcile behind the response, never in front of it — see
+    // runReconcileDetached. The store is kept current by that pass plus the
+    // background tmux mirror, so what we serve here is already right; anything
+    // the pass changes reaches the panel over its socket and next poll.
+    if ((Date.now() - _lastActiveReconcileAt) > ACTIVE_RECONCILE_MIN_INTERVAL_MS) {
+      runReconcileDetached('Active', () => reconcileJobsAgainstAgents(req.app.get('io')));
+    }
 
     let activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'retrying');
-    let statusUpdated = false;
 
-    if (activeJobs.length > 0) {
-      const SYNC_BUDGET_MS = 6000;
-      const agentActiveCache = new Map(); // one agent call per host, shared by all jobs
-      const results = await Promise.race([
-        Promise.allSettled(activeJobs.map(j => syncJobStatusWithAgent(j, hosts, agentActiveCache))),
-        new Promise(resolve => setTimeout(() => resolve(null), SYNC_BUDGET_MS)),
-      ]);
-      if (Array.isArray(results)) {
-        statusUpdated = results.some(r => r.status === 'fulfilled' && r.value);
-      } else {
-        console.warn('[Active] Agent status sync exceeded budget; serving stale data');
-      }
-    }
-
-    // Save if any status was updated
-    if (statusUpdated) {
-      await saveBackupJobs(jobs);
-    }
-    
-    // Re-filter after sync
-    activeJobs = jobs.filter(j => j.status === 'running' || j.status === 'queued' || j.status === 'retrying');
-    
     // Add countdown for retrying jobs
     activeJobs = activeJobs.map(job => ({
       ...job,
@@ -412,37 +796,17 @@ router.get('/history', async (req, res, next) => {
   try {
     const { limit = 100, status, vmId } = req.query;
     let backupJobs = await getBackupJobs();
-    const hosts = await getBackupHosts();
 
-    // Sync status for backup jobs marked as running/queued — but in parallel
-    // and with a hard overall budget so unreachable agents can't block the
-    // dashboard. Previously this loop ran serially with a 5s timeout per job;
-    // a handful of hung jobs would freeze /history (and the dashboard's
-    // Recent Activity card would spin forever).
-    const runningBackupJobs = backupJobs.filter(j => j.status === 'running' || j.status === 'queued');
-    let statusUpdated = false;
+    // Same detached reconcile as /active, on the same shared throttle: History
+    // answers from the store immediately and the agent round-trips happen
+    // behind the response. Both handlers drive the identical pass, so it no
+    // longer matters which one wins the window (when only /history reconciled,
+    // it finalized jobs that nothing re-adopted until /active next won a
+    // window — that mismatch is what made rows blink in and out).
+    if ((Date.now() - _lastActiveReconcileAt) > ACTIVE_RECONCILE_MIN_INTERVAL_MS) {
+      runReconcileDetached('History', () => reconcileJobsAgainstAgents(req.app.get('io')));
+    }
 
-    if (runningBackupJobs.length > 0) {
-      const SYNC_BUDGET_MS = 6000;
-      const agentActiveCache = new Map(); // one agent call per host, shared by all jobs
-      const results = await Promise.race([
-        Promise.allSettled(runningBackupJobs.map(j => syncJobStatusWithAgent(j, hosts, agentActiveCache))),
-        new Promise(resolve => setTimeout(() => resolve(null), SYNC_BUDGET_MS)),
-      ]);
-      if (Array.isArray(results)) {
-        statusUpdated = results.some(r => r.status === 'fulfilled' && r.value);
-      } else {
-        // Budget exceeded — skip the save and return what we already have on
-        // disk. The next call (or background reconciler) can finish the job.
-        console.warn('[History] Agent status sync exceeded budget; serving stale data');
-      }
-    }
-    
-    // Save updated backup jobs
-    if (statusUpdated) {
-      await saveBackupJobs(backupJobs);
-    }
-    
     // Get restore jobs
     const fs = require('fs').promises;
     const path = require('path');
@@ -488,8 +852,25 @@ router.get('/history', async (req, res, next) => {
       allJobs = allJobs.filter(j => j.vmId === vmId || j.vmName === vmId);
     }
     
-    // Sort by start time (newest first)
-    allJobs.sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+    // Still-running jobs come FIRST, then everything else newest-first.
+    //
+    // Sorting purely by startTime buries a live job on page 3 as soon as it has
+    // been running longer than a page of finished ones — and a session adopted
+    // from tmux carries the session's real (often hours-old) start time, so it
+    // landed several pages back the moment it appeared. Worse, with a `limit`
+    // it could be cut from the response entirely. What's happening now belongs
+    // on the page the user is looking at.
+    const ACTIVE_FIRST = ['running', 'queued', 'retrying', 'initializing'];
+    const startedAt = (j) => {
+      const t = new Date(j.startTime).getTime();
+      return Number.isFinite(t) ? t : 0;
+    };
+    allJobs.sort((a, b) => {
+      const aActive = ACTIVE_FIRST.includes(a.status) ? 1 : 0;
+      const bActive = ACTIVE_FIRST.includes(b.status) ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      return startedAt(b) - startedAt(a);
+    });
     allJobs = allJobs.slice(0, parseInt(limit));
     
     res.json({ success: true, data: allJobs });
@@ -534,10 +915,25 @@ router.get('/jobs/:id', async (req, res, next) => {
 router.get('/jobs/:id/logs', async (req, res, next) => {
   try {
     const jobs = await getBackupJobs();
-    const job = jobs.find(j => j.id === req.params.id);
-    
+    let job = jobs.find(j => j.id === req.params.id);
+
     if (!job) {
       return res.status(404).json({ success: false, error: 'Job not found' });
+    }
+
+    // A run that was REJECTED never executed — it has no output of its own,
+    // only a controller note. What the operator actually wants to see is the
+    // backup it collided with, which is the one doing the work. Follow the
+    // link and serve that run's real (tmux/script) log instead.
+    let coveredNote = '';
+    if (job.status === 'rejected' && job.coveredBy) {
+      const covering = jobs.find(j => j.id === job.coveredBy);
+      if (covering) {
+        coveredNote =
+          `[this run was rejected — ${job.vmName} was already being backed up]\n` +
+          `[showing the log of the backup that is running: job ${covering.id}]\n\n`;
+        job = covering;
+      }
     }
 
     // Get backup host
@@ -546,8 +942,8 @@ router.get('/jobs/:id/logs', async (req, res, next) => {
     
     if (!host) {
       // Fallback to controller logs if host not found
-      const logs = await readLog(req.params.id);
-      return res.json({ success: true, data: { logs } });
+      const logs = await readLog(job.id);
+      return res.json({ success: true, data: { logs: coveredNote + logs } });
     }
 
     // Fetch logs from agent. Default to the last 2000 lines so a huge job
@@ -556,8 +952,14 @@ router.get('/jobs/:id/logs', async (req, res, next) => {
 
     // Resolve the storage pool path so the agent can fall back to the durable
     // script log on the backup pool if the flat per-job log was lost.
-    let poolPath = null;
-    if (job.storagePoolId) {
+    //
+    // A run adopted from a live tmux session has no flat per-job log at all
+    // (the agent never registered it), so the pool log is the ONLY way to show
+    // what that backup is doing — and it carries `storagePoolPath` straight
+    // from the host for exactly this reason. Without it the viewer could only
+    // offer the controller-side record, which is not the backup's output.
+    let poolPath = job.storagePoolPath || null;
+    if (!poolPath && job.storagePoolId) {
       try {
         const { getStoragePools } = require('../services/fileStorage');
         const pools = await getStoragePools();
@@ -576,7 +978,7 @@ router.get('/jobs/:id/logs', async (req, res, next) => {
 
     try {
       const client = agentService.createAgentClient(host.url, host.id, host.name);
-      const response = await client.get(`/api/backup/logs/${req.params.id}`, {
+      const response = await client.get(`/api/backup/logs/${job.id}`, {
         timeout: 10000,
         params: {
           ...(tail ? { tail } : {}),
@@ -586,27 +988,44 @@ router.get('/jobs/:id/logs', async (req, res, next) => {
         },
       });
 
-      res.json({ success: true, data: { logs: response.data.data.logs } });
+      // The agent returns HTTP 200 with an empty string when it holds no log
+      // for this job (missing flat log AND no durable pool log). That is NOT an
+      // error, so it never hit the catch-block fallback below — and the viewer
+      // showed "no logs" even when the controller itself recorded why the job
+      // failed (trigger error, reconciler note, "queued but never started").
+      // Fall back to the controller's own log store on an empty agent reply so
+      // that reason is always visible.
+      const agentLogs = (response.data && response.data.data && response.data.data.logs) || '';
+      if (agentLogs.trim()) {
+        return res.json({ success: true, data: { logs: coveredNote + agentLogs } });
+      }
+      const controllerLogs = await readLog(job.id);
+      return res.json({
+        success: true,
+        data: {
+          logs: controllerLogs && controllerLogs.trim()
+            ? `${coveredNote}[no log on backup host — showing controller-side record]\n\n${controllerLogs}`
+            : agentLogs, // both empty: preserve prior behaviour (empty string)
+        },
+      });
     } catch (error) {
       console.error('Error fetching logs from agent:', error.message);
       
-      // A 404 only tells us the job is no longer active on the agent — NOT
-      // that it succeeded. Marking it a clean "completed" here is exactly
-      // what produced false "completed / exit -" records. Flag it UNVERIFIED
-      // so the UI shows its success was never confirmed; exit code stays "-".
-      if (error.response?.status === 404 && (job.status === 'running' || job.status === 'queued')) {
-        job.status = 'completed';
-        job.endTime = job.endTime || new Date().toISOString();
-        job.unverified = true;
-        job.verified = false;
-        job.finalizedBy = 'reconciler-inferred';
-        await saveBackupJobs(jobs);
-        await appendLog(req.params.id, 'Job marked completed but UNVERIFIED (no longer active on agent; exit code unknown)');
-      }
-      
+      // Deliberately does NOT touch job status.
+      //
+      // This used to mark the job "completed" on a 404, which meant merely
+      // OPENING THE LOG VIEWER could flip a running — or failed — backup to a
+      // green completed with exit code "-". A 404 from the log endpoint says
+      // one thing only: the agent isn't holding this job's log right now. It is
+      // not evidence about the backup's outcome, and a read endpoint has no
+      // business finalising a job as a side effect of being read.
+      //
+      // Finalisation belongs to syncJobStatusWithAgent, which asks live-status
+      // and trusts the shell's recorded exit code before concluding anything.
+
       // Fallback to controller logs
-      const logs = await readLog(req.params.id);
-      res.json({ success: true, data: { logs } });
+      const logs = await readLog(job.id);
+      res.json({ success: true, data: { logs: coveredNote + logs } });
     }
   } catch (error) {
     next(error);
@@ -867,6 +1286,7 @@ router.post('/trigger', requireUser, async (req, res, next) => {
         hypervisorIp: finalHypervisorIp,
         storagePoolId,
         storagePoolPath: pool.path,
+        diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         scheduleType,
         retention,
         keepArchive,
@@ -1037,130 +1457,140 @@ router.post('/jobs/:id/update', async (req, res, next) => {
   try {
     const { status, exitCode, error, logLine, progress, progressText, failureReason, offsiteResults, progressType } = req.body;
     
-    const jobs = await getBackupJobs();
-    const job = jobs.find(j => j.id === req.params.id);
+    // Apply the agent report inside a single atomic read-modify-write.
+    // The agent posts one of these per running job roughly every second; a
+    // plain read → mutate → save would let a slow reconciler that read
+    // earlier and wrote later silently roll it back (and vice versa: this
+    // handler saving a whole stale array is what used to drop jobs the
+    // reconciler had just adopted from a live tmux session).
+    let job = null;
+    await updateBackupJobs((jobs) => {
+      job = jobs.find(j => j.id === req.params.id);
+      if (!job) return false; // nothing to write
+
+      // Handle status updates
+      if (status) {
+        console.log(`[Backups] Job ${job.id} received status update: ${status}, current status: ${job.status}`);
+      
+        // For scheduled backups with retry capability, check if we should mark as "retrying" instead of "failed"
+        if (status === 'failed' && job.scheduled && job.scheduleId) {
+          const attempt = job.attemptNumber || 1;
+          const maxAttempts = job.maxAttempts || 1;
+        
+          console.log(`[Backups] Job ${job.id} failed - checking retry eligibility:`);
+          console.log(`  - scheduled: ${job.scheduled}`);
+          console.log(`  - scheduleId: ${job.scheduleId}`);
+          console.log(`  - attempt: ${attempt}/${maxAttempts}`);
+          console.log(`  - retryCount from schedule: ${maxAttempts - 1}`);
+        
+          // If we have retries remaining, mark as "retrying" instead of "failed"
+          if (attempt < maxAttempts) {
+            job.status = 'retrying';
+            job.retryScheduled = true;
+            // Set retry timestamp for countdown
+            const retryDelayMinutes = job.retryDelayMinutes || 5;
+            job.retryAt = new Date(Date.now() + (retryDelayMinutes * 60 * 1000)).toISOString();
+            console.log(`[Backups] ✓ Job ${job.id} marked as 'retrying' (attempt ${attempt}/${maxAttempts})`);
+            console.log(`[Backups] ✓ Retry scheduled at ${job.retryAt} (in ${retryDelayMinutes} minutes)`);
+            console.log(`[Backups] ✓ Job will NOT have endTime set (stays in active)`);
+          } else {
+            // All retries exhausted, mark as failed
+            job.status = 'failed';
+            job.retriesExhausted = true;
+            job.retryAt = null; // Clear retry timestamp
+            console.log(`[Backups] ✗ Job ${job.id} marked as 'failed' - all ${maxAttempts} attempts exhausted`);
+          }
+        } else {
+          job.status = status;
+          if (status === 'failed') {
+            console.log(`[Backups] Job ${job.id} marked as failed (no retry - scheduled:${job.scheduled}, scheduleId:${job.scheduleId})`);
+          }
+        }
+      
+        // Treat cancelled as failed
+        if (status === 'cancelled') {
+          job.status = 'failed';
+          if (!error) {
+            job.error = 'Cancelled by user';
+          }
+          if (exitCode === undefined || exitCode === null) {
+            job.exitCode = 1;
+          }
+        }
+      }
     
+      if (exitCode !== undefined) job.exitCode = exitCode;
+      // The agent scrapes error/progress text out of colourised script logs, so
+      // scrub terminal escapes at ingestion: this keeps the stored record clean
+      // for the UI regardless of which agent version reported it.
+      if (error) job.error = stripAnsi(error, { singleLine: true });
+      if (failureReason) job.failureReason = failureReason;
+      if (progress !== undefined) job.progress = progress;
+      if (progressText !== undefined) job.progressText = stripAnsi(progressText, { singleLine: true });
+
+      // Track the progress phase reported by the agent (backup vs rsync).
+      // phase='rsync' drives the purple "Syncing offsite" badge; the offsite
+      // sync status persists so History can show it after the job ends —
+      // including for failed backups whose offsite sync still ran.
+      if (progressType) {
+        job.progressType = progressType;
+        if (progressType === 'rsync') {
+          job.phase = 'rsync';
+          if (job.status === 'running' || job.status === 'queued') {
+            job.offsiteSyncStatus = 'running';
+          }
+        } else if (job.phase === 'rsync') {
+          job.phase = 'backup';
+        }
+      }
+
+      // Persist per-offsite-host outcomes (sent with the terminal update).
+      if (Array.isArray(offsiteResults) && offsiteResults.length > 0) {
+        job.offsiteResults = offsiteResults;
+        const ok = offsiteResults.filter(r => r.status === 'success').length;
+        job.offsiteSyncStatus = ok === offsiteResults.length
+          ? 'completed'
+          : ok > 0 ? 'partial' : 'failed';
+      }
+
+      // Record the last time we heard from the agent about this job. Used by the
+      // monitoring service to detect *inactivity* (a genuinely hung backup or
+      // lost connectivity) instead of naively alerting on total runtime — a
+      // legitimately long backup keeps updating this and is never "stuck".
+      job.lastProgressAt = new Date().toISOString();
+    
+      // Set end time for terminal states
+      if (status === 'completed' || status === 'cancelled' ||
+          (status === 'failed' && job.status === 'failed')) { // Only set endTime if actually failed (not retrying)
+        job.endTime = new Date().toISOString();
+        // This terminal status came straight from the agent's own exit-code
+        // detection — it is authoritative. Mark it verified so the UI can
+        // distinguish it from a completion inferred by the controller-side
+        // reconciler (which can't see the real exit code). A verified
+        // completion with exitCode 0 is a backup you can trust.
+        job.verified = true;
+        delete job.unverified;
+        if (status === 'completed') {
+          job.progress = 100;
+          // Mark if this was a successful retry
+          if (job.attemptNumber && job.attemptNumber > 1) {
+            job.wasRetried = true;
+            job.succeededOnAttempt = job.attemptNumber;
+            console.log(`[Backups] Job ${job.id} completed successfully on retry attempt ${job.attemptNumber}`);
+          }
+        }
+        // Terminal: no live phase remains; if the offsite sync was seen running
+        // but the agent sent no per-host outcomes, its result is unknown.
+        if (job.phase === 'rsync') job.phase = null;
+        if (job.offsiteSyncStatus === 'running' && !(Array.isArray(offsiteResults) && offsiteResults.length > 0)) {
+          job.offsiteSyncStatus = 'unknown';
+        }
+      }
+    });
+
     if (!job) {
       return res.status(404).json({ success: false, error: 'Job not found' });
     }
-
-    // Handle status updates
-    if (status) {
-      console.log(`[Backups] Job ${job.id} received status update: ${status}, current status: ${job.status}`);
-      
-      // For scheduled backups with retry capability, check if we should mark as "retrying" instead of "failed"
-      if (status === 'failed' && job.scheduled && job.scheduleId) {
-        const attempt = job.attemptNumber || 1;
-        const maxAttempts = job.maxAttempts || 1;
-        
-        console.log(`[Backups] Job ${job.id} failed - checking retry eligibility:`);
-        console.log(`  - scheduled: ${job.scheduled}`);
-        console.log(`  - scheduleId: ${job.scheduleId}`);
-        console.log(`  - attempt: ${attempt}/${maxAttempts}`);
-        console.log(`  - retryCount from schedule: ${maxAttempts - 1}`);
-        
-        // If we have retries remaining, mark as "retrying" instead of "failed"
-        if (attempt < maxAttempts) {
-          job.status = 'retrying';
-          job.retryScheduled = true;
-          // Set retry timestamp for countdown
-          const retryDelayMinutes = job.retryDelayMinutes || 5;
-          job.retryAt = new Date(Date.now() + (retryDelayMinutes * 60 * 1000)).toISOString();
-          console.log(`[Backups] ✓ Job ${job.id} marked as 'retrying' (attempt ${attempt}/${maxAttempts})`);
-          console.log(`[Backups] ✓ Retry scheduled at ${job.retryAt} (in ${retryDelayMinutes} minutes)`);
-          console.log(`[Backups] ✓ Job will NOT have endTime set (stays in active)`);
-        } else {
-          // All retries exhausted, mark as failed
-          job.status = 'failed';
-          job.retriesExhausted = true;
-          job.retryAt = null; // Clear retry timestamp
-          console.log(`[Backups] ✗ Job ${job.id} marked as 'failed' - all ${maxAttempts} attempts exhausted`);
-        }
-      } else {
-        job.status = status;
-        if (status === 'failed') {
-          console.log(`[Backups] Job ${job.id} marked as failed (no retry - scheduled:${job.scheduled}, scheduleId:${job.scheduleId})`);
-        }
-      }
-      
-      // Treat cancelled as failed
-      if (status === 'cancelled') {
-        job.status = 'failed';
-        if (!error) {
-          job.error = 'Cancelled by user';
-        }
-        if (exitCode === undefined || exitCode === null) {
-          job.exitCode = 1;
-        }
-      }
-    }
-    
-    if (exitCode !== undefined) job.exitCode = exitCode;
-    if (error) job.error = error;
-    if (failureReason) job.failureReason = failureReason;
-    if (progress !== undefined) job.progress = progress;
-    if (progressText !== undefined) job.progressText = progressText;
-
-    // Track the progress phase reported by the agent (backup vs rsync).
-    // phase='rsync' drives the purple "Syncing offsite" badge; the offsite
-    // sync status persists so History can show it after the job ends —
-    // including for failed backups whose offsite sync still ran.
-    if (progressType) {
-      job.progressType = progressType;
-      if (progressType === 'rsync') {
-        job.phase = 'rsync';
-        if (job.status === 'running' || job.status === 'queued') {
-          job.offsiteSyncStatus = 'running';
-        }
-      } else if (job.phase === 'rsync') {
-        job.phase = 'backup';
-      }
-    }
-
-    // Persist per-offsite-host outcomes (sent with the terminal update).
-    if (Array.isArray(offsiteResults) && offsiteResults.length > 0) {
-      job.offsiteResults = offsiteResults;
-      const ok = offsiteResults.filter(r => r.status === 'success').length;
-      job.offsiteSyncStatus = ok === offsiteResults.length
-        ? 'completed'
-        : ok > 0 ? 'partial' : 'failed';
-    }
-
-    // Record the last time we heard from the agent about this job. Used by the
-    // monitoring service to detect *inactivity* (a genuinely hung backup or
-    // lost connectivity) instead of naively alerting on total runtime — a
-    // legitimately long backup keeps updating this and is never "stuck".
-    job.lastProgressAt = new Date().toISOString();
-    
-    // Set end time for terminal states
-    if (status === 'completed' || status === 'cancelled' ||
-        (status === 'failed' && job.status === 'failed')) { // Only set endTime if actually failed (not retrying)
-      job.endTime = new Date().toISOString();
-      // This terminal status came straight from the agent's own exit-code
-      // detection — it is authoritative. Mark it verified so the UI can
-      // distinguish it from a completion inferred by the controller-side
-      // reconciler (which can't see the real exit code). A verified
-      // completion with exitCode 0 is a backup you can trust.
-      job.verified = true;
-      delete job.unverified;
-      if (status === 'completed') {
-        job.progress = 100;
-        // Mark if this was a successful retry
-        if (job.attemptNumber && job.attemptNumber > 1) {
-          job.wasRetried = true;
-          job.succeededOnAttempt = job.attemptNumber;
-          console.log(`[Backups] Job ${job.id} completed successfully on retry attempt ${job.attemptNumber}`);
-        }
-      }
-      // Terminal: no live phase remains; if the offsite sync was seen running
-      // but the agent sent no per-host outcomes, its result is unknown.
-      if (job.phase === 'rsync') job.phase = null;
-      if (job.offsiteSyncStatus === 'running' && !(Array.isArray(offsiteResults) && offsiteResults.length > 0)) {
-        job.offsiteSyncStatus = 'unknown';
-      }
-    }
-
-    await saveBackupJobs(jobs);
 
     if (logLine) {
       await appendLog(req.params.id, logLine);
@@ -1254,6 +1684,9 @@ router.get('/stats', async (req, res, next) => {
       total: jobs.length,
       completed: jobs.filter(j => j.status === 'completed').length,
       failed: jobs.filter(j => j.status === 'failed').length,
+      // Declined because the VM was already backing up — counted separately so
+      // it never inflates the failure count.
+      rejected: jobs.filter(j => j.status === 'rejected').length,
       running: jobs.filter(j => j.status === 'running').length,
       queued: jobs.filter(j => j.status === 'queued').length,
     };
@@ -1448,11 +1881,36 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Job not found' });
     }
 
-    // Only allow retry for skipped or failed jobs
-    if (originalJob.status !== 'skipped' && originalJob.status !== 'failed') {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'Only skipped or failed jobs can be retried' 
+    // Only allow retry for runs that did not produce a backup: failed, skipped,
+    // or rejected (refused because the VM was already backing up — retrying it
+    // once that run finishes is exactly the right move).
+    const RETRYABLE_STATUSES = ['skipped', 'failed', 'rejected'];
+    if (!RETRYABLE_STATUSES.includes(originalJob.status)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Only failed, skipped or rejected jobs can be retried'
+      });
+    }
+
+    // Guard against creating a duplicate: refuse if another job for the same VM
+    // and schedule type is already active (running/queued/initializing/retrying).
+    // Without this, clicking Retry while a previous attempt is still working — or
+    // double-clicking — spawns a second concurrent backup for the same VM, which
+    // then shows up as two "Backing up" entries. The agent's per-VM lock only
+    // catches this when it and its in-memory state are intact (not across an
+    // agent restart), so the controller must enforce it too.
+    const ACTIVE_STATES = ['running', 'queued', 'initializing', 'retrying'];
+    const activeDuplicate = jobs.find(j =>
+      j.id !== originalJob.id &&
+      j.vmId === originalJob.vmId &&
+      (j.scheduleType || null) === (originalJob.scheduleType || null) &&
+      ACTIVE_STATES.includes(j.status)
+    );
+    if (activeDuplicate) {
+      return res.status(409).json({
+        success: false,
+        error: `A backup for ${originalJob.vmName} (${originalJob.scheduleType || 'backup'}) is already ${activeDuplicate.status}. Wait for it to finish before retrying.`,
+        existingJobId: activeDuplicate.id,
       });
     }
 
@@ -1491,28 +1949,32 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
 
     // Look up the schedule (if any) so we can rebuild the same payload
     // executeScheduledBackup uses. The agent rejects without storagePoolPath.
-    let schedule = null;
-    if (originalJob.scheduleId) {
-      const schedules = await getBackupSchedules();
-      schedule = schedules.find(s => s.id === originalJob.scheduleId) || null;
-    }
+    const schedules = await getBackupSchedules();
+    let schedule = originalJob.scheduleId
+      ? (schedules.find(s => s.id === originalJob.scheduleId) || null)
+      : null;
 
-    // Resolve storage pool. Prefer the schedule's pool, then the original
-    // job's pool id (manual triggers store storagePoolId on the job
-    // record), otherwise refuse — without it the agent returns 400.
+    // Resolve the storage pool. The job record is NOT the only place this is
+    // known: a job adopted from a live tmux session (or an older record) has no
+    // storagePoolId, and a schedule that was edited since the run holds the
+    // pool the VM backs up to NOW — which is the one a retry should use.
     const { getStoragePools } = require('../services/fileStorage');
     const pools = await getStoragePools();
-    const poolId = schedule?.storagePoolId || originalJob.storagePoolId;
-    const pool = poolId
-      ? pools.find(p => p.id === poolId && p.backupHostId === host.id)
-      : null;
+    const { pool, source: poolSource, schedule: poolSchedule } =
+      resolveRetryStoragePool({ originalJob, host, pools, schedules, jobs });
     if (!pool) {
       return res.status(400).json({
         success: false,
-        error: poolId
-          ? `Storage pool ${poolId} not found on this backup host`
-          : 'Original job has no storage pool on record; cannot retry. Edit the schedule and trigger a fresh backup instead.',
+        error: originalJob.storagePoolId
+          ? `Storage pool ${originalJob.storagePoolId} not found on this backup host`
+          : `No storage pool could be resolved for ${originalJob.vmName} on ${host.name}. Its schedule was deleted and no earlier backup recorded a pool — trigger a fresh backup choosing a pool instead.`,
       });
+    }
+    // A schedule found by VM (because the job carried no usable scheduleId)
+    // also supplies retention/offsite settings for the rebuilt payload.
+    if (!schedule && poolSchedule) schedule = poolSchedule;
+    if (poolSource !== 'job') {
+      console.log(`[Retry] Resolved storage pool for ${originalJob.vmName} from ${poolSource}: ${pool.name} (${pool.path})`);
     }
 
     // Resolve offsite targets through the shared scheduler helper so retries
@@ -1586,6 +2048,12 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       error: null,
       scheduled: originalJob.scheduled || false,
       retryOf: originalJob.id,
+      // A retry that fails must itself be retryable — state it explicitly
+      // rather than relying on `canRetry` being absent.
+      canRetry: true,
+      // Persisted so any later trigger of this record (e.g. the queue drainer
+      // in _startQueuedJob) still runs the pre-backup cleanup.
+      isRetry: true,
       progress: 0,
       progressText: 'Queued (retry)...',
     };
@@ -1616,18 +2084,9 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
         return { ok: false, running: runningOnHost.length, max: maxConcurrent };
       }
 
-      // Retrying a FAILED job replaces it: drop the original record so the
-      // history isn't cluttered with the superseded failure. The new retry
-      // job carries retryOf for lineage. (Skipped jobs are handled by
-      // supersedeSkippedSiblings instead, which resolves the whole group.)
-      if (originalJob.status === 'failed') {
-        const oi = freshJobs.findIndex(j => j.id === originalJob.id);
-        if (oi !== -1) freshJobs.splice(oi, 1);
-      }
-
       freshJobs.push(retryJob);
       await saveBackupJobs(freshJobs);
-      return { ok: true, removedOriginal: originalJob.status === 'failed' };
+      return { ok: true };
     });
 
     if (!slotResult.ok && slotResult.existing) {
@@ -1650,10 +2109,16 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       });
     }
 
-    // The original failed record was removed inside the lock — tell the UI.
-    if (slotResult.removedOriginal) {
-      io.emit('job-removed', { jobId: originalJob.id });
-    }
+    // Retrying a FAILED job replaces it, so the superseded failure is dropped
+    // from history — but ONLY once the retry actually exists in its place
+    // (in flight, or itself recorded as a fresh failure). Removing it up front
+    // meant a 409 "already in progress" deleted the retry AND the original,
+    // leaving nothing in history and no Retry button to click.
+    // Skipped originals are left alone; supersedeSkippedSiblings resolves those.
+    const retireOriginalFailure = async () => {
+      if (originalJob.status !== 'failed') return;
+      await schedulerService._removeJob(originalJob.id); // emits job-removed
+    };
 
     await appendLog(newJobId, `Retry of job ${originalJob.id} (${originalJob.status})`);
     await appendLog(newJobId, `Original job: ${originalJob.vmName} - ${originalJob.error || 'No error message'}`);
@@ -1677,6 +2142,7 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
         method: originalJob.method,
         storagePoolId: pool.id,
         storagePoolPath: pool.path,
+        diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: retryJob.retention,
         keepArchive: retryJob.keepArchive,
         compression: retryJob.compression,
@@ -1684,6 +2150,10 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
         noVerify: retryJob.noVerify,
         offsiteHosts: offsiteEncoded,
         verbose: schedule?.verbose || false,
+        // Makes the agent run Cleanup_Backup.sh to clear partial files from the
+        // failed attempt before starting fresh. Without it a manual retry
+        // resumed on top of the debris the previous failure left behind.
+        isRetry: true,
         ...(sourceScheduleType === 'daily' || sourceScheduleType === 'interval' || sourceScheduleType === 'cron'
           ? { vmId: originalJob.vmId, incrementalCount: schedule?.incrementalCount }
           : {}),
@@ -1708,12 +2178,15 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       // skipped record for this VM + schedule as superseded so their
       // Retry buttons disappear.
       await schedulerService.supersedeSkippedSiblings(originalJob, newJobId);
+      await retireOriginalFailure();
 
     } catch (error) {
       const detail = error.response?.data?.error || error.message;
 
       // 409 = the agent says a backup for this VM is already running.
-      // Adopt that job instead of recording a bogus failure.
+      // Adopt that job instead of recording a bogus failure. The retry never
+      // ran, so the original failure is deliberately NOT retired here — it
+      // stays in history, still retryable, once that in-flight backup ends.
       if (error.response?.status === 409) {
         const adoptedId = error.response?.data?.existingJobId || null;
         await schedulerService._removeJob(newJobId);
@@ -1735,11 +2208,15 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       freshJob.status = 'failed';
       freshJob.error = `Retry trigger failed: ${detail}`;
       freshJob.endTime = new Date().toISOString();
+      freshJob.canRetry = true;
       await saveBackupJobs(freshJobs);
       retryJob.status = 'failed';
       retryJob.error = freshJob.error;
       await appendLog(newJobId, `Error triggering retry: ${detail}`);
       io.emit('backup-error', freshJob);
+      // This retry record now represents the failure and carries its own Retry
+      // button, so the original it replaced can go.
+      await retireOriginalFailure();
     }
 
     res.status(202).json({ 

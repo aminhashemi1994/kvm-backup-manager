@@ -46,6 +46,12 @@ class RestoreStoragePoolRefreshService {
         return;
       }
 
+      // Skip offline hosts — see StoragePoolRefresh for the rationale (avoid the
+      // per-cycle ECONNREFUSED spam; resumes automatically when back online).
+      if (backupHost.status && backupHost.status !== 'online') {
+        return;
+      }
+
       // Get fresh storage info from agent
       const validation = await agentService.validateRestoreStoragePool(backupHost.url, pool.path);
       

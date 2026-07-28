@@ -3,6 +3,7 @@ const router = express.Router();
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { findAllVMInstances } = require('../utils/storagePoolHelper');
 
 // POST /api/fix-backup - Fix backup for a VM using KVM_Fix_Backup.sh script
 //
@@ -21,6 +22,66 @@ const SSH_OPTS = [
   '-o', 'ConnectTimeout=10',
   '-o', 'BatchMode=yes',
 ];
+
+const NEEDS_FULL_MARKER = '.needs-full';
+
+/**
+ * Record that the next backup for this VM must be a full one.
+ *
+ * KVM_Fix_Backup.sh deletes the VM's libvirt checkpoints and dirty bitmaps. The
+ * backup target directories are left untouched and still hold a perfectly
+ * readable full, so Backup_Manager.sh's disk-side detection concludes an
+ * incremental is possible and virtnbdbackup then fails redefining checkpoints
+ * that no longer exist on the hypervisor. The script can now discover this by
+ * asking the hypervisor, but that costs an SSH round trip and can be
+ * inconclusive — whereas here we know it for a fact, so we say so.
+ *
+ * The marker sits at <pool>/<vm>/.needs-full, one per VM per pool: libvirt
+ * checkpoints are VM-global, so this invalidates the daily, weekly and custom
+ * chains simultaneously. Backup_Manager.sh archives the chain, takes a full, and
+ * removes the marker once a backup succeeds.
+ *
+ * Best effort by design: a marker we could not write means the script falls back
+ * to its own hypervisor check, so failing here must never fail the fix itself.
+ */
+async function markNextBackupFull(vmName, hypervisorIp) {
+  const written = [];
+  const failed = [];
+
+  let instances = [];
+  try {
+    instances = await findAllVMInstances(vmName);
+  } catch (error) {
+    console.error(`[FixBackup] Could not enumerate storage pools for ${vmName}: ${error.message}`);
+    return { written, failed, enumerated: false };
+  }
+
+  const payload = JSON.stringify({
+    reason: 'a backup fix reset this VM\'s checkpoint metadata',
+    source: 'fix-backup',
+    vmName,
+    hypervisorIp,
+    timestamp: new Date().toISOString(),
+  }, null, 2);
+
+  for (const { vmPath } of instances) {
+    const markerPath = path.join(vmPath, NEEDS_FULL_MARKER);
+    try {
+      fs.writeFileSync(markerPath, `${payload}\n`, 'utf8');
+      written.push(markerPath);
+      console.log(`[FixBackup] Marked next backup as full: ${markerPath}`);
+    } catch (error) {
+      failed.push(markerPath);
+      console.error(`[FixBackup] Could not write ${markerPath}: ${error.message}`);
+    }
+  }
+
+  if (instances.length === 0) {
+    console.log(`[FixBackup] No existing backup directories for ${vmName}; no marker needed`);
+  }
+
+  return { written, failed, enumerated: true };
+}
 
 /**
  * Run a command and capture output. Returns { code, stdout, stderr }.
@@ -131,10 +192,18 @@ router.post('/', async (req, res, next) => {
     if (execResult.stderr) console.error(`[FixBackup:${hypervisorIp}] stderr: ${execResult.stderr}`);
 
     if (execResult.code === 0) {
+      // The chain is now unextendable on every pool that holds it. Record that
+      // so the next scheduled backup takes a full instead of attempting an
+      // incremental that cannot succeed.
+      const marker = await markNextBackupFull(vmName, hypervisorIp);
+
       return res.json({
         success: true,
-        message: `Backup fixed successfully for ${vmName}. Checkpoint metadata has been reset.`,
+        message: `Backup fixed successfully for ${vmName}. Checkpoint metadata has been reset; the next backup will be a full one.`,
         output: execResult.stdout.trim(),
+        nextBackupForcedFull: marker.written.length > 0,
+        markers: marker.written,
+        markerFailures: marker.failed,
       });
     } else if (execResult.code === 255) {
       return res.status(500).json({

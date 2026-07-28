@@ -270,12 +270,23 @@ export default function ScheduleDetails({ schedule, vmId, vmName }: ScheduleDeta
             </div>
           )}
 
-          {/* Scheduler Log */}
+          {/* Scheduler Log — the scheduler file is appended chronologically
+              (oldest first). "Recent Runs" must therefore show the LAST entries,
+              newest first — the previous slice(0,5) showed the OLDEST 5, which
+              never matched the totals (e.g. Last Backup 01/07 while the list
+              stopped at 29/06) and made the report look inconsistent. */}
           {schedule.scheduler_log && schedule.scheduler_log.length > 0 && (
             <div className="space-y-1">
-              <h6 className="text-xs font-medium">Recent Runs</h6>
+              <h6 className="text-xs font-medium">
+                Recent Runs
+                {schedule.scheduler_log.length > 8 && (
+                  <span className="text-gray-400 font-normal ml-1">
+                    (last 8 of {schedule.scheduler_log.length})
+                  </span>
+                )}
+              </h6>
               <div className="space-y-1">
-                {schedule.scheduler_log.slice(0, 5).map((log: any, index: number) => (
+                {[...schedule.scheduler_log].slice(-8).reverse().map((log: any, index: number) => (
                   <div key={index} className="flex items-center space-x-2 text-xs">
                     <Calendar className="h-3 w-3 text-gray-400" />
                     <span className="font-medium">{log.day}</span>

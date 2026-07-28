@@ -26,6 +26,7 @@ interface FormData {
   name: string
   path: string
   backupHostId: string
+  diskUsageThreshold: number
 }
 
 export default function AddStoragePoolDialog({
@@ -41,12 +42,15 @@ export default function AddStoragePoolDialog({
     handleSubmit,
     reset,
     formState: { errors },
-  } = useForm<FormData>()
+  } = useForm<FormData>({
+    defaultValues: { diskUsageThreshold: 80 },
+  })
 
   const onSubmit = async (data: FormData) => {
     try {
       await createMutation.mutateAsync({
         ...data,
+        diskUsageThreshold: Number(data.diskUsageThreshold),
         backupHostId: selectedHostId,
       })
       reset()
@@ -132,6 +136,29 @@ export default function AddStoragePoolDialog({
             )}
             <p className="text-sm text-gray-500">
               Must be an absolute path on a mounted filesystem (e.g., /mnt/backup-storage or /mnt/backup-storage/backups)
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="diskUsageThreshold">Disk Usage Threshold (%)</Label>
+            <Input
+              id="diskUsageThreshold"
+              type="number"
+              min={1}
+              max={100}
+              {...register('diskUsageThreshold', {
+                required: 'Threshold is required',
+                min: { value: 1, message: 'Must be between 1 and 100' },
+                max: { value: 100, message: 'Must be between 1 and 100' },
+                valueAsNumber: true,
+              })}
+            />
+            {errors.diskUsageThreshold && (
+              <p className="text-sm text-red-600">{errors.diskUsageThreshold.message}</p>
+            )}
+            <p className="text-sm text-gray-500">
+              Backups (including offsite syncs) are refused when usage exceeds this
+              percentage. Defaults to 80%.
             </p>
           </div>
 

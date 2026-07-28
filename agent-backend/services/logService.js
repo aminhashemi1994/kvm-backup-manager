@@ -78,6 +78,7 @@ class LogService {
     const files = await fs.readdir(config.logDir);
     const now = Date.now();
     const maxAge = maxAgeDays * 24 * 60 * 60 * 1000;
+    const jobStateDir = path.join(config.logDir, 'job-state');
     let deletedCount = 0;
 
     for (const file of files) {
@@ -85,11 +86,24 @@ class LogService {
 
       const filePath = path.join(config.logDir, file);
       const stats = await fs.stat(filePath);
-      
-      if (now - stats.mtimeMs > maxAge) {
-        await fs.unlink(filePath);
-        deletedCount++;
+
+      if (now - stats.mtimeMs <= maxAge) continue;
+
+      // Never delete the log of a job that isn't finished. A surviving
+      // job-state file means the job is still queued / running / recovering,
+      // and deleting its log would destroy the only record of an in-flight
+      // backup — exactly the log-loss we are trying to eliminate. Age alone
+      // is not a safe deletion criterion.
+      const jobId = file.slice(0, -4); // strip ".log"
+      try {
+        await fs.access(path.join(jobStateDir, `${jobId}.json`));
+        continue; // job-state exists → job not finalized → keep the log
+      } catch (_) {
+        // no job-state → job is finalized → safe to age out
       }
+
+      await fs.unlink(filePath);
+      deletedCount++;
     }
 
     return { deleted: deletedCount };

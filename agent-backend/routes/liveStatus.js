@@ -54,4 +54,45 @@ router.get('/live-status/batch', async (req, res, next) => {
   }
 });
 
+/**
+ * POST /api/jobs/active-sessions
+ *
+ * Body: { jobs: [{ jobId, vmName, scheduleType }, ...] }
+ *
+ * Cheap host-side liveness grep for the history/active reconciler: returns the
+ * subset of the given jobs that still have a live tmux session on this host
+ * (matched by jobId containment, with VM+schedule as fallback), plus progress
+ * where a progress file is found. One `tmux ls` for the whole batch.
+ *
+ * This is what lets the panel correct a job that was wrongly marked "failed"
+ * while its backup is in fact still running in tmux — the lock file may be
+ * gone, but the session and progress file prove it is alive.
+ */
+router.post('/active-sessions', async (req, res, next) => {
+  try {
+    const jobs = Array.isArray(req.body?.jobs) ? req.body.jobs : [];
+    const data = await liveStatusService.checkActiveSessions(jobs);
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/jobs/live-sessions
+ *
+ * Discover EVERY live backup tmux session on this host (no input needed),
+ * parsed with progress. The controller uses this to make the Active Jobs panel
+ * mirror `tmux ls` — adopting/resurrecting sessions whose job record was lost,
+ * superseded, or wrongly finalized.
+ */
+router.get('/live-sessions', async (req, res, next) => {
+  try {
+    const data = await liveStatusService.discoverBackupSessions();
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

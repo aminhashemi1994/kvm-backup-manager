@@ -111,7 +111,7 @@ class ConcurrencyConfigSyncService {
 
     try {
       const endpoint = `/backup-hosts/${backupHostId}/concurrent-config`;
-      const response = await controllerAuthService.get(controllerUrl, endpoint, { timeout: 5000 });
+      const response = await controllerAuthService.get(controllerUrl, endpoint, { timeout: 15000 });
       if (!response.data?.success || !response.data.data) {
         return { success: false, error: response.data?.error || 'Empty response' };
       }

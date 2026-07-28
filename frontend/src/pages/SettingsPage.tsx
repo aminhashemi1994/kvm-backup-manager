@@ -78,6 +78,7 @@ function GeneralSettings() {
     defaultMaxConcurrentBackups: number
     healthCheckIntervalSeconds: number
     defaultMissedRunPolicy: 'immediate' | 'most-recent' | 'skip'
+    jobLogRetentionDays: number
   }
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -85,6 +86,7 @@ function GeneralSettings() {
     defaultMaxConcurrentBackups: 20,
     healthCheckIntervalSeconds: 60,
     defaultMissedRunPolicy: 'immediate',
+    jobLogRetentionDays: 90,
   })
   const [applyConcurrencyToAllHosts, setApplyConcurrencyToAllHosts] = useState(false)
 
@@ -101,6 +103,9 @@ function GeneralSettings() {
               : 20,
             healthCheckIntervalSeconds: Number(data.healthCheckIntervalSeconds) || 60,
             defaultMissedRunPolicy: data.defaultMissedRunPolicy || 'immediate',
+            jobLogRetentionDays: data.jobLogRetentionDays != null
+              ? Number(data.jobLogRetentionDays)
+              : 90,
           })
         }
       })
@@ -248,6 +253,26 @@ function GeneralSettings() {
             <option value="most-recent">Run only most recent missed</option>
             <option value="skip">Skip (log only)</option>
           </select>
+        </div>
+
+        <div className="space-y-2">
+          <label className="text-sm font-medium">Backup Job Log Retention (days)</label>
+          <input
+            type="number"
+            value={settings.jobLogRetentionDays}
+            onChange={(e) => {
+              const n = Number(e.target.value)
+              updateField('jobLogRetentionDays', Number.isFinite(n) && n >= 0 ? n : 0)
+            }}
+            min={0}
+            max={3650}
+            className={inputCls}
+          />
+          <p className="text-xs text-gray-500">
+            Agents automatically delete a backup job's log file once it's older than this many days.
+            Logs are never deleted while a job is still running. <strong>Set to 0 to disable</strong> —
+            logs are then kept indefinitely until manually removed from the Cleanup page.
+          </p>
         </div>
 
         <div className="pt-2">

@@ -26,6 +26,7 @@ import { useQuery } from '@tanstack/react-query'
 import { storagePoolsApi } from '@/services/api'
 import { useNavigate } from 'react-router-dom'
 import RestoreBackupDialog from '@/components/backup-management/RestoreBackupDialog'
+import DataLoadingIndicator from '@/components/backup-management/DataLoadingIndicator'
 
 export default function BackupManagement() {
   const navigate = useNavigate()
@@ -143,7 +144,7 @@ export default function BackupManagement() {
     setRestoreDialogOpen(true)
   }
 
-  const handleRestoreStarted = (restoreId: string) => {
+  const handleRestoreStarted = (_restoreId: string) => {
     // Navigate to Active Jobs page to see the restore progress
     navigate('/backups/active')
   }
@@ -337,9 +338,15 @@ export default function BackupManagement() {
             </CardHeader>
             <CardContent>
               {vmListLoading ? (
-                <div className="flex items-center justify-center py-8">
-                  <Loader2 className="h-8 w-8 animate-spin text-gray-400" />
-                </div>
+                <DataLoadingIndicator
+                  title="Loading virtual machines…"
+                  messages={[
+                    'Connecting to the backup host…',
+                    'Listing backed-up VMs…',
+                  ]}
+                  slowAfterSeconds={8}
+                  slowNote="Hosts with many VMs can take a little longer — still working."
+                />
               ) : filteredVMs && filteredVMs.length > 0 ? (
                 <div className="space-y-2 max-h-[600px] overflow-y-auto">
                   {filteredVMs.map((vm: any) => (
@@ -415,11 +422,15 @@ export default function BackupManagement() {
                   <p>Select a VM from the list to view backup details</p>
                 </div>
               ) : (vmDetailsLoading || vmDetailsFetching) ? (
-                <div className="flex flex-col items-center justify-center py-12">
-                  <Loader2 className="h-12 w-12 animate-spin text-gray-400 mb-4" />
-                  <p className="text-gray-600">Loading backup details...</p>
-                  <p className="text-sm text-gray-500 mt-2">This may take a few minutes</p>
-                </div>
+                <DataLoadingIndicator
+                  title={`Loading backup details for ${selectedVMName}`}
+                  messages={[
+                    'Connecting to the backup host…',
+                    'Scanning backup directories…',
+                    'Analyzing backup chains…',
+                    'Calculating sizes and health…',
+                  ]}
+                />
               ) : vmDetails ? (
                 <div className="space-y-6">
                   {/* VM Summary */}

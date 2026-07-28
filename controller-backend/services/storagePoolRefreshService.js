@@ -46,6 +46,14 @@ class StoragePoolRefreshService {
         return;
       }
 
+      // Skip hosts the health check already knows are offline. Hitting them just
+      // produces an immediate ECONNREFUSED every cycle — pure log spam and wasted
+      // connections. The refresh resumes automatically once the host is back
+      // online (its status flips and this guard passes).
+      if (backupHost.status && backupHost.status !== 'online') {
+        return;
+      }
+
       // Get fresh storage info from agent
       const validation = await agentService.validateStoragePool(backupHost.url, pool.path);
       

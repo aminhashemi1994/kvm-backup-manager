@@ -94,6 +94,24 @@ class RemoteMetricsService {
         throw new Error(`Backup host not found for hypervisor ${hypervisor.name}`);
       }
 
+      // Skip when the owning backup host is offline — the agent that runs the SSH
+      // probe is unreachable, so every attempt is an immediate ECONNREFUSED. Mark
+      // the metrics offline (without hammering the agent) and move on.
+      if (backupHost.status && backupHost.status !== 'online') {
+        this.metricsCache.set(`hypervisor-${hypervisor.id}`, {
+          id: hypervisor.id,
+          name: hypervisor.name,
+          ip: hypervisor.ip,
+          backupHostId: hypervisor.backupHostId,
+          type: 'hypervisor',
+          disks: [],
+          timestamp: new Date().toISOString(),
+          status: 'offline',
+          error: 'Backup host offline',
+        });
+        return;
+      }
+
       // Call agent API to collect metrics via SSH
       const result = await agentService.getRemoteHypervisorMetrics(backupHost.url, {
         ip: hypervisor.ip,
@@ -144,6 +162,24 @@ class RemoteMetricsService {
       
       if (!backupHost) {
         throw new Error(`Backup host not found for offsite ${offsite.name}`);
+      }
+
+      // Skip when the owning backup host is offline — its agent runs the SSH
+      // probe, so every attempt is an immediate ECONNREFUSED. Cache offline and
+      // move on instead of hammering the dead host each cycle.
+      if (backupHost.status && backupHost.status !== 'online') {
+        this.metricsCache.set(`offsite-${offsite.id}`, {
+          id: offsite.id,
+          name: offsite.name,
+          ip: offsite.ip,
+          backupHostId: offsite.backupHostId,
+          type: 'offsite',
+          disks: [],
+          timestamp: new Date().toISOString(),
+          status: 'offline',
+          error: 'Backup host offline',
+        });
+        return;
       }
 
       // Use THIS offsite host's own storage pools (embedded in the offsite

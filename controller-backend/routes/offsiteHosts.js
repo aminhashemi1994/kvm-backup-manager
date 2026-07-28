@@ -4,6 +4,18 @@ const { v4: uuidv4 } = require('uuid');
 const { getOffsiteHosts, saveOffsiteHosts, getBackupHosts, getStoragePools, getBackupSchedules } = require('../services/fileStorage');
 const agentService = require('../services/agentService');
 
+// Default disk-usage guard rail (percent) for an offsite pool when unset.
+const DEFAULT_DISK_USAGE_THRESHOLD = 80;
+
+// Normalize a user-supplied disk-usage threshold to an integer 1–100, or
+// return null when absent/invalid so callers can fall back to a default.
+function normalizeThreshold(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const t = parseInt(value, 10);
+  if (!Number.isFinite(t) || t < 1 || t > 100) return null;
+  return t;
+}
+
 // Helper to ensure URL has protocol
 function ensureProtocol(url) {
   if (!url) return url;
@@ -366,7 +378,7 @@ router.get('/:id/pools', async (req, res, next) => {
 // POST /api/offsite-hosts/:id/pools - add a pool to an offsite host
 router.post('/:id/pools', async (req, res, next) => {
   try {
-    const { name, path: poolPath } = req.body;
+    const { name, path: poolPath, diskUsageThreshold } = req.body;
 
     if (!name || !String(name).trim()) {
       return res.status(400).json({ success: false, error: 'Pool name is required' });
@@ -411,6 +423,7 @@ router.post('/:id/pools', async (req, res, next) => {
       id: uuidv4(),
       name: String(name).trim(),
       path: trimmedPath,
+      diskUsageThreshold: normalizeThreshold(diskUsageThreshold) ?? DEFAULT_DISK_USAGE_THRESHOLD,
       totalGB: check.snapshot.totalGB,
       usedGB: check.snapshot.usedGB,
       availableGB: check.snapshot.availableGB,
@@ -453,6 +466,17 @@ router.put('/:id/pools/:poolId', async (req, res, next) => {
         return res.status(400).json({ success: false, error: 'Pool name is required' });
       }
       pool.name = name;
+    }
+
+    if (req.body.diskUsageThreshold !== undefined) {
+      const t = normalizeThreshold(req.body.diskUsageThreshold);
+      if (t === null) {
+        return res.status(400).json({
+          success: false,
+          error: 'diskUsageThreshold must be an integer between 1 and 100'
+        });
+      }
+      pool.diskUsageThreshold = t;
     }
 
     if (req.body.path !== undefined) {

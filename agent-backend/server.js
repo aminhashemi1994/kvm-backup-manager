@@ -64,7 +64,27 @@ if (!fs.existsSync(config.logDir)) {
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use(morgan('dev'));
+// High-frequency polling/health endpoints flood the logs and bury real
+// diagnostics (backup lifecycle lines, errors). Skip them ONLY when they
+// succeed — any 4xx/5xx on these still gets logged so problems stay visible.
+const NOISY_LOG_PATHS = [
+  '/api/health',
+  '/api/jobs/active-sessions',
+  '/api/jobs/live-sessions',
+  '/api/storage-pools/validate',
+  '/api/restore-storage-pools/validate',
+  '/api/remote-metrics',
+  '/api/storage-pool-sync',
+  '/api/concurrency-config',
+  '/api/backup/active',
+];
+app.use(morgan('dev', {
+  skip: (req, res) => {
+    if (res.statusCode >= 400) return false;
+    const url = req.originalUrl || req.url || '';
+    return NOISY_LOG_PATHS.some(p => url.startsWith(p));
+  },
+}));
 
 app.set('io', io);
 app.set('config', config);
@@ -73,9 +93,12 @@ app.set('hypervisors', new Map());
 // Initialize backup executor
 backupExecutor.initialize(io, config);
 
-// Initialize restore executor
+// Initialize restore executor. initialize() re-adopts restores still running in
+// tmux from a previous agent process — without it they stay invisible after a
+// restart and never report a final status.
 restoreExecutor.setSocketIO(io);
 restoreExecutor.setConfig(config);
+restoreExecutor.initialize();
 
 // Initialize init host service
 initHostService.initialize(io, config);
@@ -187,6 +210,7 @@ process.on('SIGTERM', () => {
   if (controllerSocket) controllerSocket.disconnect();
   reportService.shutdown();
   backupExecutor.shutdown();
+  restoreExecutor.shutdown();
   cleanupService.shutdown();
   storagePoolSyncService.shutdown?.();
   concurrencyConfigSyncService.shutdown();
@@ -198,6 +222,7 @@ process.on('SIGINT', () => {
   if (controllerSocket) controllerSocket.disconnect();
   reportService.shutdown();
   backupExecutor.shutdown();
+  restoreExecutor.shutdown();
   cleanupService.shutdown();
   storagePoolSyncService.shutdown?.();
   concurrencyConfigSyncService.shutdown();

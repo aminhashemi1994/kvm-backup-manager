@@ -1,6 +1,7 @@
 const axios = require('axios');
 const https = require('https');
 const config = require('../config/config');
+const { stripAnsi } = require('../utils/stripAnsi');
 
 // Allow self-signed / internal-CA RocketChat servers — same effect as
 // curl's `-k` flag. Toggleable per call so we can turn strict TLS back on
@@ -237,7 +238,18 @@ class RocketChatService {
    * Build the standard message body. Any field can be omitted by passing
    * an empty string; that line is dropped so the message stays readable.
    */
-  formatUpdate({ entity, state, status, name, version, details }) {
+  formatUpdate(fields = {}) {
+    // Single choke point for every RocketChat message, so scrub terminal escape
+    // sequences here: error strings are scraped from colourised script logs and
+    // would otherwise render literally as "[0;31m✗ Backup FAILED[0m". Details
+    // are collapsed to one line to keep each message a tidy single bullet.
+    const entity  = stripAnsi(fields.entity);
+    const state   = stripAnsi(fields.state);
+    const status  = stripAnsi(fields.status);
+    const name    = stripAnsi(fields.name);
+    const version = stripAnsi(fields.version);
+    const details = stripAnsi(fields.details, { singleLine: true });
+
     const ent = entity || this.entity || 'Backup Manager';
     const ver = version || this.version || '';
 

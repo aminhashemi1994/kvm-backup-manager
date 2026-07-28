@@ -21,6 +21,10 @@ const DEFAULTS = {
   healthCheckIntervalSeconds: 60,
   // Default policy applied to newly-created schedules.
   defaultMissedRunPolicy: 'immediate', // 'immediate' | 'most-recent' | 'skip'
+  // Age (in days) after which agents auto-delete a backup job's flat log
+  // file (<logDir>/<jobId>.log). 0 disables automatic deletion — logs are
+  // kept until manually removed via the Cleanup page.
+  jobLogRetentionDays: 90,
 };
 
 async function loadSettings() {
@@ -51,6 +55,13 @@ function validate(payload) {
   if (payload.defaultMissedRunPolicy !== undefined) {
     if (!['immediate', 'most-recent', 'skip'].includes(payload.defaultMissedRunPolicy)) {
       errors.push('defaultMissedRunPolicy must be one of: immediate, most-recent, skip');
+    }
+  }
+  if (payload.jobLogRetentionDays !== undefined) {
+    const n = Number(payload.jobLogRetentionDays);
+    // 0 = disabled (never auto-delete). Otherwise 1–3650 (~10 years).
+    if (!Number.isFinite(n) || n < 0 || n > 3650) {
+      errors.push('jobLogRetentionDays must be a number between 0 and 3650 (0 = disabled)');
     }
   }
   return errors;
@@ -103,6 +114,9 @@ router.put('/', requireAdmin, async (req, res, next) => {
     }
     if (incoming.defaultMissedRunPolicy !== undefined) {
       merged.defaultMissedRunPolicy = incoming.defaultMissedRunPolicy;
+    }
+    if (incoming.jobLogRetentionDays !== undefined) {
+      merged.jobLogRetentionDays = Number(incoming.jobLogRetentionDays);
     }
     merged.updatedAt = new Date().toISOString();
 

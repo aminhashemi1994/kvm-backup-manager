@@ -10,6 +10,18 @@ const {
   getBackupHosts
 } = require('../services/fileStorage');
 
+// Default disk-usage guard rail (percent) applied when a pool doesn't set one.
+const DEFAULT_DISK_USAGE_THRESHOLD = 80;
+
+// Normalize a user-supplied disk-usage threshold to an integer 1–100, or
+// return null when the value is absent/invalid so callers can fall back.
+function normalizeThreshold(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const t = parseInt(value, 10);
+  if (!Number.isFinite(t) || t < 1 || t > 100) return null;
+  return t;
+}
+
 // GET /api/storage-pools - Get all storage pools
 router.get('/', async (req, res, next) => {
   try {
@@ -20,7 +32,8 @@ router.get('/', async (req, res, next) => {
       isMountPoint: !!pool.mountPoint, // Convert mountPoint string to boolean
       lastChecked: pool.updatedAt || pool.createdAt, // Use updatedAt as lastChecked
       status: pool.status === 'active' ? 'online' : 'offline', // Map status
-      usedPercentage: pool.usagePercent || 0 // Add usedPercentage alias
+      usedPercentage: pool.usagePercent || 0, // Add usedPercentage alias
+      diskUsageThreshold: pool.diskUsageThreshold ?? DEFAULT_DISK_USAGE_THRESHOLD
     }));
     res.json({ success: true, data: transformedPools });
   } catch (error) {
@@ -39,7 +52,8 @@ router.get('/backup-host/:backupHostId', async (req, res, next) => {
       isMountPoint: !!pool.mountPoint, // Convert mountPoint string to boolean
       lastChecked: pool.updatedAt || pool.createdAt, // Use updatedAt as lastChecked
       status: pool.status === 'active' ? 'online' : 'offline', // Map status
-      usedPercentage: pool.usagePercent || 0 // Add usedPercentage alias
+      usedPercentage: pool.usagePercent || 0, // Add usedPercentage alias
+      diskUsageThreshold: pool.diskUsageThreshold ?? DEFAULT_DISK_USAGE_THRESHOLD
     }));
     res.json({ success: true, data: transformedPools });
   } catch (error) {
@@ -50,7 +64,7 @@ router.get('/backup-host/:backupHostId', async (req, res, next) => {
 // POST /api/storage-pools - Create a new storage pool
 router.post('/', async (req, res, next) => {
   try {
-    const { backupHostId, name, path } = req.body;
+    const { backupHostId, name, path, diskUsageThreshold } = req.body;
 
     console.log('[Storage Pools] Creating new storage pool:', { backupHostId, name, path });
 
@@ -102,6 +116,7 @@ router.post('/', async (req, res, next) => {
       usedGB: validation.data.usedGB,
       availableGB: validation.data.availableGB,
       usagePercent: validation.data.usagePercent,
+      diskUsageThreshold: normalizeThreshold(diskUsageThreshold) ?? DEFAULT_DISK_USAGE_THRESHOLD,
       status: 'active',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
@@ -146,7 +161,7 @@ router.post('/', async (req, res, next) => {
 // PUT /api/storage-pools/:id - Update storage pool
 router.put('/:id', async (req, res, next) => {
   try {
-    const { name } = req.body;
+    const { name, diskUsageThreshold } = req.body;
     const pools = await getStoragePools();
     const pool = pools.find(p => p.id === req.params.id);
 
@@ -187,8 +202,15 @@ router.put('/:id', async (req, res, next) => {
       updatedAt: new Date().toISOString()
     };
 
+    // Only touch the threshold when the caller supplied a valid one, so an
+    // edit that just renames the pool preserves the existing guard rail.
+    const normalizedThreshold = normalizeThreshold(diskUsageThreshold);
+    if (normalizedThreshold !== null) {
+      updates.diskUsageThreshold = normalizedThreshold;
+    }
+
     await updateStoragePool(req.params.id, updates);
-    
+
     // Notify agent to sync storage pools
     console.log('[Storage Pools] ═══════════════════════════════════════════════════');
     console.log('[Storage Pools] Notifying agent to sync after update');
