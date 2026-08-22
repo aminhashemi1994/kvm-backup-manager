@@ -36,7 +36,11 @@ export default function VmNameCell({
 
   return (
     <div className={maxWidthClass}>
-      <div className="truncate font-medium" title={full}>
+      {/* Wrap up to two lines and ellipsise at the column edge instead of
+          cutting a long VM name off mid-word on a single line. A short name
+          still renders as a single line, so this only kicks in when the
+          column is too narrow. The full name is on hover. */}
+      <div className="font-medium line-clamp-2 break-all" title={full}>
         {title || '-'}
       </div>
       {uuid && (

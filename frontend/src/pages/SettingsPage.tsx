@@ -1,11 +1,24 @@
 import { useState, useEffect } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
-import { Settings, Users, Shield, Bell, MessageSquare, Sun, Moon, Save, Send, Loader2 } from 'lucide-react'
+import { Settings, Users, Shield, Bell, MessageSquare, Sun, Moon, Save, Send, Loader2, ChevronDown, ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTheme } from '@/contexts/ThemeContext'
 import { notificationsApi, settingsApi } from '@/services/api'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { NOTIFICATION_EVENTS, NOTIFICATION_TYPES, NOTIFICATION_TYPE_GROUPS, type NotificationEventToggles } from '@/types'
+
+/**
+ * Turn the comma-separated text of a mentions field into clean usernames.
+ * A leading @ is accepted and stripped — people type it out of habit and the
+ * formatter adds exactly one when it builds the message.
+ */
+function splitMentions(text: string): string[] {
+  return text
+    .split(',')
+    .map(v => v.trim().replace(/^@+/, ''))
+    .filter(Boolean)
+}
 
 const settingsTabs = [
   { name: 'General', to: '/settings', icon: Settings, end: true },
@@ -831,6 +844,19 @@ function NotificationSettings() {
     entity: 'Backup Manager',
     version: '',
   })
+  // System-wide default for each event. A schedule may override any of these;
+  // these values are what "Inherit" resolves to in the schedule forms.
+  const [events, setEvents] = useState<NotificationEventToggles>({})
+  // Master on/off per notification, and who gets @-mentioned on each.
+  // Mentions are held as the raw comma-separated text the user typed and only
+  // split on save, so typing a comma doesn't fight the input.
+  const [types, setTypes] = useState<Record<string, boolean>>({})
+  // People are assigned per section, not per notification: every notification in
+  // a section shares one list. The API still stores mentions per type, so the
+  // section value is fanned out on save and read back from the section's types.
+  const [mentionsByGroup, setMentionsByGroup] = useState<Record<string, string>>({})
+  const [defaultMentions, setDefaultMentions] = useState('')
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
     let mounted = true
@@ -846,6 +872,29 @@ function NotificationSettings() {
             entity: data.entity || prev.entity,
             version: data.version || prev.version,
           }))
+        }
+        const incomingEvents = res.data?.data?.events
+        if (incomingEvents) setEvents(incomingEvents)
+        const incomingTypes = res.data?.data?.types
+        if (incomingTypes) setTypes(incomingTypes)
+        const m = res.data?.data?.mentions
+        if (m) {
+          setDefaultMentions((m.default || []).join(', '))
+          const byType: Record<string, string> = {}
+          Object.entries(m.byType || {}).forEach(([k, v]) => {
+            byType[k] = (Array.isArray(v) ? v : []).join(', ')
+          })
+          // Collapse the stored per-type lists into one value per section:
+          // the first type in the section that actually has people wins.
+          const byGroup: Record<string, string> = {}
+          NOTIFICATION_TYPE_GROUPS.forEach(group => {
+            const hit = NOTIFICATION_TYPES
+              .filter(t => t.group === group)
+              .map(t => byType[t.key])
+              .find(v => v && v.trim())
+            byGroup[group] = hit || ''
+          })
+          setMentionsByGroup(byGroup)
         }
       })
       .catch(err => toast.error(`Failed to load settings: ${err.message}`))
@@ -868,6 +917,14 @@ function NotificationSettings() {
       version: rc.version,
       ...override,
     },
+    events,
+    types,
+    mentions: {
+      default: splitMentions(defaultMentions),
+      byType: Object.fromEntries(
+        NOTIFICATION_TYPES.map(t => [t.key, splitMentions(mentionsByGroup[t.group] || '')])
+      ),
+    },
   })
 
   const handleSave = async () => {
@@ -875,6 +932,8 @@ function NotificationSettings() {
     try {
       const res = await notificationsApi.saveSettings(buildPayload())
       const fresh = res.data?.data?.rocketChat
+      if (res.data?.data?.events) setEvents(res.data.data.events)
+      if (res.data?.data?.types) setTypes(res.data.data.types)
       if (fresh) {
         setRc(prev => ({
           ...prev,
@@ -928,7 +987,7 @@ function NotificationSettings() {
     )
   }
 
-  const inputCls = 'w-full px-3 py-2 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500'
+  const inputCls = 'w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-sm text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500'
 
   return (
     <div className="space-y-6">
@@ -1038,6 +1097,228 @@ function NotificationSettings() {
           >
             {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             {testing ? 'Sending...' : 'Send Test Message'}
+          </button>
+        </div>
+      </div>
+
+      {/* Every notification the platform can send: whether it is sent at all,
+          and who is @-mentioned when it is. */}
+      <div className="space-y-4 p-4 border border-gray-200 dark:border-gray-700 rounded-xl">
+        <div>
+          <h3 className="text-sm font-semibold flex items-center gap-2">
+            <Bell className="h-4 w-4" /> Notifications
+          </h3>
+          <p className="text-xs text-gray-500 mt-1">
+            Switch each section on or off, and name the people responsible for it.
+            People are assigned per section — everyone listed is{' '}
+            <span className="font-medium">@-mentioned</span> at the top of every message that
+            section sends, so it lands as someone's job rather than as general chatter. Expand a
+            section to see exactly which notifications it covers.
+          </p>
+          <p className="text-xs text-gray-500 mt-1">
+            Usernames are comma-separated. The <code className="px-1">@</code> is optional — type
+            <code className="mx-1">alice, bob</code> or <code className="mx-1">@alice, @bob</code>,
+            both work.
+          </p>
+        </div>
+
+        <div className="space-y-2 max-w-3xl">
+          <label className="text-xs font-medium text-gray-600 dark:text-gray-400">
+            Default people (used when a notification has nobody of its own)
+          </label>
+          <input
+            type="text"
+            placeholder="alice, bob"
+            value={defaultMentions}
+            onChange={(e) => setDefaultMentions(e.target.value)}
+            className={inputCls}
+            spellCheck={false}
+            autoComplete="off"
+          />
+        </div>
+
+        {NOTIFICATION_TYPE_GROUPS.map(group => {
+          const items = NOTIFICATION_TYPES.filter(t => t.group === group)
+          if (items.length === 0) return null
+          const onCount = items.filter(t => types[t.key] !== false).length
+          const groupOn = onCount > 0
+          const expanded = !!openGroups[group]
+          return (
+            <div key={group} className="pt-3 border-t border-gray-200 dark:border-gray-700">
+              <div className="flex flex-wrap items-center gap-3 py-2 px-3 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800/40">
+                <label className="flex items-center gap-3 cursor-pointer min-w-0 flex-1">
+                  <input
+                    type="checkbox"
+                    checked={groupOn}
+                    /* Partially-on sections read as on, but show as indeterminate. */
+                    ref={el => { if (el) el.indeterminate = onCount > 0 && onCount < items.length }}
+                    onChange={(e) => {
+                      const checked = e.target.checked
+                      setTypes(prev => {
+                        const next = { ...prev }
+                        items.forEach(t => { next[t.key] = checked })
+                        return next
+                      })
+                    }}
+                    className="h-4 w-4 shrink-0"
+                  />
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold">{group}</div>
+                    <div className="text-xs text-gray-500">
+                      {items.length} notification{items.length === 1 ? '' : 's'}
+                      {onCount < items.length && ` · ${onCount} on`}
+                    </div>
+                  </div>
+                </label>
+                <input
+                  type="text"
+                  placeholder="Mention… e.g. alice, bob"
+                  value={mentionsByGroup[group] || ''}
+                  onChange={(e) => {
+                    const value = e.target.value
+                    setMentionsByGroup(prev => ({ ...prev, [group]: value }))
+                  }}
+                  disabled={!groupOn}
+                  title={groupOn ? `RocketChat usernames to @-mention for every ${group} notification` : 'Switch this section on to assign people'}
+                  className={cn(
+                    'w-full sm:w-64 shrink-0 px-3 py-1.5 rounded-lg border text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500',
+                    'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900',
+                    'text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500',
+                    !groupOn && 'opacity-50 cursor-not-allowed bg-gray-50 dark:bg-gray-800'
+                  )}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </div>
+
+              {/* Each notification in the section can still be switched on or
+                  off individually; only the people are section-wide. */}
+              <button
+                type="button"
+                onClick={() => setOpenGroups(prev => ({ ...prev, [group]: !prev[group] }))}
+                className="ml-3 inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+              >
+                {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                {expanded ? 'Hide' : 'Show'} what this covers
+              </button>
+              {expanded && (
+                <div className="mt-1 mb-2 ml-9 space-y-1">
+                  <p className="text-[11px] text-gray-500">
+                    Click a notification to switch it on or off. People come from the section above.
+                  </p>
+                  {items.map(t => {
+                    const on = types[t.key] !== false
+                    return (
+                      <label
+                        key={t.key}
+                        className={cn(
+                          'flex items-start gap-2 py-1.5 px-2 rounded-md cursor-pointer border border-transparent',
+                          'hover:bg-gray-50 dark:hover:bg-gray-800/60 hover:border-gray-200 dark:hover:border-gray-700'
+                        )}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={on}
+                          onChange={(e) => {
+                            const checked = e.target.checked
+                            setTypes(prev => ({ ...prev, [t.key]: checked }))
+                          }}
+                          className="h-3.5 w-3.5 mt-0.5 shrink-0"
+                        />
+                        <span className="text-xs min-w-0">
+                          <span className={cn('font-medium', !on && 'text-gray-400')}>{t.label}</span>
+                          {t.hint && (
+                            <span className={cn(on ? 'text-gray-500' : 'text-gray-400')}> — {t.hint}</span>
+                          )}
+                        </span>
+                      </label>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )
+        })}
+
+        <div className="pt-2">
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving}
+            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+          >
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            {saving ? 'Saving...' : 'Save Settings'}
+          </button>
+        </div>
+      </div>
+
+      {/* System-wide event defaults. These are what "Inherit" resolves to on
+          every schedule, so this is the one place to turn an event class off
+          across the whole platform. */}
+      <div className="space-y-4 p-4 border border-gray-200 dark:border-gray-700 rounded-xl">
+        <div>
+          <h3 className="text-sm font-semibold flex items-center gap-2">
+            <Bell className="h-4 w-4" /> Per-schedule event defaults
+          </h3>
+          <p className="text-xs text-gray-500 mt-1">
+            A second, narrower layer: these are the values a schedule inherits when its own
+            Notifications tab is left on <span className="font-medium">Inherit</span>
+            (Schedules → Edit, or Bulk Edit → Notifications). They decide whether a given
+            schedule participates in an event — the switches above decide whether that kind of
+            message is ever sent at all.
+          </p>
+        </div>
+
+        <div className="space-y-1 max-w-2xl">
+          {NOTIFICATION_EVENTS.map(ev => {
+            const on = events[ev.key] !== false
+            return (
+              <label
+                key={ev.key}
+                className="flex items-start gap-3 py-2 px-3 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/40"
+              >
+                <input
+                  type="checkbox"
+                  checked={on}
+                  onChange={(e) => {
+                    const checked = e.target.checked
+                    setEvents(prev => {
+                      const next: NotificationEventToggles = { ...prev }
+                      next[ev.key] = checked
+                      return next
+                    })
+                  }}
+                  className="h-4 w-4 mt-0.5"
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-medium">{ev.label}</div>
+                  <div className="text-xs text-gray-500">{ev.hint}</div>
+                </div>
+                <span
+                  className={cn(
+                    'text-xs font-medium px-2 py-0.5 rounded-full shrink-0',
+                    on
+                      ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                      : 'bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
+                  )}
+                >
+                  {on ? 'On' : 'Off'}
+                </span>
+              </label>
+            )
+          })}
+        </div>
+
+        <div className="pt-2">
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving}
+            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+          >
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            {saving ? 'Saving...' : 'Save Settings'}
           </button>
         </div>
       </div>

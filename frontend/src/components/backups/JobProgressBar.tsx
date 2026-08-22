@@ -58,9 +58,9 @@ export default function JobProgressBar({
     (status === 'running' && (!progress || progress <= 0))
 
   return (
-    <div className="w-full min-w-[220px]">
+    <div className="w-full max-w-[320px]">
       <div className="flex items-center space-x-2 mb-1">
-        <div className="flex-1 bg-gray-200 rounded-full h-3 overflow-hidden relative">
+        <div className="flex-1 bg-gray-200 rounded-full h-2 overflow-hidden relative">
           {isIndeterminate ? (
             <div className="h-full w-full bg-gray-300 animate-pulse rounded-full">
               <div

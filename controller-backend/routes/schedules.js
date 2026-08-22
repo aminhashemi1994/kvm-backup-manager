@@ -5,6 +5,7 @@ const { getBackupSchedules, saveBackupSchedules, getVirtualMachines } = require(
 const schedulerService = require('../services/schedulerService');
 const auditService = require('../services/auditService');
 const { validateSchedule } = require('../utils/validator');
+const { sanitizeScheduleNotifications, sanitizeMentions } = require('../services/notificationPolicyService');
 const { generateCronExpression, parseCronToHuman } = require('../utils/helpers');
 const { requireUser } = require('../middleware/rbac');
 
@@ -452,6 +453,31 @@ router.post('/', requireUser, async (req, res, next) => {
       retryCount: typeof req.body.retryCount === 'number' ? req.body.retryCount : 3,
       retryDelayMinutes: typeof req.body.retryDelayMinutes === 'number' ? req.body.retryDelayMinutes : 5,
 
+      // Offsite rsync retry (per-schedule, script-level): how many times the
+      // agent retries a failing rsync to a given offsite host before giving
+      // up on it for this run, and the base backoff (seconds) between
+      // attempts (exponential: base * 2^(attempt-1)). Separate from the
+      // controller-level offsite-only resync configured just below.
+      offsiteRetryAttempts: typeof req.body.offsiteRetryAttempts === 'number' ? req.body.offsiteRetryAttempts : 3,
+      offsiteRetryBackoffSeconds: typeof req.body.offsiteRetryBackoffSeconds === 'number' ? req.body.offsiteRetryBackoffSeconds : 15,
+
+      // Controller-level offsite-only resync: once the agent has exhausted its
+      // in-place rsync attempts, the controller re-runs JUST the replication
+      // (never the VM backup) on this slower cadence. null means "inherit the
+      // backup retry settings", which is how every schedule created before
+      // these fields existed behaves — see schedulerService.handleOffsiteSyncFailure.
+      // RocketChat usernames to @-mention when this schedule's backups fail.
+      // Empty = fall back to the global default list.
+      notifyMentions: sanitizeMentions(req.body.notifyMentions) || [],
+
+      offsiteResyncAttempts: typeof req.body.offsiteResyncAttempts === 'number' ? req.body.offsiteResyncAttempts : null,
+      offsiteResyncDelayMinutes: typeof req.body.offsiteResyncDelayMinutes === 'number' ? req.body.offsiteResyncDelayMinutes : null,
+
+      // Per-event notification toggles. Only explicit booleans are stored; an
+      // absent key means "inherit the global setting", which is what every
+      // existing schedule has.
+      notifications: sanitizeScheduleNotifications(req.body.notifications),
+
       // Retention / archive settings for chain backups (daily/weekly/interval/
       // cron). Stored for all types for simplicity; copy-based types
       // (once/monthly) ignore them at backup time. These are read by the
@@ -677,6 +703,34 @@ router.put('/:id', requireUser, async (req, res, next) => {
       retryDelayMinutes: typeof req.body.retryDelayMinutes === 'number'
         ? req.body.retryDelayMinutes
         : (existingSchedule.retryDelayMinutes ?? 5),
+
+      // Offsite rsync retry (per-schedule, script-level)
+      offsiteRetryAttempts: typeof req.body.offsiteRetryAttempts === 'number'
+        ? req.body.offsiteRetryAttempts
+        : (existingSchedule.offsiteRetryAttempts ?? 3),
+      offsiteRetryBackoffSeconds: typeof req.body.offsiteRetryBackoffSeconds === 'number'
+        ? req.body.offsiteRetryBackoffSeconds
+        : (existingSchedule.offsiteRetryBackoffSeconds ?? 15),
+
+      // Controller-level offsite-only resync. null is meaningful here — it
+      // means "inherit the backup retry settings" — so an explicit null in the
+      // request body must be able to clear an override, which `typeof number`
+      // alone would not allow.
+      notifyMentions: req.body.notifyMentions !== undefined
+        ? (sanitizeMentions(req.body.notifyMentions) || [])
+        : (existingSchedule.notifyMentions || []),
+
+      offsiteResyncAttempts: req.body.offsiteResyncAttempts !== undefined
+        ? (typeof req.body.offsiteResyncAttempts === 'number' ? req.body.offsiteResyncAttempts : null)
+        : (existingSchedule.offsiteResyncAttempts ?? null),
+      offsiteResyncDelayMinutes: req.body.offsiteResyncDelayMinutes !== undefined
+        ? (typeof req.body.offsiteResyncDelayMinutes === 'number' ? req.body.offsiteResyncDelayMinutes : null)
+        : (existingSchedule.offsiteResyncDelayMinutes ?? null),
+
+      // Per-event notification toggles (absent key = inherit global).
+      notifications: req.body.notifications !== undefined
+        ? sanitizeScheduleNotifications(req.body.notifications)
+        : existingSchedule.notifications,
 
       // Retention / archive settings (updatable for chain backups). Without
       // these the bulk/edit changes were silently dropped and the agent

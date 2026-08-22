@@ -42,9 +42,9 @@ export default function RecentActivity() {
                   </p>
                   {(job.status === 'running' || job.status === 'queued') && (
                     <div className="flex items-center space-x-2 mt-2">
-                      <div className="flex-1 bg-gray-200 rounded-full h-1.5 max-w-[200px]">
-                        <div 
-                          className="bg-blue-600 h-full transition-all duration-300"
+                      <div className="flex-1 bg-gray-200 rounded-full h-1.5 max-w-[200px] overflow-hidden">
+                        <div
+                          className="bg-blue-600 h-full rounded-full transition-all duration-300"
                           style={{ width: `${job.progress || 0}%` }}
                         />
                       </div>

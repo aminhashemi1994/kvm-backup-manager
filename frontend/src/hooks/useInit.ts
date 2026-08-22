@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { initApi } from '@/services/api'
+import { initApi, offsiteHostsApi } from '@/services/api'
 import { toast } from 'sonner'
 import { useState, useEffect } from 'react'
 import socketService from '@/services/socket'
@@ -23,12 +23,25 @@ export function useInitBackupHost() {
   })
 }
 
+/**
+ * Initialize an OFFSITE host.
+ *
+ * Takes the offsite host's own id and posts to /offsite-hosts/:id/init, which
+ * resolves the owning backup host itself and runs the init through that
+ * agent against the offsite machine's IP.
+ *
+ * This previously called /init/host with the offsite host's id in the
+ * `backupHostId` field — a copy of useInitBackupHost. That endpoint looks the
+ * id up in the BACKUP hosts collection, where an offsite host id never
+ * appears, so every attempt failed with "Backup host not found" even though
+ * the backup host was online and reachable.
+ */
 export function useInitOffsiteHost() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: async (backupHostId: string) => {
-      const response = await initApi.initHost({ backupHostId })
+    mutationFn: async (offsiteHostId: string) => {
+      const response = await offsiteHostsApi.init(offsiteHostId)
       return response.data
     },
     onSuccess: () => {

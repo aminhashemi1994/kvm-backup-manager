@@ -32,6 +32,52 @@ function describeAxiosError(err) {
   return err.message || String(err);
 }
 
+
+/**
+ * Per-notification-type switches.
+ *
+ * Every template is individually addressable so noise can be turned down
+ * without touching code. Defaults are the operator's decisions: routine
+ * successes and lifecycle chatter are OFF, anything representing a problem
+ * someone must act on is ON.
+ */
+const TYPE_DEFAULTS = Object.freeze({
+  // Backup lifecycle
+  backupCompleted: false,          // 15 messages a night saying things worked
+  backupFailed: true,
+  scheduledBackupFailed: true,
+  backupSkipped: true,
+  backupRetry: false,              // the outcome is what matters, not the attempt
+  multipleBackupFailures: true,
+  backupStuck: true,
+  // Offsite
+  offsiteSyncFailed: true,
+  // Restore — driven by a human who is already watching the panel
+  restoreStarted: false,
+  restoreCompleted: false,
+  restoreFailed: false,
+  restoreStuck: false,
+  // Infrastructure
+  agentConnected: false,           // recovery of a host is not worth waking for
+  agentDisconnected: true,
+  agentDownExtended: true,
+  hypervisorConnectionFailed: true,
+  criticalError: true,
+  missedRunsRecovered: true,
+  // TLS
+  certificateExpiring: true,
+  certificateExpired: true,
+  agentTlsDegraded: true,
+  // Aggregator output
+  groupedSummary: true,
+  dailyDigest: true,
+  // Failure templates that exist but are not wired to a trigger yet.
+  storagePoolIssue: true,
+  backupVerificationFailed: true,
+  sshConnectionFailed: true,
+  lowDiskSpace: true,
+});
+
 class RocketChatService {
   constructor() {
     // Initial config is taken from env. The notifications route calls
@@ -49,6 +95,12 @@ class RocketChatService {
       entity: '',
       version: '',
     });
+
+    this.types = { ...TYPE_DEFAULTS };
+    // Who gets @-mentioned, as configured in Settings -> Notifications.
+    // Held in memory so every template can resolve its own people without an
+    // async settings read on the send path.
+    this.mentions = { default: [], byType: {} };
 
     this.lastMessageId = null;
     this.lastRoomId = null;
@@ -78,6 +130,76 @@ class RocketChatService {
     if (!rc) return;
     this.applyConfig(rc);
     console.log('[RocketChat] Config reloaded (enabled=%s, mode=%s)', this.enabled, this.useWebhook ? 'webhook' : 'api');
+  }
+
+  /** Replace the per-type switches (called after a settings save). */
+  setTypeSettings(types) {
+    this.types = { ...TYPE_DEFAULTS };
+    if (types && typeof types === 'object') {
+      for (const key of Object.keys(TYPE_DEFAULTS)) {
+        if (typeof types[key] === 'boolean') this.types[key] = types[key];
+      }
+    }
+  }
+
+  /**
+   * Replace the mention lists (called after a settings save and at boot).
+   * Shape: { default: string[], byType: { [typeKey]: string[] } }.
+   */
+  setMentionSettings(mentions) {
+    const clean = (list) => (Array.isArray(list) ? list : [])
+      .map(v => String(v).trim().replace(/^@+/, ''))
+      .filter(Boolean);
+    const src = mentions && typeof mentions === 'object' ? mentions : {};
+    const byType = {};
+    if (src.byType && typeof src.byType === 'object') {
+      for (const [key, list] of Object.entries(src.byType)) {
+        const people = clean(list);
+        if (people.length > 0) byType[key] = people;
+      }
+    }
+    this.mentions = { default: clean(src.default), byType };
+  }
+
+  /**
+   * People to @-mention for a notification type. The type's own list wins;
+   * the global default is a safety net used only when nobody was named for
+   * that type, so setting it does not put the same person on every alert.
+   */
+  mentionsForType(key) {
+    if (!key) return [];
+    const own = this.mentions?.byType?.[key];
+    if (own && own.length > 0) return own;
+    return this.mentions?.default || [];
+  }
+
+  /**
+   * Like mentionsForType(), but also unions in the people named on the
+   * schedule itself ("Notify these people" on the schedule form) when the
+   * message belongs to one. Async because that list lives in the schedules
+   * file, so it is only used on paths that can await.
+   */
+  async resolveMentions(typeKey, scheduleId = null) {
+    if (!scheduleId) return this.mentionsForType(typeKey);
+    try {
+      const people = await require('./notificationPolicyService')
+        .getMentionsForSchedules([scheduleId], typeKey);
+      if (people && people.length > 0) return people;
+    } catch (err) {
+      console.error('[RocketChat] Mention lookup failed:', err.message);
+    }
+    return this.mentionsForType(typeKey);
+  }
+
+  /** Is this notification type switched on? Unknown keys default to on. */
+  isTypeEnabled(key) {
+    if (!key) return true;
+    return this.types[key] !== false;
+  }
+
+  /** Uniform "we deliberately said nothing" result. */
+  _muted(key) {
+    return { success: false, skipped: true, reason: `notification type "${key}" is off` };
   }
 
   isConfigured() {
@@ -248,7 +370,11 @@ class RocketChatService {
     const status  = stripAnsi(fields.status);
     const name    = stripAnsi(fields.name);
     const version = stripAnsi(fields.version);
-    const details = stripAnsi(fields.details, { singleLine: true });
+    // Grouped and digest messages are deliberately multi-line — one line per
+    // affected VM or open incident. Collapsing their whitespace turns the whole
+    // summary into a single unreadable run-on, which defeats the point of
+    // grouping in the first place. Per-VM messages stay single-line.
+    const details = stripAnsi(fields.details, { singleLine: !fields.multiline });
 
     const ent = entity || this.entity || 'Backup Manager';
     const ver = version || this.version || '';
@@ -256,6 +382,21 @@ class RocketChatService {
     const lines = [];
     lines.push(`✨ *${ent} Update* ✨`);
     lines.push('');
+
+    // Put the people responsible at the very top, before anything else, so a
+    // mention is visible in the notification preview rather than buried under
+    // the detail block.
+    // An explicit list wins (the aggregator and the certificate monitor resolve
+    // their own, including per-schedule owners); otherwise the notification's
+    // type decides who is on the hook.
+    const explicit = Array.isArray(fields.mentions) ? fields.mentions : null;
+    const mentions = (explicit || this.mentionsForType(fields.typeKey))
+      .map(m => String(m).trim().replace(/^@+/, ''))
+      .filter(Boolean);
+    if (mentions.length > 0) {
+      lines.push(mentions.map(m => `@${m}`).join(' '));
+      lines.push('');
+    }
     lines.push(`*🧩 Entity:* ${ent}`);
     if (state)   lines.push(`*⚙️ State:* ${state}`);
     if (status)  lines.push(`*📊 Status:* ${status}`);
@@ -267,8 +408,19 @@ class RocketChatService {
   }
 
   /** Generic notify shortcut used by callers that want full control. */
-  notify({ entity, state, status, name, version, details }) {
-    return this.sendMessage(this.formatUpdate({ entity, state, status, name, version, details }));
+  notify({ entity, state, status, name, version, details, typeKey, mentions }) {
+    return this.sendMessage(this.formatUpdate({
+      entity, state, status, name, version, details, typeKey, mentions,
+    }));
+  }
+
+  /**
+   * notify(), but with people @-mentioned at the top. Used where a human is
+   * expected to act — certificate expiry above all, since nothing else in the
+   * system will chase it.
+   */
+  notifyWithMentions(mentions, fields) {
+    return this.sendMessage(this.formatUpdate({ ...fields, mentions }));
   }
 
   /** Used by /api/notifications/test */
@@ -285,7 +437,9 @@ class RocketChatService {
 
   // Notification templates
   notifyAgentConnected(agentName) {
+    if (!this.isTypeEnabled('agentConnected')) return this._muted('agentConnected');
     return this.notify({
+        typeKey: 'agentConnected',
       entity: 'Agent',
       state: 'Connectivity',
       status: 'Online',
@@ -295,7 +449,9 @@ class RocketChatService {
   }
 
   notifyAgentDisconnected(agentName) {
+    if (!this.isTypeEnabled('agentDisconnected')) return this._muted('agentDisconnected');
     return this.notify({
+        typeKey: 'agentDisconnected',
       entity: 'Agent',
       state: 'Connectivity',
       status: 'Offline',
@@ -304,68 +460,104 @@ class RocketChatService {
     });
   }
 
-  notifyBackupStarted(vmName, method, backupHost) {
-    return this.notify({
-      entity: 'Backup',
-      state: (method || '').toUpperCase() || 'BACKUP',
-      status: 'Started',
-      name: vmName,
-      details: `Host: ${backupHost}`,
+
+  /**
+   * Send a message that the aggregator has already composed. Bypasses the
+   * aggregator itself, or grouped messages would recurse straight back into it.
+   */
+  sendGrouped({ entity, state, status, name, details, mentions }) {
+    return this.sendMessage(this.formatUpdate({
+      entity, state, status, name, details, mentions,
+      multiline: true,
+    }));
+  }
+
+  /**
+   * Hand an event to the aggregator, which decides whether it is worth saying
+   * on its own, worth folding into a group, or a repeat of an open incident
+   * that needs no message at all. See services/notificationAggregator.js.
+   *
+   * Lazily required: the aggregator calls back into this service to send.
+   */
+  _viaAggregator(ev) {
+    try {
+      return require('./notificationAggregator').submit(ev);
+    } catch (err) {
+      // Aggregation must never cost us an alert — fall back to sending direct.
+      console.error('[RocketChat] Aggregator unavailable, sending directly:', err.message);
+      return ev.sendSingle && ev.sendSingle();
+    }
+  }
+
+  notifyBackupCompleted(vmName, method, duration, scheduleId = null) {
+    // Successes are still handed to the aggregator even when this type is off:
+    // it uses them to clear open incidents and to announce RECOVERIES, which
+    // are worth hearing. `mute` suppresses only the routine "N VMs completed"
+    // summary — dropping the event entirely would mean a VM that came back
+    // after three weeks of failing did so silently.
+    return this._viaAggregator({
+      kind: 'backup-completed',
+      subject: vmName,
+      mute: !this.isTypeEnabled('backupCompleted'),
+      context: `Duration: ${duration}`,
+      scheduleId,
+      sendSingle: async () => this.notify({
+        mentions: await this.resolveMentions('backupCompleted', scheduleId),
+        entity: 'Backup',
+        state: (method || '').toUpperCase() || 'BACKUP',
+        status: 'Completed',
+        name: vmName,
+        details: `Duration: ${duration}`,
+      }),
     });
   }
 
-  notifyBackupCompleted(vmName, method, duration) {
-    return this.notify({
-      entity: 'Backup',
-      state: (method || '').toUpperCase() || 'BACKUP',
-      status: 'Completed',
-      name: vmName,
-      details: `Duration: ${duration}`,
+  notifyBackupFailed(vmName, method, error, scheduleId = null) {
+    if (!this.isTypeEnabled('backupFailed')) return this._muted('backupFailed');
+    return this._viaAggregator({
+      kind: 'backup-failed',
+      subject: vmName,
+      cause: error,
+      scheduleId,
+      sendSingle: async () => this.notify({
+        mentions: await this.resolveMentions('backupFailed', scheduleId),
+        entity: 'Backup',
+        state: (method || '').toUpperCase() || 'BACKUP',
+        status: 'Failed',
+        name: vmName,
+        details: `Error: ${error}`,
+      }),
     });
   }
 
-  notifyBackupFailed(vmName, method, error) {
-    return this.notify({
-      entity: 'Backup',
-      state: (method || '').toUpperCase() || 'BACKUP',
-      status: 'Failed',
-      name: vmName,
-      details: `Error: ${error}`,
-    });
-  }
 
-  notifyOffsiteSyncStarted(vmName, offsiteHost) {
-    return this.notify({
-      entity: 'Offsite Sync',
-      state: 'Transfer',
-      status: 'Started',
-      name: vmName,
-      details: `Destination: ${offsiteHost}`,
-    });
-  }
 
-  notifyOffsiteSyncCompleted(vmName, offsiteHost, size) {
-    return this.notify({
-      entity: 'Offsite Sync',
-      state: 'Transfer',
-      status: 'Completed',
-      name: vmName,
-      details: `Destination: ${offsiteHost}, Size: ${size}`,
-    });
-  }
-
-  notifyOffsiteSyncFailed(vmName, offsiteHost, error) {
-    return this.notify({
-      entity: 'Offsite Sync',
-      state: 'Transfer',
-      status: 'Failed',
-      name: vmName,
-      details: `Destination: ${offsiteHost}, Error: ${error}`,
+  notifyOffsiteSyncFailed(vmName, offsiteHost, error, scheduleId = null) {
+    if (!this.isTypeEnabled('offsiteSyncFailed')) return this._muted('offsiteSyncFailed');
+    // Grouped by destination as well as cause: "10 VMs failed to Offsite-2"
+    // is one incident, and one unreachable destination was responsible for
+    // roughly 60 messages in a single night before this.
+    return this._viaAggregator({
+      kind: 'offsite-failed',
+      subject: vmName,
+      cause: `${offsiteHost}: ${error}`,
+      context: `Destination: ${offsiteHost}`,
+      scheduleId,
+      sendSingle: async () => this.notify({
+        mentions: await this.resolveMentions('offsiteSyncFailed', scheduleId),
+        entity: 'Offsite Sync',
+        state: 'Transfer',
+        status: 'Failed',
+        name: vmName,
+        details: `Destination: ${offsiteHost}, Error: ${error}`,
+      }),
     });
   }
 
   notifyBackupSkipped(vmName, backupHost, reason) {
+    if (!this.isTypeEnabled('backupSkipped')) return this._muted('backupSkipped');
     return this.notify({
+        typeKey: 'backupSkipped',
       entity: 'Backup',
       state: 'Schedule',
       status: 'Skipped',
@@ -375,7 +567,9 @@ class RocketChatService {
   }
 
   notifyBackupRetry(vmName, backupHost, originalJobId) {
+    if (!this.isTypeEnabled('backupRetry')) return this._muted('backupRetry');
     return this.notify({
+        typeKey: 'backupRetry',
       entity: 'Backup',
       state: 'Auto-Retry',
       status: 'Started',
@@ -385,7 +579,9 @@ class RocketChatService {
   }
 
   notifyRestoreStarted(vmName, backupHost, restoreHost) {
+    if (!this.isTypeEnabled('restoreStarted')) return this._muted('restoreStarted');
     return this.notify({
+        typeKey: 'restoreStarted',
       entity: 'Restore',
       state: 'Transfer',
       status: 'Started',
@@ -395,7 +591,9 @@ class RocketChatService {
   }
 
   notifyRestoreCompleted(vmName, duration) {
+    if (!this.isTypeEnabled('restoreCompleted')) return this._muted('restoreCompleted');
     return this.notify({
+        typeKey: 'restoreCompleted',
       entity: 'Restore',
       state: 'Transfer',
       status: 'Completed',
@@ -405,7 +603,9 @@ class RocketChatService {
   }
 
   notifyRestoreFailed(vmName, error) {
+    if (!this.isTypeEnabled('restoreFailed')) return this._muted('restoreFailed');
     return this.notify({
+        typeKey: 'restoreFailed',
       entity: 'Restore',
       state: 'Transfer',
       status: 'Failed',
@@ -415,7 +615,9 @@ class RocketChatService {
   }
 
   notifyCriticalError(component, error, details = '') {
+    if (!this.isTypeEnabled('criticalError')) return this._muted('criticalError');
     return this.notify({
+        typeKey: 'criticalError',
       entity: 'System',
       state: component,
       status: 'Critical Error',
@@ -425,7 +627,9 @@ class RocketChatService {
   }
 
   notifyScheduledBackupFailed(vmName, scheduleType, error) {
+    if (!this.isTypeEnabled('scheduledBackupFailed')) return this._muted('scheduledBackupFailed');
     return this.notify({
+        typeKey: 'scheduledBackupFailed',
       entity: 'Backup',
       state: `${scheduleType} schedule`,
       status: 'Failed',
@@ -435,7 +639,9 @@ class RocketChatService {
   }
 
   notifyHypervisorConnectionFailed(hypervisorName, hypervisorIp, error) {
+    if (!this.isTypeEnabled('hypervisorConnectionFailed')) return this._muted('hypervisorConnectionFailed');
     return this.notify({
+        typeKey: 'hypervisorConnectionFailed',
       entity: 'Hypervisor',
       state: 'Connectivity',
       status: 'Failed',
@@ -445,7 +651,9 @@ class RocketChatService {
   }
 
   notifyStoragePoolIssue(poolName, issue, usage = '') {
+    if (!this.isTypeEnabled('storagePoolIssue')) return this._muted('storagePoolIssue');
     return this.notify({
+        typeKey: 'storagePoolIssue',
       entity: 'Storage Pool',
       state: 'Health',
       status: 'Warning',
@@ -455,7 +663,9 @@ class RocketChatService {
   }
 
   notifyBackupStuck(vmName, jobId, duration) {
+    if (!this.isTypeEnabled('backupStuck')) return this._muted('backupStuck');
     return this.notify({
+        typeKey: 'backupStuck',
       entity: 'Backup',
       state: 'Job Health',
       status: 'Stuck',
@@ -465,7 +675,9 @@ class RocketChatService {
   }
 
   notifyRestoreStuck(vmName, restoreId, duration) {
+    if (!this.isTypeEnabled('restoreStuck')) return this._muted('restoreStuck');
     return this.notify({
+        typeKey: 'restoreStuck',
       entity: 'Restore',
       state: 'Job Health',
       status: 'Stuck',
@@ -475,17 +687,31 @@ class RocketChatService {
   }
 
   notifyMultipleBackupFailures(vmName, failureCount, lastError) {
-    return this.notify({
-      entity: 'Backup',
-      state: 'Reliability',
-      status: 'Multiple Failures',
-      name: vmName,
-      details: `Consecutive failures: ${failureCount}, Last error: ${lastError}`,
+    if (!this.isTypeEnabled('multipleBackupFailures')) return this._muted('multipleBackupFailures');
+    // The worst offender in practice: 15 VMs sharing one fault produced 15 of
+    // these on top of 15 failure messages, every night, for three weeks. The
+    // aggregator groups them by cause and suppresses the ones already open, so
+    // a long-running incident stops re-announcing itself.
+    return this._viaAggregator({
+      kind: 'backup-repeat-failure',
+      subject: vmName,
+      cause: lastError,
+      context: `Consecutive failures: ${failureCount}`,
+      sendSingle: () => this.notify({
+        typeKey: 'multipleBackupFailures',
+        entity: 'Backup',
+        state: 'Reliability',
+        status: 'Multiple Failures',
+        name: vmName,
+        details: `Consecutive failures: ${failureCount}, Last error: ${lastError}`,
+      }),
     });
   }
 
   notifyAgentDownExtended(agentName, downSince, missedBackups = 0) {
+    if (!this.isTypeEnabled('agentDownExtended')) return this._muted('agentDownExtended');
     return this.notify({
+        typeKey: 'agentDownExtended',
       entity: 'Agent',
       state: 'Connectivity',
       status: 'Extended Outage',
@@ -495,7 +721,9 @@ class RocketChatService {
   }
 
   notifyBackupVerificationFailed(vmName, backupPath, error) {
+    if (!this.isTypeEnabled('backupVerificationFailed')) return this._muted('backupVerificationFailed');
     return this.notify({
+        typeKey: 'backupVerificationFailed',
       entity: 'Backup',
       state: 'Verification',
       status: 'Failed',
@@ -505,7 +733,9 @@ class RocketChatService {
   }
 
   notifySSHConnectionFailed(host, error) {
+    if (!this.isTypeEnabled('sshConnectionFailed')) return this._muted('sshConnectionFailed');
     return this.notify({
+        typeKey: 'sshConnectionFailed',
       entity: 'SSH',
       state: 'Connectivity',
       status: 'Failed',
@@ -515,7 +745,9 @@ class RocketChatService {
   }
 
   notifyLowDiskSpace(host, path, available, total, percentage) {
+    if (!this.isTypeEnabled('lowDiskSpace')) return this._muted('lowDiskSpace');
     return this.notify({
+        typeKey: 'lowDiskSpace',
       entity: 'Storage',
       state: 'Disk Space',
       status: 'Low',
@@ -524,8 +756,55 @@ class RocketChatService {
     });
   }
 
+  /**
+   * Certificate is still valid but the clock is running. Every one of these
+   * says outright that backups are unaffected — an operator who reads "TLS
+   * problem" at 3am should not go looking for a backup outage that isn't there.
+   */
+  notifyCertificateExpiring(cert, mentions = []) {
+    if (!this.isTypeEnabled('certificateExpiring')) return this._muted('certificateExpiring');
+    return this.notifyWithMentions(
+      mentions && mentions.length > 0 ? mentions : this.mentionsForType('certificateExpiring'),
+      {
+      entity: 'TLS Certificate',
+      state: cert.label,
+      status: cert.daysRemaining <= 7 ? 'Expiring Soon (Critical)' : 'Expiring Soon',
+      name: cert.subject || cert.label,
+      details: `Expires in ${cert.daysRemaining} day(s) on ${cert.validTo}. Issuer: ${cert.issuer || 'unknown'}. Backups are NOT affected — renew before expiry to restore full verification.`,
+    });
+  }
+
+  notifyCertificateExpired(cert, mentions = []) {
+    if (!this.isTypeEnabled('certificateExpired')) return this._muted('certificateExpired');
+    return this.notifyWithMentions(
+      mentions && mentions.length > 0 ? mentions : this.mentionsForType('certificateExpired'),
+      {
+      entity: 'TLS Certificate',
+      state: cert.label,
+      status: 'EXPIRED',
+      name: cert.subject || cert.label,
+      details: `Expired on ${cert.validTo} (${Math.abs(cert.daysRemaining)} day(s) ago). Backups and agent sync are STILL RUNNING on the pinned-key fallback, but browser access will be blocked and certificate verification is degraded. Renew and reload nginx, then restart the controller.`,
+    });
+  }
+
+  notifyAgentTlsDegraded(agentName, tlsState, mentions = []) {
+    if (!this.isTypeEnabled('agentTlsDegraded')) return this._muted('agentTlsDegraded');
+    const blocked = tlsState.mode === 'blocked';
+    return this.notifyWithMentions(
+      mentions && mentions.length > 0 ? mentions : this.mentionsForType('agentTlsDegraded'),
+      {
+      entity: 'TLS Certificate',
+      state: 'Agent → Controller link',
+      status: blocked ? 'BLOCKED' : 'Degraded (still working)',
+      name: agentName,
+      details: `${tlsState.reason || tlsState.mode}${tlsState.cert && tlsState.cert.validTo ? ` Cert valid_to: ${tlsState.cert.validTo}.` : ''}`,
+    });
+  }
+
   notifyMissedRunsRecovered({ downtimeMinutes, lastSeenAt, bootedAt, replayed, skippedByPolicy, skippedTooOld }) {
+    if (!this.isTypeEnabled('missedRunsRecovered')) return this._muted('missedRunsRecovered');
     return this.notify({
+      typeKey: 'missedRunsRecovered',
       entity: 'Controller',
       state: 'Missed-Run Recovery',
       status: replayed > 0 ? 'Replaying' : 'Idle',
@@ -536,4 +815,7 @@ class RocketChatService {
 }
 
 const rocketChatService = new RocketChatService();
+// Exposed so the settings route can enumerate and validate the switches
+// without duplicating the list.
+rocketChatService.TYPE_DEFAULTS = TYPE_DEFAULTS;
 module.exports = rocketChatService;

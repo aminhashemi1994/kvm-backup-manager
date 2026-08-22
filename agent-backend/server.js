@@ -44,6 +44,9 @@ const storagePoolSyncService = require('./services/storagePoolSyncService');
 const concurrencyConfigSyncService = require('./services/concurrencyConfigSyncService');
 const liveStatusService = require('./services/liveStatusService');
 const cleanupService = require('./services/cleanupService');
+const controllerTlsService = require('./services/controllerTlsService');
+const controllerOutbox = require('./services/controllerOutbox');
+const controllerAuthService = require('./services/controllerAuthService');
 
 const app = express();
 const server = http.createServer(app);
@@ -89,6 +92,27 @@ app.use(morgan('dev', {
 app.set('io', io);
 app.set('config', config);
 app.set('hypervisors', new Map());
+
+// Initialize the controller transport FIRST. Everything below talks to the
+// controller, and storagePoolSyncService fires a sync the moment it starts —
+// the TLS pin store and the outbox spool must be loaded before that happens.
+controllerTlsService.initialize(config);
+controllerOutbox.initialize(config);
+
+// A certificate problem is invisible from the agent's own console in
+// production, so push every transition to the panel and to the controller's
+// notification channels.
+controllerTlsService.onStateChange((tlsState) => {
+  io.emit('agent-tls-status', tlsState);
+  if (tlsState.mode !== 'ok' && config.controllerUrl) {
+    // Best-effort: this rides the very connection that is degraded, which is
+    // exactly why the transport fails open rather than closed.
+    controllerAuthService.post(config.controllerUrl, '/certificates/agent-report', {
+      agentPort: config.port,
+      tls: tlsState,
+    }, { timeout: 10000 }).catch(() => { /* controller will also poll /api/health */ });
+  }
+});
 
 // Initialize backup executor
 backupExecutor.initialize(io, config);
@@ -214,6 +238,8 @@ process.on('SIGTERM', () => {
   cleanupService.shutdown();
   storagePoolSyncService.shutdown?.();
   concurrencyConfigSyncService.shutdown();
+  // Flush the spool last so anything queued during shutdown is on disk.
+  controllerOutbox.shutdown();
   server.close(() => process.exit(0));
 });
 
@@ -226,6 +252,8 @@ process.on('SIGINT', () => {
   cleanupService.shutdown();
   storagePoolSyncService.shutdown?.();
   concurrencyConfigSyncService.shutdown();
+  // Flush the spool last so anything queued during shutdown is on disk.
+  controllerOutbox.shutdown();
   server.close(() => process.exit(0));
 });
 

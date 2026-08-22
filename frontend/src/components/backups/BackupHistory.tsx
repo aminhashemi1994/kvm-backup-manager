@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -6,12 +6,12 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Badge } from '@/components/ui/badge'
 import { Select } from '@/components/ui/select'
 import { Checkbox } from '@/components/ui/checkbox'
-import { Eye, Loader2, Trash2, AlertTriangle, RefreshCw, Search, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Eye, Loader2, Trash2, RefreshCw, Search, ChevronLeft, ChevronRight } from 'lucide-react'
 import { useBackupHistory, useForceRemoveJob, useRetryBackup, useBulkRetryBackups, useBulkForceRemoveJobs } from '@/hooks/useBackups'
-import { formatDate, formatDuration, getStatusColor } from '@/lib/utils'
+import { formatDate, formatDateCompact, formatDuration, jobTypeCode, methodCode } from '@/lib/utils'
 import LiveLogViewer from './LiveLogViewer'
 import JobProgressBar from './JobProgressBar'
-import OffsiteSyncBadge from './OffsiteSyncBadge'
+import JobStatusIcons from './JobStatusIcons'
 import VmNameCell from '@/components/common/VmNameCell'
 import VmNameToggle from '@/components/common/VmNameToggle'
 import socketService from '@/services/socket'
@@ -55,6 +55,16 @@ export default function BackupHistory() {
     limit: 1000 // Fetch up to 1000 records for search across all
   })
   
+  // A rejected run points at the backup that WAS running via `coveredBy`.
+  // Without resolving it the row reads "rejected / - / 0s" and the operator has
+  // no way to see that the VM was in fact backed up seconds earlier by another
+  // run — the row and its log then appear to contradict each other.
+  const jobsById = useMemo(() => {
+    const map = new Map<string, any>()
+    for (const job of allHistory || []) map.set(job.id, job)
+    return map
+  }, [allHistory])
+
   // Filter history based on search query
   const filteredHistory = allHistory?.filter(job => {
     if (!searchQuery) return true
@@ -66,7 +76,10 @@ export default function BackupHistory() {
       job.method?.toLowerCase().includes(query) ||
       job.status?.toLowerCase().includes(query) ||
       job.jobType?.toLowerCase().includes(query) ||
-      job.error?.toLowerCase().includes(query)
+      job.error?.toLowerCase().includes(query) ||
+      // Searchable by id so the covering job named on a rejected row (and in
+      // the log header) can actually be found.
+      job.id?.toLowerCase().includes(query)
     )
   })
 
@@ -281,9 +294,9 @@ export default function BackupHistory() {
     <>
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <CardTitle>Job History</CardTitle>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2 min-w-0">
               <Button
                 variant="outline"
                 size="sm"
@@ -300,7 +313,7 @@ export default function BackupHistory() {
                 Remove failed{failedBackups.length > 0 ? ` (${failedBackups.length})` : ''}
               </Button>
               <VmNameToggle showFull={showFullVmNames} onToggle={setShowFullVmNames} />
-              <div className="relative w-64">
+              <div className="relative w-full sm:w-56 min-w-0">
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
                 <Input
                   type="text"
@@ -352,7 +365,7 @@ export default function BackupHistory() {
                       </span>
                     )}
                   </span>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Button
                       variant="ghost"
                       size="sm"
@@ -399,7 +412,7 @@ export default function BackupHistory() {
                   </div>
                 </div>
               )}
-              <Table>
+              <Table className="table-fixed">
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-10">
@@ -410,17 +423,19 @@ export default function BackupHistory() {
                       aria-label="Select all jobs on this page"
                     />
                   </TableHead>
-                  <TableHead>Type</TableHead>
-                  <TableHead>VM Name</TableHead>
-                  <TableHead>Method</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Progress</TableHead>
-                  <TableHead>Start Time</TableHead>
-                  <TableHead>Duration</TableHead>
-                  <TableHead>Exit Code</TableHead>
+                  {/* Type and method are single letters (full word on hover) so
+                      the columns that carry real information — status and
+                      progress — keep their width without the table scrolling
+                      sideways. */}
+                  <TableHead className="w-[90px]" title="Job type">Type</TableHead>
+                  <TableHead>VM</TableHead>
+                  <TableHead className="w-[90px]" title="Schedule / method">Method</TableHead>
+                  <TableHead className="w-[90px] pl-3 pr-0">Status</TableHead>
+                  <TableHead className="w-[28%] pl-3">Progress</TableHead>
+                  <TableHead className="w-[90px]">Duration</TableHead>
                   {/* Same layering as the Actions cell below: opaque base on the cell, the
                       header's translucent tint on the `before` layer above it. */}
-                  <TableHead className="sticky right-0 z-20 whitespace-nowrap bg-background before:absolute before:inset-0 before:-z-10 before:content-[''] before:bg-gray-50/80 dark:before:bg-gray-800/50 shadow-[-8px_0_8px_-8px_rgba(0,0,0,0.15)]">Actions</TableHead>
+                  <TableHead className="w-[140px] whitespace-nowrap ">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -436,107 +451,80 @@ export default function BackupHistory() {
                         aria-label={`Select ${job.vmName}`}
                       />
                     </TableCell>
-                    <TableCell>
-                      <Badge variant="outline" className={job.jobType === 'restore' ? 'bg-purple-50 text-purple-700 border-purple-200' : 'bg-blue-50 text-blue-700 border-blue-200'}>
-                        {job.jobType === 'restore' ? 'RESTORE' : 'BACKUP'}
-                      </Badge>
+                    {/* Single-letter type and method columns: the full word is
+                        on hover. A column of repeated "BACKUP"/"DAILY" costs
+                        real width for a value that rarely varies. */}
+                    <TableCell className="w-[90px]">
+                      {(() => {
+                        const t = jobTypeCode(job.jobType)
+                        return (
+                          <Badge variant="outline" className={`${t.className} justify-center px-2 font-semibold`} title={t.label}>
+                            {t.label}
+                          </Badge>
+                        )
+                      })()}
                     </TableCell>
-                    <TableCell className="font-medium">
+                    <TableCell className="font-medium max-w-0 min-w-0">
                       <VmNameCell vmName={job.vmName} showFull={showFullVmNames} />
                     </TableCell>
-                    <TableCell>
-                      <Badge variant="outline">{(job.scheduleType || job.method || 'backup').toUpperCase()}</Badge>
+                    <TableCell className="w-[90px] text-center">
+                      {(() => {
+                        const m = methodCode(job.scheduleType || job.method)
+                        return (
+                          <span className="text-xs text-gray-600" title={m.label}>{m.label}</span>
+                        )
+                      })()}
                     </TableCell>
-                    <TableCell>
-                      <Badge className={getStatusColor(job.status === 'queued' && (job.progress || 0) > 0 ? 'running' : job.status)}>
-                        {job.status === 'queued' && (job.progress || 0) > 0 ? 'running' : job.status}
-                      </Badge>
-                      {/* The controller could not determine this run's outcome: no
-                          agent record and no recorded exit code. It is reported as
-                          failed rather than completed (never assume success), but it
-                          may in fact have succeeded — say so, and point at the report. */}
-                      {job.status === 'failed' && job.failureReason === 'indeterminate' && (
-                        <div className="mt-1">
-                          <Badge
-                            className="bg-amber-100 text-amber-800 border-amber-200 gap-1"
-                            title="The outcome of this backup could not be determined — the agent had no record of it and no exit code was captured. It is shown as failed because success was never confirmed, not because it definitely failed. Check the report to see whether the backup actually exists, and retry if not."
-                          >
-                            <AlertTriangle className="h-3 w-3" />
-                            Outcome unknown
-                          </Badge>
-                        </div>
-                      )}
-                      {/* Legacy records finalised before outcomes were evidence-based. */}
-                      {job.status === 'completed' && job.unverified && (
-                        <div className="mt-1">
-                          <Badge
-                            className="bg-amber-100 text-amber-800 border-amber-200 gap-1"
-                            title="This backup was marked completed by the controller because the agent had no record of it — its success was never confirmed by an exit code. Check the report to verify the backup actually exists."
-                          >
-                            <AlertTriangle className="h-3 w-3" />
-                            Unverified
-                          </Badge>
-                        </div>
-                      )}
-                      {job.offsiteSyncStatus && (
-                        <div className="mt-1">
-                          <OffsiteSyncBadge job={job} />
-                        </div>
-                      )}
-                      {job.status === 'skipped' && job.skippedReason && (
-                        <div className="text-xs text-gray-500 mt-1">
-                          {job.skippedReason === 'agent_offline' ? 'Agent offline' : job.skippedReason}
-                        </div>
-                      )}
-                      {job.retryOf && (
-                        <div className="text-xs text-blue-600 mt-1">
-                          Retry of {job.retryOf.substring(0, 8)}
-                        </div>
-                      )}
+                    <TableCell className="w-[44px] pl-3 pr-0">
+                      {/* One icon for the whole job. Everything that used to
+                          render under it — covered-by / skipped reason / retry
+                          lineage — now lives on the icon's tooltip, so the cell
+                          stays a single dot. The covering job is looked up from
+                          the same map the visible badge used so the tooltip
+                          names the same run the operator used to see. */}
+                      <JobStatusIcons
+                        job={job}
+                        coveringJob={job.coveredBy ? jobsById.get(job.coveredBy) : undefined}
+                      />
                     </TableCell>
-                    <TableCell>
-                      {job.status === 'running' || job.status === 'queued' ? (
+                    <TableCell className="pl-3">
+                      {job.status === 'running' || job.status === 'queued' || job.status === 'retrying' ? (
                         <JobProgressBar
                           progress={job.progress || 0}
                           phase={job.phase}
                           progressText={job.progressText}
-                          jobType={job.jobType || 'backup'}
+                          jobType={job.jobType === 'restore' ? 'restore' : 'backup'}
                           status={job.status}
                         />
-                      ) : job.status === 'completed' ? (
-                        <div className="flex items-center space-x-2">
-                          <div className="flex-1 bg-green-200 rounded-full h-2">
-                            <div className="bg-green-600 h-full w-full" />
-                          </div>
-                          <span className="text-xs font-medium text-green-600">100%</span>
-                        </div>
+                      ) : job.status === 'completed' || job.status === 'failed' ? (
+                        // Same component for finished rows so the track height,
+                        // rounded ends and width line up with an in-progress row.
+                        // A failed run keeps however far it actually got.
+                        <JobProgressBar
+                          progress={job.status === 'completed' ? 100 : (job.progress || 0)}
+                          phase={job.phase}
+                          jobType={job.jobType === 'restore' ? 'restore' : 'backup'}
+                          status={job.status}
+                        />
                       ) : (
                         <span className="text-xs text-gray-400">-</span>
                       )}
                     </TableCell>
-                    <TableCell className="text-sm whitespace-nowrap">
-                      {formatDate(job.startTime)}
+                    <TableCell
+                      className="text-sm whitespace-nowrap"
+                      title={formatDate(job.startTime)}
+                    >
+                      <div>{formatDateCompact(job.startTime)}</div>
+                      <div className="text-xs text-gray-500">
+                        {formatDuration(job.startTime, job.endTime)}
+                      </div>
                     </TableCell>
+                    {/* Square icon buttons in a fixed-width column: with the
+                        default `sm` padding three of them were wider than the
+                        column, so `justify-end` had nothing to push against and
+                        the row spilled left of the right-aligned header. */}
                     <TableCell className="whitespace-nowrap">
-                      {formatDuration(job.startTime, job.endTime)}
-                    </TableCell>
-                    <TableCell>
-                      {job.exitCode !== null && job.exitCode !== undefined ? (
-                        <span className={job.exitCode === 0 ? 'text-green-600' : 'text-red-600'}>
-                          {job.exitCode}
-                        </span>
-                      ) : (
-                        '-'
-                      )}
-                    </TableCell>
-                    {/* A translucent `bg-muted/50` let the Duration column scrolling underneath
-                        bleed through the buttons on hover. So: opaque `bg-background` on the cell,
-                        and the hover tint on the `before` layer above it. Painting order inside
-                        this cell's stacking context is [cell background] → [before, -z-10] →
-                        [content], so the tint sits over an opaque base and under the buttons —
-                        matching the row's hover colour without ever being see-through. */}
-                    <TableCell className="sticky right-0 z-10 whitespace-nowrap bg-background before:absolute before:inset-0 before:-z-10 before:content-[''] group-hover:before:bg-muted/50 shadow-[-8px_0_8px_-8px_rgba(0,0,0,0.15)]">
-                      <div className="flex items-center justify-end space-x-2">
+                      <div className="flex items-center justify-end gap-1">
                         <Button
                           variant="ghost"
                           size="sm"
@@ -544,25 +532,23 @@ export default function BackupHistory() {
                             setSelectedJobId(job.id)
                             setSelectedJobType(job.jobType === 'restore' ? 'restore' : 'backup')
                           }}
+                          title="View logs"
+                          className="h-8 w-8 p-0"
                         >
-                          <Eye className="h-4 w-4 mr-2" />
-                          View Logs
+                          <Eye className="h-4 w-4" />
                         </Button>
                         <Button
                           variant="ghost"
                           size="sm"
                           onClick={() => handleForceRemove(job.id, job.vmName)}
                           disabled={forceRemoveJob.isPending}
-                          className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                          className="h-8 w-8 p-0 text-red-600 hover:text-red-700 hover:bg-red-50"
                           title="Force remove this job from history"
                         >
                           {forceRemoveJob.isPending ? (
                             <Loader2 className="h-4 w-4 animate-spin" />
                           ) : (
-                            <>
-                              <Trash2 className="h-4 w-4 mr-2" />
-                              Force Remove
-                            </>
+                            <Trash2 className="h-4 w-4" />
                           )}
                         </Button>
                         {/* Retry only applies to some rows, but the slot is always
@@ -579,16 +565,13 @@ export default function BackupHistory() {
                             size="sm"
                             onClick={() => handleRetry(job.id, job.vmName)}
                             disabled={retryBackup.isPending}
-                            className="text-blue-600 hover:text-blue-700 hover:bg-blue-50"
+                            className="h-8 w-8 p-0 text-blue-600 hover:text-blue-700 hover:bg-blue-50"
                             title="Retry this backup"
                           >
                             {retryBackup.isPending ? (
                               <Loader2 className="h-4 w-4 animate-spin" />
                             ) : (
-                              <>
-                                <RefreshCw className="h-4 w-4 mr-2" />
-                                Retry
-                              </>
+                              <RefreshCw className="h-4 w-4" />
                             )}
                           </Button>
                         </div>
@@ -601,7 +584,7 @@ export default function BackupHistory() {
 
             {/* Pagination Controls */}
             {totalItems > 0 && (
-              <div className="mt-4 flex items-center justify-between border-t pt-4">
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t pt-4">
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-gray-600">Items per page:</span>
                   <Select

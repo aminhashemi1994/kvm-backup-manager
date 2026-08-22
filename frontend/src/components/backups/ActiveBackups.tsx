@@ -1,17 +1,16 @@
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { Badge } from '@/components/ui/badge'
 import { Eye, Loader2, XCircle, Download, Upload, Search } from 'lucide-react'
 import { useActiveBackups, useKillBackupJob } from '@/hooks/useBackups'
 import { useActiveRestores, useKillRestoreJob } from '@/hooks/useRestores'
-import { formatDuration } from '@/lib/utils'
+import { formatDuration, jobTypeCode, methodCode } from '@/lib/utils'
 import LiveLogViewer from './LiveLogViewer'
-import JobStatusBadge from './JobStatusBadge'
+import JobStatusIcons from './JobStatusIcons'
 import JobProgressBar from './JobProgressBar'
-import OffsiteSyncBadge from './OffsiteSyncBadge'
 import VmNameCell from '@/components/common/VmNameCell'
 import VmNameToggle from '@/components/common/VmNameToggle'
 import socketService from '@/services/socket'
@@ -219,11 +218,11 @@ export default function ActiveBackups() {
     <>
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <CardTitle>Active & Queued Jobs</CardTitle>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2 min-w-0">
               <VmNameToggle showFull={showFullVmNames} onToggle={setShowFullVmNames} />
-              <div className="relative w-64">
+              <div className="relative w-full sm:w-56 min-w-0">
                 <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
                 <Input
                   type="text"
@@ -248,54 +247,49 @@ export default function ActiveBackups() {
                   Found {activeJobs.length} job{activeJobs.length !== 1 ? 's' : ''} matching "{searchQuery}"
                 </div>
               )}
-              <Table>
+              <Table className="table-fixed">
               <TableHeader>
                 <TableRow>
-                  <TableHead>Type</TableHead>
-                  <TableHead>VM Name</TableHead>
-                  <TableHead>Method</TableHead>
-                  <TableHead>Agent</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Progress</TableHead>
-                  <TableHead>Duration</TableHead>
-                  <TableHead>Actions</TableHead>
+                  <TableHead className="w-[90px]" title="Job type">Type</TableHead>
+                  <TableHead>VM</TableHead>
+                  <TableHead className="w-[90px]" title="Schedule / method">Method</TableHead>
+                  <TableHead className="w-[44px] pl-3 pr-0">Status</TableHead>
+                  <TableHead className="w-[32%] pl-3">Progress</TableHead>
+                  <TableHead className="w-[72px]">Duration</TableHead>
+                  <TableHead className="w-[104px] whitespace-nowrap text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {activeJobs.map((job) => (
                   <TableRow key={`${job.jobType}-${job.id}`}>
-                    <TableCell>
-                      <div className="flex items-center space-x-2">
-                        {job.jobType === 'backup' ? (
-                          <Upload className="h-4 w-4 text-blue-600" />
-                        ) : (
-                          <Download className="h-4 w-4 text-green-600" />
-                        )}
-                        <span className="font-medium capitalize">{job.jobType}</span>
-                      </div>
+                    <TableCell className="w-[90px]">
+                      {(() => {
+                        const t = jobTypeCode(job.jobType)
+                        return (
+                          <Badge variant="outline" className={`${t.className} justify-center px-2 font-semibold`} title={t.label}>
+                            {t.label}
+                          </Badge>
+                        )
+                      })()}
                     </TableCell>
-                    <TableCell className="font-medium">
+                    <TableCell className="font-medium max-w-0 min-w-0">
                       <VmNameCell vmName={job.vmName} showFull={showFullVmNames} />
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant="outline">{(job.scheduleType || job.method || job.jobType).toUpperCase()}</Badge>
-                    </TableCell>
-                    <TableCell>{job.backupHostName || '-'}</TableCell>
-                    <TableCell>
-                      <JobStatusBadge
-                        status={job.status === 'queued' && (job.progress || 0) > 0 ? 'running' : job.status}
-                        phase={job.phase}
-                        jobType={job.jobType}
-                        failureReason={job.failureReason}
-                        replay={job.replay}
-                      />
-                      {(job as any).offsiteSyncStatus && (job as any).offsiteSyncStatus !== 'running' && (
-                        <div className="mt-1">
-                          <OffsiteSyncBadge job={job as any} />
-                        </div>
+                      {job.backupHostName && (
+                        <div className="text-xs text-gray-500 truncate">{job.backupHostName}</div>
                       )}
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="w-[90px] text-center">
+                      {(() => {
+                        const m = methodCode(job.scheduleType || job.method)
+                        return (
+                          <span className="text-xs text-gray-600" title={m.label}>{m.label}</span>
+                        )
+                      })()}
+                    </TableCell>
+                    <TableCell className="w-[44px] pl-3 pr-0">
+                      <JobStatusIcons job={job as any} />
+                    </TableCell>
+                    <TableCell className="pl-3">
                       <JobProgressBar
                         progress={job.progress || 0}
                         phase={job.phase}
@@ -304,28 +298,29 @@ export default function ActiveBackups() {
                         status={job.status === 'queued' && (job.progress || 0) > 0 ? 'running' : job.status}
                       />
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="whitespace-nowrap text-sm">
                       {formatDuration(job.startTime, job.endTime)}
                     </TableCell>
-                    <TableCell>
-                      <div className="flex items-center space-x-2">
+                    <TableCell className="whitespace-nowrap">
+                      <div className="flex items-center justify-end gap-1">
                         <Button
                           variant="ghost"
                           size="sm"
                           onClick={() => handleViewLogs(job.id, job.jobType)}
+                          title="View logs"
+                          className="h-8 w-8 p-0"
                         >
-                          <Eye className="h-4 w-4 mr-2" />
-                          View Logs
+                          <Eye className="h-4 w-4" />
                         </Button>
                         <Button
                           variant="ghost"
                           size="sm"
                           onClick={() => handleKill(job.id, job.vmName, job.jobType)}
                           disabled={killBackupMutation.isPending || killRestoreMutation.isPending}
-                          className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                          className="h-8 w-8 p-0 text-red-600 hover:text-red-700 hover:bg-red-50"
+                          title="Cancel this job"
                         >
-                          <XCircle className="h-4 w-4 mr-2" />
-                          Cancel
+                          <XCircle className="h-4 w-4" />
                         </Button>
                       </div>
                     </TableCell>

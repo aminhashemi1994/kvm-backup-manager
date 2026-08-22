@@ -19,6 +19,9 @@ router.post('/trigger', async (req, res, next) => {
       noCompression, 
       noVerify,
       offsiteHosts,
+      offsiteRetryAttempts,
+      offsiteRetryBackoffSeconds,
+      offsiteOnly,  // Skip the VM backup; only re-run the offsite sync
       verbose,
       storagePoolPath,
       diskUsageThreshold,
@@ -40,6 +43,16 @@ router.post('/trigger', async (req, res, next) => {
       return res.status(400).json({
         success: false,
         error: 'Storage pool path is required. Please select a storage pool for this backup.',
+      });
+    }
+
+    // An offsite-only run does nothing but replicate the existing backup
+    // directory, so it is meaningless — and would silently "succeed" — with
+    // no offsite hosts to replicate to.
+    if (offsiteOnly && (!Array.isArray(offsiteHosts) || offsiteHosts.length === 0)) {
+      return res.status(400).json({
+        success: false,
+        error: 'offsiteOnly requires at least one entry in offsiteHosts',
       });
     }
 
@@ -68,6 +81,9 @@ router.post('/trigger', async (req, res, next) => {
       noCompression: noCompression || false,
       noVerify: noVerify || false,
       offsiteHosts: offsiteHosts || [],
+      offsiteRetryAttempts: offsiteRetryAttempts || 3,
+      offsiteRetryBackoffSeconds: offsiteRetryBackoffSeconds || 15,
+      offsiteOnly: offsiteOnly || false,
       verbose: verbose || false,
       storagePoolPath: storagePoolPath,
       diskUsageThreshold: diskUsageThreshold != null ? diskUsageThreshold : null,

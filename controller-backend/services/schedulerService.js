@@ -14,6 +14,7 @@ const {
 const agentService = require('./agentService');
 const backupCycleService = require('./backupCycleService');
 const rocketChatService = require('./rocketChatService');
+const notificationPolicy = require('./notificationPolicyService');
 const { v4: uuidv4 } = require('uuid');
 
 class SchedulerService {
@@ -24,6 +25,9 @@ class SchedulerService {
     this.healthCheckInterval = null;
     this.queueReconcilerInterval = null;
     this._retryTimers = new Map(); // Map of jobId -> setTimeout handle for pending retries
+    // Separate from _retryTimers: a job can have a backup retry and an offsite
+    // resync pending independently, and one must never cancel the other.
+    this._offsiteRetryTimers = new Map(); // Map of jobId -> setTimeout handle for pending offsite resyncs
     this._hostLocks = new Map(); // Map of hostId -> promise chain (serializes slot decisions)
   }
 
@@ -115,6 +119,7 @@ class SchedulerService {
     await this.loadSchedules();
     this.startHealthChecks();
     this.startQueueReconciler();
+    await this.rearmPendingOffsiteResyncs();
     console.log(`✓ Loaded ${this.tasks.size} scheduled tasks`);
   }
 
@@ -497,6 +502,14 @@ class SchedulerService {
     try {
       if (!failedJob || !failedJob.scheduled || !failedJob.scheduleId) return;
 
+      // Idempotent: the same failure can reach us more than once (the agent
+      // reports the backup-phase failure early, then again when the script
+      // finally exits after its offsite sync). One pending retry per job.
+      if (this._retryTimers.has(failedJob.id)) {
+        console.log(`[Scheduler] Retry already pending for job ${failedJob.id}; ignoring duplicate failure report`);
+        return;
+      }
+
       const attempt = failedJob.attemptNumber || 1;
       const maxAttempts = failedJob.maxAttempts || 1;
 
@@ -553,6 +566,323 @@ class SchedulerService {
       this._retryTimers.set(failedJob.id, timer);
     } catch (err) {
       console.error('[Scheduler] handleScheduledBackupFailure error:', err.message);
+    }
+  }
+
+  /**
+   * Re-arm offsite resyncs that were pending when the process stopped.
+   *
+   * The delay is held in an in-memory setTimeout, so a controller restart
+   * during the wait used to strand the job: offsiteSyncStatus stayed
+   * 'retrying' and offsiteRetryAt sat in the past forever, and the
+   * replication was never retried. Nothing re-created those timers, because
+   * handleOffsiteSyncFailure only runs off a live job update.
+   *
+   * Anything already due is run on a short stagger rather than all at once, so
+   * a restart after a long outage doesn't fire every pending resync into the
+   * agents simultaneously.
+   */
+  async rearmPendingOffsiteResyncs() {
+    try {
+      const jobs = await getBackupJobs();
+      const pending = (jobs || []).filter(j =>
+        j &&
+        j.offsiteSyncStatus === 'retrying' &&
+        j.offsiteRetryAt &&
+        !j.offsiteRetryInFlight &&
+        !this._offsiteRetryTimers.has(j.id)
+      );
+
+      if (pending.length === 0) return;
+
+      console.log(`[Scheduler] Re-arming ${pending.length} pending offsite resync(s) after restart`);
+
+      let overdueIndex = 0;
+      for (const job of pending) {
+        const dueAt = new Date(job.offsiteRetryAt).getTime();
+        if (isNaN(dueAt)) {
+          await this._patchJobFresh(job.id, { offsiteRetryAt: null, offsiteSyncStatus: 'failed' }).catch(() => {});
+          continue;
+        }
+
+        // Overdue work is spread 30s apart; anything still in the future keeps
+        // the time the user is already being shown in the panel.
+        const remaining = dueAt - Date.now();
+        const delayMs = remaining > 0 ? remaining : (overdueIndex++ * 30000) + 5000;
+
+        const attempt = job.offsiteRetryAttempt || 0;
+        const nextAttempt = job.offsiteRetryNextAttempt || attempt + 1;
+        const maxAttempts = job.offsiteRetryMaxAttempts || 3;
+
+        if (remaining <= 0) {
+          // Keep the displayed time truthful about when it will now run.
+          await this._patchJobFresh(job.id, {
+            offsiteRetryAt: new Date(Date.now() + delayMs).toISOString(),
+          }).catch(() => {});
+        }
+
+        console.log(`[Scheduler] Offsite resync for ${job.vmName} re-armed: attempt ${nextAttempt}/${maxAttempts} in ${Math.round(delayMs / 1000)}s`);
+
+        const timer = setTimeout(async () => {
+          this._offsiteRetryTimers.delete(job.id);
+          try {
+            await this.retryOffsiteSyncForJob(job.id, nextAttempt, maxAttempts);
+          } catch (err) {
+            console.error(`[Scheduler] Re-armed offsite resync failed for ${job.vmName}:`, err.message);
+            await this._patchJobFresh(job.id, {
+              offsiteRetryInFlight: false,
+              offsiteRetryAt: null,
+              offsiteSyncStatus: 'failed',
+            }).catch(() => {});
+          }
+        }, delayMs);
+
+        if (timer.unref) timer.unref();
+        this._offsiteRetryTimers.set(job.id, timer);
+      }
+    } catch (err) {
+      console.error('[Scheduler] rearmPendingOffsiteResyncs error:', err.message);
+    }
+  }
+
+  /**
+   * Handle a failed or partial offsite sync on a job that has otherwise
+   * finished. Schedules an offsite-ONLY resync (no virtnbdbackup re-run)
+   * after the schedule's retry delay, targeting just the offsite hosts that
+   * are still failing.
+   *
+   * The agent already retried the rsync in-place a few times per host
+   * (--offsite-retry-attempts) before reporting failure, so reaching here
+   * means the destination was down or unreachable for a sustained period.
+   * Retrying on the controller's slower cadence is what covers that case.
+   *
+   * Attempt budget and delay reuse the schedule's existing retryCount /
+   * retryDelayMinutes — the same knobs that govern backup retries.
+   *
+   * @param {object} failedJob - the job record whose offsiteSyncStatus is failed/partial.
+   */
+  async handleOffsiteSyncFailure(failedJob) {
+    try {
+      if (!failedJob || !failedJob.id) return;
+      if (!failedJob.scheduleId) return; // only schedule-driven jobs carry retry config
+
+      // Don't stack resyncs: one pending timer / in-flight run per job.
+      if (this._offsiteRetryTimers.has(failedJob.id)) return;
+      if (failedJob.offsiteRetryInFlight) return;
+
+      const stillFailing = (Array.isArray(failedJob.offsiteResults) ? failedJob.offsiteResults : [])
+        .filter(r => r && r.status !== 'success');
+      if (stillFailing.length === 0) {
+        // Nothing actionable — e.g. offsiteSyncStatus is 'unknown' with no
+        // per-host detail. A resync would have no targets to aim at.
+        return;
+      }
+
+      const schedules = await getBackupSchedules();
+      const schedule = schedules.find(s => s.id === failedJob.scheduleId);
+      if (!schedule) {
+        console.log(`[Scheduler] Cannot retry offsite sync: schedule ${failedJob.scheduleId} no longer exists`);
+        return;
+      }
+
+      const attempt = failedJob.offsiteRetryAttempt || 0;
+
+      // Dedicated offsite-resync settings when the schedule has them, otherwise
+      // the backup retry knobs — which is what every schedule used before these
+      // fields existed, so unconfigured schedules keep their current behaviour.
+      const maxAttempts = typeof schedule.offsiteResyncAttempts === 'number'
+        ? schedule.offsiteResyncAttempts
+        : (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3);
+
+      if (attempt >= maxAttempts) {
+        console.log(`[Scheduler] ${failedJob.vmName}: offsite resync attempts exhausted (${attempt}/${maxAttempts}); leaving offsite sync failed until the next scheduled run`);
+        return;
+      }
+
+      const delayMinutes = typeof schedule.offsiteResyncDelayMinutes === 'number'
+        ? schedule.offsiteResyncDelayMinutes
+        : (typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5);
+      const delayMs = Math.max(0, delayMinutes) * 60 * 1000;
+      const nextAttempt = attempt + 1;
+      const retryAt = new Date(Date.now() + delayMs).toISOString();
+
+      console.log(`[Scheduler] ${failedJob.vmName}: offsite sync ${failedJob.offsiteSyncStatus} on ${stillFailing.length} host(s); scheduling offsite-only resync ${nextAttempt}/${maxAttempts} in ${delayMinutes} minute(s) (at ${retryAt})`);
+
+      await this._patchJobFresh(failedJob.id, {
+        offsiteRetryAt: retryAt,
+        // Carried on the job so the UI can show "attempt 2 of 5" next to the
+        // queued time without having to go and read the schedule.
+        offsiteRetryNextAttempt: nextAttempt,
+        offsiteRetryMaxAttempts: maxAttempts,
+        offsiteSyncStatus: 'retrying',
+      });
+
+      const timer = setTimeout(async () => {
+        this._offsiteRetryTimers.delete(failedJob.id);
+        try {
+          await this.retryOffsiteSyncForJob(failedJob.id, nextAttempt, maxAttempts);
+        } catch (err) {
+          // Triggering itself failed (agent 409/unreachable, store error). The
+          // attempt was already consumed inside retryOffsiteSyncForJob, so
+          // re-entering here continues the budget rather than ending the chain
+          // on a transient error.
+          console.error(`[Scheduler] Offsite resync failed for ${failedJob.vmName}:`, err.message);
+          await this._patchJobFresh(failedJob.id, {
+            offsiteRetryInFlight: false,
+            offsiteRetryAt: null,
+            offsiteSyncStatus: 'failed',
+          }).catch(() => {});
+          try {
+            const fresh = (await getBackupJobs()).find(j => j.id === failedJob.id);
+            if (fresh) await this.handleOffsiteSyncFailure(fresh);
+          } catch (_) { /* budget exhausted or store unavailable — stop here */ }
+        }
+      }, delayMs);
+
+      if (timer.unref) timer.unref();
+      this._offsiteRetryTimers.set(failedJob.id, timer);
+    } catch (err) {
+      console.error('[Scheduler] handleOffsiteSyncFailure error:', err.message);
+    }
+  }
+
+  /**
+   * Re-trigger ONLY the offsite sync for an already-finished job, against the
+   * offsite hosts that are still failing. Reuses the same job id: the offsite
+   * outcome belongs to that backup, and the status-update handler routes these
+   * reports through its offsiteRetryInFlight branch so the backup's own
+   * verdict is never overwritten.
+   */
+  async retryOffsiteSyncForJob(jobId, attemptNumber, maxAttempts) {
+    const jobs = await getBackupJobs();
+    const job = jobs.find(j => j.id === jobId);
+    if (!job) {
+      console.error(`[Scheduler] Cannot retry offsite sync: job ${jobId} not found`);
+      return;
+    }
+
+    const schedules = await getBackupSchedules();
+    const schedule = schedules.find(s => s.id === job.scheduleId);
+    if (!schedule) {
+      console.log(`[Scheduler] Offsite resync aborted: schedule ${job.scheduleId} was removed during the delay`);
+      await this._patchJobFresh(jobId, { offsiteRetryAt: null, offsiteSyncStatus: 'failed' });
+      return;
+    }
+
+    // Re-read the failing hosts at fire time: an earlier attempt (or a later
+    // scheduled backup) may have already synced some of them.
+    const stillFailing = (Array.isArray(job.offsiteResults) ? job.offsiteResults : [])
+      .filter(r => r && r.status !== 'success');
+    if (stillFailing.length === 0) {
+      console.log(`[Scheduler] Offsite resync for ${job.vmName} no longer needed — all hosts report success`);
+      await this._patchJobFresh(jobId, {
+        offsiteRetryAt: null,
+        offsiteSyncStatus: 'completed',
+      });
+      return;
+    }
+
+    const vms = await getVirtualMachines();
+    const vm = vms.find(v => v.id === schedule.vmId);
+    if (!vm) throw new Error(`VM ${schedule.vmId} not found`);
+
+    const hosts = await getBackupHosts();
+    const host = hosts.find(h => h.id === vm.backupHostId);
+    if (!host) throw new Error(`Backup host ${vm.backupHostId} not found`);
+    if (host.status !== 'online') {
+      // Try again later, but still consume the attempt — otherwise a host that
+      // stays offline would reschedule forever without ever exhausting the
+      // budget. The next scheduled run re-syncs anyway.
+      console.log(`[Scheduler] Offsite resync deferred: backup host ${host.name} is offline`);
+      await this._patchJobFresh(jobId, {
+        offsiteRetryAttempt: attemptNumber,
+        offsiteRetryAt: null,
+        offsiteSyncStatus: 'failed',
+      });
+      const fresh = (await getBackupJobs()).find(j => j.id === jobId);
+      if (fresh) await this.handleOffsiteSyncFailure(fresh);
+      return;
+    }
+
+    const hypervisors = await getHypervisors();
+    const hypervisor = hypervisors.find(h => h.id === vm.hypervisorId);
+    if (!hypervisor) throw new Error(`Hypervisor ${vm.hypervisorId} not found`);
+
+    const pools = await getStoragePools();
+    const pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
+    if (!pool) throw new Error('Storage pool not found on backup host');
+
+    // Narrow the schedule's offsite targets down to the failing hosts, then
+    // encode them the usual way (ip:path[:threshold]).
+    const { resolved, encoded } = await this.resolveOffsiteTargets(schedule);
+    const failingIps = new Set(stillFailing.map(r => r.ip).filter(Boolean));
+    const retryEncoded = resolved
+      .map((r, i) => ({ r, e: encoded[i] }))
+      .filter(({ r }) => failingIps.has(r.ip))
+      .map(({ e }) => e);
+
+    if (retryEncoded.length === 0) {
+      console.log(`[Scheduler] Offsite resync for ${job.vmName}: no schedule target matches the failing host(s) — the offsite selection likely changed`);
+      await this._patchJobFresh(jobId, { offsiteRetryAt: null, offsiteSyncStatus: 'failed' });
+      return;
+    }
+
+    const agentScheduleType = (() => {
+      switch (schedule.scheduleType) {
+        case 'once':
+        case 'monthly':
+        case 'daily':
+        case 'weekly': return schedule.scheduleType;
+        case 'interval':
+        case 'cron': return 'daily';
+        case 'custom-days': return 'custom';
+        default: return 'once';
+      }
+    })();
+
+    let url = host.url;
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      url = 'http://' + url;
+    }
+
+    // Flag BEFORE triggering: the agent starts posting status updates
+    // immediately, and they must hit the offsite-only branch of the handler.
+    await this._patchJobFresh(jobId, {
+      offsiteRetryInFlight: true,
+      offsiteRetryAttempt: attemptNumber,
+      offsiteRetryAt: null,
+      offsiteSyncStatus: 'running',
+      phase: 'rsync',
+    });
+
+    await appendLog(jobId, `\n=== OFFSITE RESYNC ATTEMPT ${attemptNumber}/${maxAttempts} ===`);
+    await appendLog(jobId, `Re-syncing to ${retryEncoded.length} offsite host(s) that previously failed: ${[...failingIps].join(', ')}`);
+
+    try {
+      await agentService.triggerBackup(url, {
+        jobId,
+        vmName: vm.name,
+        hypervisorId: hypervisor.id,
+        hypervisorIp: hypervisor.ip,
+        scheduleType: agentScheduleType,
+        storagePoolId: pool.id,
+        storagePoolPath: pool.path,
+        diskUsageThreshold: pool.diskUsageThreshold ?? 80,
+        offsiteHosts: retryEncoded,
+        offsiteRetryAttempts: schedule.offsiteRetryAttempts || 3,
+        offsiteRetryBackoffSeconds: schedule.offsiteRetryBackoffSeconds || 15,
+        // The whole point: replicate what's already on disk, don't back up again.
+        offsiteOnly: true,
+        verbose: schedule.verbose || false,
+      });
+      console.log(`[Scheduler] ✓ Offsite resync triggered for ${vm.name} (attempt ${attemptNumber}/${maxAttempts})`);
+    } catch (err) {
+      await this._patchJobFresh(jobId, {
+        offsiteRetryInFlight: false,
+        offsiteSyncStatus: 'failed',
+      });
+      await appendLog(jobId, `ERROR: Failed to trigger offsite resync: ${err.message}`);
+      throw err;
     }
   }
 
@@ -681,6 +1011,8 @@ class SchedulerService {
         diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
+        offsiteRetryAttempts: schedule.offsiteRetryAttempts || 3,
+        offsiteRetryBackoffSeconds: schedule.offsiteRetryBackoffSeconds || 15,
         compression: schedule.compression || 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
@@ -694,9 +1026,53 @@ class SchedulerService {
       });
 
       console.log(`[Scheduler] ✓ Retry triggered for ${vm.name} (attempt ${attemptNumber}/${maxAttempts})`);
+      // The attempt actually started — reset the deferral counter so a future
+      // attempt gets the full waiting budget again.
+      await this._patchJobFresh(jobId, { retryDeferrals: 0 });
     } catch (err) {
       console.error(`[Scheduler] Failed to retry job ${jobId}:`, err.message);
-      
+
+      // The agent refuses a VM that is still busy (HTTP 409). That is the
+      // normal case now that a failed backup is reported as soon as the backup
+      // phase fails: the script is still running its post-failure offsite sync
+      // and holds the VM lock. This is not a retry failure — the attempt never
+      // ran — so re-arm the timer instead of burning it. The retry lands once
+      // the rsync finishes and the lock clears.
+      const status = err && err.response && err.response.status;
+      const agentError = err && err.response && err.response.data && err.response.data.error;
+      if (status === 409 || /already in progress/i.test(String(agentError || err.message || ''))) {
+        const deferrals = (await this._getJobField(jobId, 'retryDeferrals')) || 0;
+        const maxDeferrals = 288; // ~24h at 5-minute delays — long rsyncs are hours, not days
+        if (deferrals < maxDeferrals) {
+          const delayMinutes = (await this._getJobField(jobId, 'retryDelayMinutes')) || 5;
+          const delayMs = Math.max(0, delayMinutes) * 60 * 1000;
+          console.log(`[Scheduler] VM still busy (offsite sync in progress); deferring retry ${attemptNumber}/${maxAttempts} for job ${jobId} by ${delayMinutes} minute(s)`);
+          await this._patchJobFresh(jobId, {
+            status: 'retrying',
+            retryDeferrals: deferrals + 1,
+            retryAt: new Date(Date.now() + delayMs).toISOString(),
+            progressText: 'Waiting for the previous run to finish before retrying...',
+          });
+          await appendLog(jobId, `Retry deferred: VM still busy (offsite sync running). Next check in ${delayMinutes} minute(s).`);
+
+          const timer = setTimeout(async () => {
+            this._retryTimers.delete(jobId);
+            try {
+              const freshSchedules = await getBackupSchedules();
+              const fresh = freshSchedules.find(s => s.id === schedule.id);
+              if (!fresh) return;
+              await this.retryExistingJob(jobId, fresh, attemptNumber, maxAttempts);
+            } catch (e) {
+              console.error(`[Scheduler] Deferred retry failed for job ${jobId}:`, e.message);
+            }
+          }, delayMs);
+          if (timer.unref) timer.unref();
+          this._retryTimers.set(jobId, timer);
+          return;
+        }
+        console.error(`[Scheduler] Job ${jobId}: giving up after ${deferrals} retry deferrals — VM never freed up`);
+      }
+
       // Mark job as failed
       const jobs = await getBackupJobs();
       const job = jobs.find(j => j.id === jobId);
@@ -876,6 +1252,8 @@ class SchedulerService {
         diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
+        offsiteRetryAttempts: schedule.offsiteRetryAttempts || 3,
+        offsiteRetryBackoffSeconds: schedule.offsiteRetryBackoffSeconds || 15,
         compression: schedule.compression || 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
@@ -989,6 +1367,8 @@ class SchedulerService {
         diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
+        offsiteRetryAttempts: schedule.offsiteRetryAttempts || 3,
+        offsiteRetryBackoffSeconds: schedule.offsiteRetryBackoffSeconds || 15,
         compression: schedule.compression || 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
@@ -1011,7 +1391,9 @@ class SchedulerService {
       // this VM + schedule so their Retry buttons disappear.
       await this.supersedeSkippedSiblings(skipped, newJobId);
       try {
-        rocketChatService.notifyBackupRetry(skipped.vmName, host.name, skipped.id);
+        if (await notificationPolicy.shouldNotify(skipped.scheduleId || null, 'retry')) {
+          rocketChatService.notifyBackupRetry(skipped.vmName, host.name, skipped.id);
+        }
       } catch (_) { /* non-fatal */ }
       console.log(`[Scheduler] ✓ Auto-retry triggered for ${skipped.vmName} on ${host.name}`);
     } catch (err) {
@@ -1096,49 +1478,27 @@ class SchedulerService {
   }
 
   /**
-   * A scheduled run that was refused because the VM is already backing up.
+   * Retry budget for a scheduled job, derived from the schedule.
    *
-   * `rejected` is deliberately its own terminal status, not `failed`: nothing
-   * went wrong and nothing was attempted — the agent's per-VM lock simply
-   * declined a second concurrent run. `coveredBy` names the backup that WAS
-   * running, so the UI (and the log viewer) can send the operator to it.
+   * Every code path that creates a scheduled job MUST spread this in. The
+   * status handler reads `job.maxAttempts` and falls back to 1 when it is
+   * missing, which silently disables retries — so a job created without these
+   * fields fails permanently on its first error no matter what the schedule
+   * says. `retryCount` is the number of RETRIES, hence maxAttempts = n + 1.
    */
-  _buildRejectedJob({ jobId, schedule, vm, hypervisor, host, method, coveredBy, reason, replayMeta }) {
-    const now = new Date().toISOString();
+  _retryMetaFor(schedule, replayMeta = null) {
     return {
-      id: jobId,
-      scheduleId: schedule.id,
-      vmId: vm.id,
-      vmName: vm.name,
-      hypervisorIp: hypervisor.ip,
-      backupHostId: host.id,
-      backupHostName: host.name,
-      scheduleType: schedule.scheduleType,
-      method,
-      status: 'rejected',
-      rejectedReason: 'already_running',
-      failureReason: 'already_running',
-      error: reason,
-      startTime: now,
-      endTime: now,
-      exitCode: null,
-      progress: 0,
-      scheduled: true,
-      canRetry: true,
-      coveredBy: coveredBy || null,
-      ...(replayMeta ? {
-        replay: true,
-        originallyScheduledAt: replayMeta.scheduledAt
-          ? new Date(replayMeta.scheduledAt).toISOString()
-          : null,
-        replayReason: replayMeta.reason || 'replay',
-        actor: replayMeta.actor || 'system:replay',
-        triggeredBy: replayMeta.triggeredBy || 'system',
-      } : {
-        actor: 'system:scheduler',
-        triggeredBy: 'system',
-      }),
+      attemptNumber: replayMeta && replayMeta.attemptNumber ? replayMeta.attemptNumber : 1,
+      maxAttempts: (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3) + 1,
+      retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
     };
+  }
+
+  /** Read a single field off a job against fresh store state. */
+  async _getJobField(jobId, field) {
+    const jobs = await getBackupJobs();
+    const job = jobs.find(j => j.id === jobId);
+    return job ? job[field] : undefined;
   }
 
   /** Patch a job by id against fresh store state (avoids stale-array clobber). */
@@ -1375,7 +1735,6 @@ class SchedulerService {
 
       let job = null;
       let didQueue = false;
-      let rejected = null;
       let rejectedBecauseOf = null;
       let queuedNote = '';
       let queuedJob = null;
@@ -1396,14 +1755,20 @@ class SchedulerService {
             j.vmId === vm.id && SchedulerService.ACTIVE_STATUSES.includes(j.status)
           );
           if (inFlight) {
+            // No record is created. A job has exactly two outcomes — completed
+            // or failed — and this run had neither: it never started, because
+            // the VM was already being backed up by job `inFlight`, which will
+            // report its own outcome. Writing a third kind of row here produced
+            // a "rejected / - / 0s" entry that looked like a lost backup, sat
+            // next to a successful one for the same VM, and opened the OTHER
+            // job's log when clicked. The collision is recorded on the running
+            // job's log instead, where it explains something.
             rejectedBecauseOf = inFlight;
-            rejected = this._buildRejectedJob({
-              jobId, schedule, vm, hypervisor, host, method,
-              coveredBy: inFlight.id,
-              reason: `A backup for ${vm.name} is already ${inFlight.status} (job ${inFlight.id}); this scheduled run was not started`,
-              replayMeta,
-            });
-            jobs.push(rejected);
+            console.log(`[Scheduler] ${vm.name}: scheduled run skipped — already ${inFlight.status} as job ${inFlight.id}`);
+            appendLog(
+              inFlight.id,
+              `A scheduled ${schedule.scheduleType} run for ${vm.name} was due at ${new Date().toISOString()} and was skipped: this backup was still running. No separate job was recorded.`
+            ).catch(() => { /* best-effort trail */ });
             return;
           }
 
@@ -1443,6 +1808,11 @@ class SchedulerService {
               scheduled: true,
               canRetry: true,
               offsiteTargets: resolved,
+              // Retry budget must ride along here too. Without it this job
+              // reaches the status handler with maxAttempts undefined, which
+              // falls back to 1 — so a backup that merely waited for a free
+              // slot silently lost every retry the schedule configured.
+              ...this._retryMetaFor(schedule, replayMeta),
               ...(replayMeta ? { replay: true, originallyScheduledAt: replayMeta.scheduledAt, replayReason: replayMeta.reason } : {}),
             };
 
@@ -1472,9 +1842,7 @@ class SchedulerService {
             error: null,
             scheduled: true,
             offsiteTargets: resolved,
-            attemptNumber: replayMeta && replayMeta.attemptNumber ? replayMeta.attemptNumber : 1,
-            maxAttempts: (typeof schedule.retryCount === 'number' ? schedule.retryCount : 3) + 1,
-            retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
+            ...this._retryMetaFor(schedule, replayMeta),
             ...(replayMeta ? {
               replay: true,
               originallyScheduledAt: replayMeta.scheduledAt
@@ -1497,22 +1865,10 @@ class SchedulerService {
         }
       });
 
-      // Refused because the VM is already backing up. This is NOT a failure —
-      // nothing was attempted and nothing is wrong with the backup that IS
-      // running, so it is recorded as `rejected` and points at that run.
-      if (rejected) {
-        console.log(`[Scheduler] Rejected scheduled backup for ${vm.name}: already ${rejectedBecauseOf.status} (job ${rejectedBecauseOf.id})`);
-        await appendLog(jobId, `Scheduled run rejected: ${rejected.error}`);
-        await appendLog(jobId, `Logs for the backup that is running: job ${rejectedBecauseOf.id}`);
-        try {
-          await appendLog(
-            rejectedBecauseOf.id,
-            `A scheduled run for ${vm.name} (${schedule.scheduleType}) was rejected at ${new Date().toISOString()} because this backup is still ${rejectedBecauseOf.status}`
-          );
-        } catch (_) { /* best-effort */ }
-        if (this.io) this.io.emit('backup-rejected', rejected);
-        return;
-      }
+      // The VM was already backing up, so this run never started and no record
+      // was written for it — see the collision check above. The backup that IS
+      // running carries the note.
+      if (rejectedBecauseOf) return;
 
       // Queued for later — a freed slot will promote it. Try an immediate
       // drain in case a slot opened up since we counted.
@@ -1598,6 +1954,8 @@ class SchedulerService {
         diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: schedule.retention || 7,
         keepArchive: schedule.keepArchive || 2,
+        offsiteRetryAttempts: schedule.offsiteRetryAttempts || 3,
+        offsiteRetryBackoffSeconds: schedule.offsiteRetryBackoffSeconds || 15,
         compression: schedule.compression || 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
@@ -1643,36 +2001,29 @@ class SchedulerService {
           // Nothing failed here: the backup this run collided with is healthy,
           // and this run was never attempted. Record it as REJECTED pointing at
           // the live run, so History shows the truth instead of a red failure.
+          // Same reasoning as the pre-flight collision check above: this run
+          // never happened, so it gets no row. Here the placeholder job record
+          // already exists (it was created before the host was consulted), so
+          // it is deleted rather than stamped with a third status.
           const reason = `Another backup is in progress for ${vm.name}: ${statusCheck.details}`;
-          const rejectedJob = await this._patchJobFresh(jobId, {
-            status: 'rejected',
-            rejectedReason: 'already_running',
-            failureReason: 'already_running',
-            error: reason,
-            endTime: new Date().toISOString(),
-            progress: 0,
-            progressText: null,
-            canRetry: true,
-            ...(liveJob ? { coveredBy: liveJob.id } : {}),
-            ...(statusCheck.checks?.tmuxSession?.sessionName
-              ? { collidedWithSession: statusCheck.checks.tmuxSession.sessionName }
-              : {}),
-          });
+          console.log(`[Scheduler] ${vm.name}: scheduled run skipped — ${reason}`);
 
-          await appendLog(jobId, `Rejected: ${reason}`);
-          await appendLog(jobId, `Status on host: ${statusCheck.status}`);
+          await this._removeJob(jobId).catch(() => { /* nothing to remove */ });
+
+          // The trail lives on the backup that WAS running, which is the record
+          // an operator actually wants to read.
           if (liveJob) {
-            await appendLog(jobId, `The running backup is tracked as job ${liveJob.id} — its logs are shown here.`);
             try {
               await appendLog(
                 liveJob.id,
-                `A scheduled run for ${vm.name} (${schedule.scheduleType}) was rejected at ${new Date().toISOString()} because this backup is still running`
+                `A scheduled ${schedule.scheduleType} run for ${vm.name} was due at ${new Date().toISOString()} and was skipped: this backup was still running (host reported: ${statusCheck.status}). No separate job was recorded.`
               );
             } catch (_) { /* best-effort */ }
           }
 
           if (this.io) {
-            this.io.emit('backup-rejected', rejectedJob || { id: jobId, status: 'rejected', vmName: vm.name });
+            // Drop any row the panel already rendered for the placeholder.
+            this.io.emit('job-removed', { jobId, vmName: vm.name, reason: 'already_running' });
           }
 
           return; // Don't trigger backup
@@ -1742,7 +2093,7 @@ class SchedulerService {
       // Notify RocketChat of scheduled backup failure
       const vms = await getVirtualMachines();
       const vm = vms.find(v => v.id === schedule.vmId);
-      if (vm) {
+      if (vm && await notificationPolicy.shouldNotify(schedule, 'backupFailure')) {
         rocketChatService.notifyScheduledBackupFailed(
           vm.name, 
           schedule.scheduleType, 
@@ -1849,6 +2200,9 @@ class SchedulerService {
         error: null,
         scheduled: true,
         offsiteTargets: resolved,
+        // Custom-days runs are scheduled backups like any other and must carry
+        // the same retry budget; without it they were never retried on failure.
+        ...this._retryMetaFor(schedule),
       };
 
       const jobs = await getBackupJobs();
@@ -1894,6 +2248,8 @@ class SchedulerService {
       backupData.diskUsageThreshold = pool.diskUsageThreshold ?? 80;
       backupData.retention = schedule.retention || schedule.retentionCount || 7;
       backupData.keepArchive = schedule.keepArchive || 2;
+      backupData.offsiteRetryAttempts = schedule.offsiteRetryAttempts || 3;
+      backupData.offsiteRetryBackoffSeconds = schedule.offsiteRetryBackoffSeconds || 15;
       backupData.compression = schedule.compression || 2;
 
       // Offsite targets resolved above: send the shell-safe ip:path encoding.
@@ -1918,7 +2274,7 @@ class SchedulerService {
       // Notify RocketChat of scheduled backup failure
       const vms = await getVirtualMachines();
       const vm = vms.find(v => v.id === schedule.vmId);
-      if (vm) {
+      if (vm && await notificationPolicy.shouldNotify(schedule, 'backupFailure')) {
         rocketChatService.notifyScheduledBackupFailed(
           vm.name, 
           'custom-days', 
@@ -2036,6 +2392,20 @@ class SchedulerService {
     return false;
   }
 
+  /**
+   * Cancel a pending offsite resync for a specific job.
+   */
+  cancelOffsiteRetry(jobId) {
+    const timer = this._offsiteRetryTimers.get(jobId);
+    if (timer) {
+      clearTimeout(timer);
+      this._offsiteRetryTimers.delete(jobId);
+      console.log(`[Scheduler] Cancelled offsite resync timer for job ${jobId}`);
+      return true;
+    }
+    return false;
+  }
+
   shutdown() {
     console.log('Shutting down scheduler...');
     if (this.healthCheckInterval) {
@@ -2046,6 +2416,11 @@ class SchedulerService {
       clearTimeout(timer);
     }
     this._retryTimers.clear();
+    // ...and any pending offsite resync timers
+    for (const [jobId, timer] of this._offsiteRetryTimers) {
+      clearTimeout(timer);
+    }
+    this._offsiteRetryTimers.clear();
     this.tasks.forEach(task => task.stop());
     this.tasks.clear();
     this.customDaysTasks.forEach(tasks => tasks.forEach(t => t.stop()));

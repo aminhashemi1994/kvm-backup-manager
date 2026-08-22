@@ -21,6 +21,7 @@ const {
 const agentService = require('../services/agentService');
 const backupCycleService = require('../services/backupCycleService');
 const rocketChatService = require('../services/rocketChatService');
+const notificationPolicy = require('../services/notificationPolicyService');
 const auditService = require('../services/auditService');
 const schedulerService = require('../services/schedulerService');
 const { validateBackupTrigger } = require('../utils/validator');
@@ -658,15 +659,27 @@ async function ingestOffsiteSyncResults(job, offsiteResults) {
     // (Req 6.4). notifyOffsiteSyncFailed(name, offsiteHost, error) is reused;
     // we pass a descriptive destination string including schedule + pool.
     const scheduleLabel = schedule.name || schedule.vmName || `schedule ${schedule.id}`;
-    for (const n of notifications) {
-      try {
-        rocketChatService.notifyOffsiteSyncFailed(
-          `${job.vmName || scheduleLabel} (schedule: ${scheduleLabel})`,
-          `${n.hostName} / pool ${n.poolName}`,
-          n.reason
-        );
-      } catch (err) {
-        console.error(`[Backups] Failed to send offsite sync failure notification: ${err.message}`);
+    // A run where SOME destinations succeeded is a partial sync, which is a
+    // separate (and separately mutable) event from a total offsite failure.
+    const anySuccess = Array.isArray(offsiteResults)
+      && offsiteResults.some(r => classify(r) === 'success');
+    const offsiteEvent = anySuccess ? 'offsitePartial' : 'offsiteFailure';
+    const sendOffsite = await notificationPolicy.shouldNotify(schedule, offsiteEvent);
+
+    if (sendOffsite) {
+      for (const n of notifications) {
+        try {
+          rocketChatService.notifyOffsiteSyncFailed(
+            // The VM alone: the schedule label repeated the VM name verbatim,
+            // which doubled the length of every offsite message for no gain.
+            job.vmName || scheduleLabel,
+            `${n.hostName} / pool ${n.poolName}`,
+            n.reason,
+            schedule.id
+          );
+        } catch (err) {
+          console.error(`[Backups] Failed to send offsite sync failure notification: ${err.message}`);
+        }
       }
     }
 
@@ -1095,6 +1108,8 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       noVerify = false,
       offsiteHostIds = [],
       offsiteTargets = [],
+      offsiteRetryAttempts = 3,
+      offsiteRetryBackoffSeconds = 15,
       verbose = false
     } = req.body;
 
@@ -1290,6 +1305,8 @@ router.post('/trigger', requireUser, async (req, res, next) => {
         scheduleType,
         retention,
         keepArchive,
+        offsiteRetryAttempts,
+        offsiteRetryBackoffSeconds,
         compression: compression || 2,
         noCompression: noCompression || false,
         noVerify: noVerify || false,
@@ -1455,7 +1472,7 @@ router.post('/trigger-scheduled', async (req, res, next) => {
 // POST /api/backups/jobs/:id/update - Update job status (called by agent)
 router.post('/jobs/:id/update', async (req, res, next) => {
   try {
-    const { status, exitCode, error, logLine, progress, progressText, failureReason, offsiteResults, progressType } = req.body;
+    const { status, exitCode, error, logLine, progress, progressText, failureReason, offsiteResults, progressType, verdictAlreadyReported, failureStage, offsiteSyncStatus: reportedOffsiteStatus } = req.body;
     
     // Apply the agent report inside a single atomic read-modify-write.
     // The agent posts one of these per running job roughly every second; a
@@ -1464,14 +1481,85 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     // handler saving a whole stale array is what used to drop jobs the
     // reconciler had just adopted from a live tmux session).
     let job = null;
+    let offsiteRetryFinished = false;
     await updateBackupJobs((jobs) => {
       job = jobs.find(j => j.id === req.params.id);
       if (!job) return false; // nothing to write
 
+      // ── Offsite-only resync in flight ────────────────────────────────
+      // The controller re-triggered this SAME job id with offsiteOnly=true to
+      // retry a failed/partial offsite sync. The agent reports normal backup
+      // statuses for that run, but no backup is happening — the original
+      // backup already finished and its verdict is final. Apply only the
+      // offsite-related fields so a failing resync can never flip a
+      // successful backup to 'failed' (or resurrect a finished job as
+      // 'running').
+      if (job.offsiteRetryInFlight) {
+        if (progress !== undefined) job.offsiteRetryProgress = progress;
+        if (progressText !== undefined) {
+          job.offsiteRetryProgressText = stripAnsi(progressText, { singleLine: true });
+        }
+        job.lastProgressAt = new Date().toISOString();
+
+        // Merge per-host outcomes: a retry only targets the hosts that
+        // previously failed, so replacing the array would erase the hosts
+        // that already succeeded on the original run.
+        if (Array.isArray(offsiteResults) && offsiteResults.length > 0) {
+          const merged = Array.isArray(job.offsiteResults) ? [...job.offsiteResults] : [];
+          for (const r of offsiteResults) {
+            const i = merged.findIndex(m => m && r && m.ip === r.ip && (m.poolPath || '') === (r.poolPath || ''));
+            if (i >= 0) merged[i] = r;
+            else merged.push(r);
+          }
+          job.offsiteResults = merged;
+        }
+
+        const terminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+        if (terminal) {
+          job.offsiteRetryInFlight = false;
+          job.offsiteRetryAt = null;
+          job.phase = null;
+
+          const results = Array.isArray(job.offsiteResults) ? job.offsiteResults : [];
+          if (results.length > 0) {
+            const ok = results.filter(r => r.status === 'success').length;
+            job.offsiteSyncStatus = ok === results.length
+              ? 'completed'
+              : ok > 0 ? 'partial' : 'failed';
+          } else {
+            job.offsiteSyncStatus = status === 'completed' ? 'completed' : 'failed';
+          }
+          offsiteRetryFinished = true;
+        } else {
+          job.offsiteSyncStatus = 'running';
+          job.phase = 'rsync';
+        }
+        return true;
+      }
+
+      // The agent already reported this run's failure (the backup phase failed
+      // and the script stayed busy with its post-failure offsite sync). This is
+      // the same verdict arriving again at script exit: take the offsite
+      // outcomes it carries, but leave the status/retry decision alone so the
+      // pending retry isn't duplicated or overwritten.
+      if (verdictAlreadyReported && status === 'failed') {
+        if (Array.isArray(offsiteResults) && offsiteResults.length > 0) {
+          job.offsiteResults = offsiteResults;
+          const ok = offsiteResults.filter(r => r.status === 'success').length;
+          job.offsiteSyncStatus = ok === offsiteResults.length
+            ? 'completed'
+            : ok > 0 ? 'partial' : 'failed';
+        }
+        if (exitCode !== undefined) job.exitCode = exitCode;
+        job.phase = null;
+        job.lastProgressAt = new Date().toISOString();
+        return true;
+      }
+
       // Handle status updates
       if (status) {
         console.log(`[Backups] Job ${job.id} received status update: ${status}, current status: ${job.status}`);
-      
+
         // For scheduled backups with retry capability, check if we should mark as "retrying" instead of "failed"
         if (status === 'failed' && job.scheduled && job.scheduleId) {
           const attempt = job.attemptNumber || 1;
@@ -1553,6 +1641,22 @@ router.post('/jobs/:id/update', async (req, res, next) => {
           : ok > 0 ? 'partial' : 'failed';
       }
 
+      // The agent can report an offsite verdict that differs from the backup's
+      // own outcome (backup fine, replication not).
+      if (reportedOffsiteStatus) job.offsiteSyncStatus = reportedOffsiteStatus;
+
+      // Which stage failed. `failureReason` says WHY (interrupted, script_error);
+      // `failureStage` says WHERE — so a backup that succeeded but failed to
+      // replicate is no longer indistinguishable from a backup that never ran.
+      if (failureStage) {
+        job.failureStage = failureStage;
+      } else if (job.status === 'completed' &&
+                 (job.offsiteSyncStatus === 'failed' || job.offsiteSyncStatus === 'partial')) {
+        job.failureStage = 'offsite';
+      } else if (job.status === 'completed' && job.offsiteSyncStatus === 'completed') {
+        job.failureStage = null;
+      }
+
       // Record the last time we heard from the agent about this job. Used by the
       // monitoring service to detect *inactivity* (a genuinely hung backup or
       // lost connectivity) instead of naively alerting on total runtime — a
@@ -1597,6 +1701,56 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     }
 
     const io = req.app.get('io');
+
+    // Offsite-only resync: this run says nothing about the backup itself, so
+    // it must not drive backup-complete/backup-error events, RocketChat
+    // notifications, backup auto-retry, or concurrency-slot release. Emit a
+    // plain job update and, once the resync settles, record the outcome and
+    // schedule the next offsite attempt if hosts are still failing.
+    if (job.offsiteRetryInFlight || offsiteRetryFinished) {
+      io.emit('job-updated', job);
+
+      if (offsiteRetryFinished) {
+        if (Array.isArray(job.offsiteResults) && job.offsiteResults.length > 0) {
+          ingestOffsiteSyncResults(job, job.offsiteResults).catch(err => {
+            console.error(`[Backups] Failed to ingest offsite sync results for job ${job.id}: ${err.message}`);
+          });
+        }
+        if (job.offsiteSyncStatus === 'failed' || job.offsiteSyncStatus === 'partial') {
+          schedulerService.handleOffsiteSyncFailure(job).catch(err => {
+            console.error('[Backups] Failed to schedule offsite resync:', err.message);
+          });
+        }
+      }
+
+      return res.json({ success: true, data: job });
+    }
+
+    // Repeat of a verdict already reported early. The failure was announced
+    // (and its retry scheduled) when the backup phase failed; all that is new
+    // here is the offsite outcome and the fact that the session finally ended.
+    // Record the offsite result and free the slot — but don't re-notify and
+    // don't schedule a second retry for the same attempt.
+    if (verdictAlreadyReported && status === 'failed') {
+      io.emit('job-updated', job);
+
+      if (offsiteResults) {
+        ingestOffsiteSyncResults(job, offsiteResults).catch(err => {
+          console.error(`[Backups] Failed to ingest offsite sync results for job ${job.id}: ${err.message}`);
+        });
+      }
+      if (job.offsiteSyncStatus === 'failed' || job.offsiteSyncStatus === 'partial') {
+        schedulerService.handleOffsiteSyncFailure(job).catch(err => {
+          console.error('[Backups] Failed to schedule offsite resync:', err.message);
+        });
+      }
+      schedulerService.releaseConcurrentSlotsOnHost(job.backupHostId).catch(err => {
+        console.error('[Backups] Failed to release concurrent slots:', err.message);
+      });
+
+      return res.json({ success: true, data: job });
+    }
+
     io.to(`job-${req.params.id}`).emit('backup-progress', {
       jobId: req.params.id,
       status: job.status,
@@ -1615,7 +1769,11 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       
       // Include retry information in notification
       const retryInfo = job.wasRetried ? ` (succeeded on attempt ${job.succeededOnAttempt})` : '';
-      rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration + retryInfo);
+      notificationPolicy.shouldNotify(job.scheduleId || null, 'backupSuccess').then(send => {
+        if (send) rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration + retryInfo, job.scheduleId || null);
+      }).catch(() => {
+        rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration + retryInfo, job.scheduleId || null);
+      });
 
       // Primary backup succeeded — check whether any offsite host/pool sync was
       // skipped or failed and record a resilience warning + notification on the
@@ -1631,9 +1789,16 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       // Only emit backup-error if truly failed (not retrying)
       io.emit('backup-error', job);
 
-      // Notify RocketChat
+      // Notify RocketChat. A backup that failed only at the offsite stage is
+      // announced as an offsite problem, not a failed backup — different
+      // event, and separately mutable.
       const retryInfo = job.retriesExhausted ? ' (all retries exhausted)' : '';
-      rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', (job.error || 'Unknown error') + retryInfo);
+      const failEvent = job.failureStage === 'offsite' ? 'offsiteFailure' : 'backupFailure';
+      notificationPolicy.shouldNotify(job.scheduleId || null, failEvent).then(send => {
+        if (send) rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', (job.error || 'Unknown error') + retryInfo, job.scheduleId || null);
+      }).catch(() => {
+        rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', (job.error || 'Unknown error') + retryInfo, job.scheduleId || null);
+      });
 
       // The offsite sync runs even when the backup fails (it replicates the
       // VM's existing chain). Record its per-host outcomes on the schedule
@@ -1655,6 +1820,17 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     if (status === 'failed' && job.scheduled && job.scheduleId && job.status === 'retrying') {
       schedulerService.handleScheduledBackupFailure(job).catch(err => {
         console.error('[Backups] Failed to schedule auto-retry:', err.message);
+      });
+    }
+
+    // The offsite sync failed (or only partly succeeded) while the run itself
+    // reached a terminal state. Schedule an offsite-only resync so the backup
+    // still lands offsite without waiting for the next scheduled run — offsite
+    // replication is the whole point of having a DR copy.
+    if ((job.status === 'completed' || job.status === 'failed') &&
+        (job.offsiteSyncStatus === 'failed' || job.offsiteSyncStatus === 'partial')) {
+      schedulerService.handleOffsiteSyncFailure(job).catch(err => {
+        console.error('[Backups] Failed to schedule offsite resync:', err.message);
       });
     }
 
@@ -2037,6 +2213,8 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       storagePoolName: pool.name,
       retention: schedule?.retention ?? originalJob.retention ?? 7,
       keepArchive: schedule?.keepArchive ?? originalJob.keepArchive ?? 2,
+      offsiteRetryAttempts: schedule?.offsiteRetryAttempts ?? originalJob.offsiteRetryAttempts ?? 3,
+      offsiteRetryBackoffSeconds: schedule?.offsiteRetryBackoffSeconds ?? originalJob.offsiteRetryBackoffSeconds ?? 15,
       compression: schedule?.compression ?? originalJob.compression ?? 2,
       noCompression: originalJob.noCompression || false,
       noVerify: originalJob.noVerify || false,
@@ -2145,6 +2323,8 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
         diskUsageThreshold: pool.diskUsageThreshold ?? 80,
         retention: retryJob.retention,
         keepArchive: retryJob.keepArchive,
+        offsiteRetryAttempts: retryJob.offsiteRetryAttempts,
+        offsiteRetryBackoffSeconds: retryJob.offsiteRetryBackoffSeconds,
         compression: retryJob.compression,
         noCompression: retryJob.noCompression,
         noVerify: retryJob.noVerify,

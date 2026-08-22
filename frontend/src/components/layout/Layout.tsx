@@ -2,6 +2,7 @@ import { ReactNode, useEffect } from 'react'
 import Sidebar from './Sidebar'
 import Header from './Header'
 import CommandPalette from './CommandPalette'
+import CertificateAlertBanner from '@/components/common/CertificateAlertBanner'
 import { useSocket, useSocketEvent } from '@/hooks/useSocket'
 import { debouncedInvalidate } from '@/lib/debouncedInvalidate'
 import { useQueryClient } from '@tanstack/react-query'
@@ -78,7 +79,11 @@ export default function Layout({ children }: LayoutProps) {
       
       <div className="flex-1 flex flex-col overflow-hidden min-w-0">
         <Header />
-        
+
+        {/* Sits above the content on every page: a certificate problem is
+            invisible everywhere else, because backups keep running through it. */}
+        <CertificateAlertBanner />
+
         <main className="flex-1 overflow-y-auto overflow-x-auto p-4 sm:p-6">
           <div className="page-enter page-enter-active min-w-0">
             {children}

@@ -32,6 +32,7 @@ const storagePoolsRoutes = require('./routes/storagePools');
 const restoreStoragePoolsRoutes = require('./routes/restoreStoragePools');
 const restoreRoutes = require('./routes/restore');
 const healthCheckRoutes = require('./routes/healthCheck');
+const certificatesRoutes = require('./routes/certificates');
 const usersRoutes = require('./routes/users');
 const auditRoutes = require('./routes/audit');
 const { router: notificationsRoutes, loadSettings: loadNotificationSettings } = require('./routes/notifications');
@@ -43,6 +44,8 @@ const offsiteMigrationService = require('./services/offsiteMigrationService');
 const monitoringService = require('./services/monitoringService');
 const remoteMetricsService = require('./services/remoteMetricsService');
 const healthCheckService = require('./services/healthCheckService');
+const certificateMonitorService = require('./services/certificateMonitorService');
+const notificationAggregator = require('./services/notificationAggregator');
 const storagePoolRefreshService = require('./services/storagePoolRefreshService');
 const restoreStoragePoolRefreshService = require('./services/restoreStoragePoolRefreshService');
 const startupRecoveryService = require('./services/startupRecoveryService');
@@ -119,6 +122,18 @@ loadNotificationSettings().then((settings) => {
     rocketChatService.reloadConfig(settings.rocketChat);
     console.log('✓ Notification settings loaded');
   }
+  // Per-type switches must be applied at boot too, not only after a save —
+  // otherwise every notification reverts to its built-in default on restart.
+  if (settings) {
+    rocketChatService.setTypeSettings(settings.types);
+    // Same reason as the type switches: without this every message would go out
+    // with nobody @-mentioned until someone re-saved the settings page.
+    rocketChatService.setMentionSettings(settings.mentions);
+    const off = Object.entries(rocketChatService.types)
+      .filter(([, on]) => on === false)
+      .map(([k]) => k);
+    console.log(`✓ Notification types: ${off.length} off${off.length ? ` (${off.join(', ')})` : ''}`);
+  }
 }).catch(err => {
   console.error('Failed to load notification settings:', err);
 });
@@ -148,6 +163,7 @@ app.use('/api/storage-pools', authenticateUser, storagePoolsRoutes);
 app.use('/api/restore-storage-pools', authenticateUser, restoreStoragePoolsRoutes);
 app.use('/api/restore', authenticateUser, restoreRoutes);
 app.use('/api/health-check', authenticateUser, healthCheckRoutes);
+app.use('/api/certificates', authenticateUser, certificatesRoutes);
 app.use('/api/users', authenticateUser, usersRoutes);
 app.use('/api/audit', authenticateUser, auditRoutes);
 app.use('/api/cleanup', authenticateUser, require('./routes/cleanup'));
@@ -239,6 +255,13 @@ auditService.initialize().catch(err => {
   console.error('[Audit] Failed to initialize:', err.message);
 });
 
+// Collapse notification bursts into one message per root cause. Must come up
+// before the services that emit notifications, or an early failure would be
+// sent ungrouped.
+notificationAggregator.initialize().catch(err => {
+  console.error('[NotifAgg] Failed to initialize:', err.message);
+});
+
 // Start monitoring service
 monitoringService.initialize();
 
@@ -247,6 +270,11 @@ remoteMetricsService.initialize();
 
 // Start health check service
 healthCheckService.initialize();
+
+// Start certificate expiry monitor. The agents are built to survive an expired
+// certificate rather than stop, which removes the outage but also removes the
+// symptom — this is what makes the degradation loud instead of silent.
+certificateMonitorService.initialize(io);
 
 // Start storage pool refresh service
 storagePoolRefreshService.initialize();
@@ -335,6 +363,9 @@ process.on('SIGTERM', () => {
     monitoringService.shutdown();
     remoteMetricsService.shutdown();
     healthCheckService.shutdown();
+    certificateMonitorService.shutdown();
+    // Flush anything still buffered rather than losing it on restart.
+    notificationAggregator.shutdown();
     storagePoolRefreshService.shutdown();
     restoreStoragePoolRefreshService.shutdown();
     reportEnrichmentService.shutdown();
@@ -350,6 +381,9 @@ process.on('SIGINT', () => {
     monitoringService.shutdown();
     remoteMetricsService.shutdown();
     healthCheckService.shutdown();
+    certificateMonitorService.shutdown();
+    // Flush anything still buffered rather than losing it on restart.
+    notificationAggregator.shutdown();
     storagePoolRefreshService.shutdown();
     restoreStoragePoolRefreshService.shutdown();
     reportEnrichmentService.shutdown();
