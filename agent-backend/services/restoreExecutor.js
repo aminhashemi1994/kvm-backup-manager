@@ -796,7 +796,19 @@ class RestoreExecutor {
           }
         }
       }
-      console.error(`[Restore] CRITICAL: could not report terminal status '${status}' for ${restoreId} after ${attempts} attempts: ${lastErr && lastErr.message}`);
+      // Spool rather than drop — see controllerOutbox. A lost terminal update
+      // leaves the restore showing as running indefinitely.
+      console.error(`[Restore] CRITICAL: could not report terminal status '${status}' for ${restoreId} after ${attempts} attempts: ${lastErr && lastErr.message}. Queued for durable retry.`);
+      try {
+        require('./controllerOutbox').enqueue({
+          endpoint: `/restore/jobs/${restoreId}/update`,
+          payload,
+          dedupeKey: `restore-job:${restoreId}`,
+          description: `restore job ${restoreId} -> ${status}`,
+        });
+      } catch (queueErr) {
+        console.error(`[Restore] Failed to queue terminal status for ${restoreId}: ${queueErr.message}`);
+      }
     } catch (err) {
       // Don't log every progress update failure to avoid spam
       if (status !== 'running' || !progress) {

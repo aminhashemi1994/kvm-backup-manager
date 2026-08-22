@@ -113,6 +113,9 @@ export const offsiteHostsApi = {
   update: (id: string, data: any) => api.put(`/offsite-hosts/${id}`, data),
   delete: (id: string) => api.delete(`/offsite-hosts/${id}`),
   test: (id: string) => api.post(`/offsite-hosts/${id}/test`),
+  // Installs dependencies on the OFFSITE machine, via its owning backup host's
+  // agent. Takes the offsite host's own id — not a backup host id.
+  init: (id: string) => api.post(`/offsite-hosts/${id}/init`),
   sync: (id: string, vmName: string) => api.post(`/offsite-hosts/${id}/sync/${vmName}`),
   // Offsite host storage pools (embedded in the offsite host record)
   listPools: (hostId: string) => api.get(`/offsite-hosts/${hostId}/pools`),
@@ -287,6 +290,12 @@ export const notificationsApi = {
   getSettings: () => api.get('/notifications/settings'),
   saveSettings: (settings: any) => api.put('/notifications/settings', settings),
   sendTest: () => api.post('/notifications/test'),
+}
+
+// TLS certificate expiry monitoring
+export const certificatesApi = {
+  getStatus: () => api.get('/certificates/status'),
+  check: () => api.post('/certificates/check'),
 }
 
 // General system settings (panel-managed defaults)

@@ -3,6 +3,8 @@ const router = express.Router();
 const os = require('os');
 const backupExecutor = require('../services/backupExecutor');
 const concurrencyConfigSyncService = require('../services/concurrencyConfigSyncService');
+const controllerTlsService = require('../services/controllerTlsService');
+const controllerOutbox = require('../services/controllerOutbox');
 
 // GET /api/health - Health check
 router.get('/', async (req, res) => {
@@ -33,6 +35,11 @@ router.get('/', async (req, res) => {
       active: backupExecutor.getActiveJobs().length,
       queued: backupExecutor.getQueuedJobs().length,
     },
+    // The controller polls this on its health-check loop, so a degraded
+    // certificate on the agent's side of the link surfaces in the panel even
+    // when the controller's own cert is fine.
+    tls: controllerTlsService.getState(),
+    outbox: controllerOutbox.getStatus(),
   });
 });
 

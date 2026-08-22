@@ -15,6 +15,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { useQuery } from '@tanstack/react-query'
 import { storagePoolsApi, hypervisorsApi } from '@/services/api'
 import { toast } from 'sonner'
+import { NOTIFICATION_EVENTS, type NotificationEventToggles } from '@/types'
 
 interface ScheduleFormProps {
   schedule?: any
@@ -71,7 +72,23 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     // Auto-retry on failure
     retryCount: typeof schedule?.retryCount === 'number' ? schedule.retryCount : 3,
     retryDelayMinutes: typeof schedule?.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
-    
+
+    // Offsite rsync retry (script-level, per offsite host)
+    offsiteRetryAttempts: typeof schedule?.offsiteRetryAttempts === 'number' ? schedule.offsiteRetryAttempts : 3,
+    offsiteRetryBackoffSeconds: typeof schedule?.offsiteRetryBackoffSeconds === 'number' ? schedule.offsiteRetryBackoffSeconds : 15,
+
+    // Controller-level offsite-only resync. '' means inherit the backup retry
+    // settings, which is what these schedules did before the fields existed.
+    offsiteResyncAttempts: typeof schedule?.offsiteResyncAttempts === 'number' ? schedule.offsiteResyncAttempts : '' as number | '',
+    offsiteResyncDelayMinutes: typeof schedule?.offsiteResyncDelayMinutes === 'number' ? schedule.offsiteResyncDelayMinutes : '' as number | '',
+
+    // RocketChat usernames to @-mention on failure. Comma-separated in the
+    // form, stored as an array. Empty = inherit the global list.
+    notifyMentions: Array.isArray(schedule?.notifyMentions) ? schedule.notifyMentions.join(', ') : '',
+
+    // Per-event notification overrides. Absent key = inherit global setting.
+    notifications: (schedule?.notifications || {}) as NotificationEventToggles,
+
     // Offsite - Changed to support multiple hosts
     syncToOffsite: false,
     offsiteHostIds: [] as string[], // Changed from offsiteHostId to offsiteHostIds array
@@ -221,6 +238,12 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
           ? schedule.missedRunGracePeriodMinutes : 360,
         retryCount: typeof schedule.retryCount === 'number' ? schedule.retryCount : 3,
         retryDelayMinutes: typeof schedule.retryDelayMinutes === 'number' ? schedule.retryDelayMinutes : 5,
+        offsiteRetryAttempts: typeof schedule.offsiteRetryAttempts === 'number' ? schedule.offsiteRetryAttempts : 3,
+        offsiteRetryBackoffSeconds: typeof schedule.offsiteRetryBackoffSeconds === 'number' ? schedule.offsiteRetryBackoffSeconds : 15,
+        offsiteResyncAttempts: typeof schedule.offsiteResyncAttempts === 'number' ? schedule.offsiteResyncAttempts : '',
+        offsiteResyncDelayMinutes: typeof schedule.offsiteResyncDelayMinutes === 'number' ? schedule.offsiteResyncDelayMinutes : '',
+        notifyMentions: Array.isArray(schedule.notifyMentions) ? schedule.notifyMentions.join(', ') : '',
+        notifications: (schedule.notifications || {}) as NotificationEventToggles,
         // Derive syncToOffsite from presence of offsite targets
         syncToOffsite: schedule.syncToOffsite || 
           (Array.isArray(schedule.offsiteTargets) && schedule.offsiteTargets.length > 0) ||
@@ -352,6 +375,14 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         missedRunGracePeriodMinutes: formData.missedRunGracePeriodMinutes,
         retryCount: formData.retryCount,
         retryDelayMinutes: formData.retryDelayMinutes,
+        offsiteRetryAttempts: formData.offsiteRetryAttempts,
+        offsiteRetryBackoffSeconds: formData.offsiteRetryBackoffSeconds,
+        // Blank = inherit; send an explicit null so the API clears any override.
+        offsiteResyncAttempts: formData.offsiteResyncAttempts === '' ? null : formData.offsiteResyncAttempts,
+        offsiteResyncDelayMinutes: formData.offsiteResyncDelayMinutes === '' ? null : formData.offsiteResyncDelayMinutes,
+        notifications: formData.notifications,
+        notifyMentions: formData.notifyMentions
+          .split(',').map(v => v.trim().replace(/^@+/, '')).filter(Boolean),
         syncToOffsite: formData.syncToOffsite,
         // Primary field: one { offsiteHostId, offsitePoolId } per checked host.
         offsiteTargets: formData.syncToOffsite && offsiteTargets.length > 0 ? offsiteTargets : undefined,
@@ -1396,6 +1427,173 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                   </p>
                 </div>
               )}
+            </div>
+
+            {/* Offsite Sync Retry */}
+            {formData.syncToOffsite && (
+              <div className="space-y-4 p-4 border rounded-md bg-purple-50 dark:bg-purple-900/10 dark:border-purple-900/30">
+                <h3 className="font-medium text-sm flex items-center">
+                  <span className="mr-2">🔁</span>
+                  Offsite Sync Retry
+                </h3>
+                <p className="text-xs text-gray-600 dark:text-gray-400">
+                  If the offsite rsync fails (slow or dropped network, busy offsite host), retry it
+                  in place before giving up — the VM backup is never redone. If every attempt still
+                  fails, the controller queues a full offsite-only resync on the slower cadence
+                  configured below.
+                </p>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="offsiteRetryAttempts">Rsync attempts per host</Label>
+                    <Input
+                      id="offsiteRetryAttempts"
+                      type="number"
+                      min="1"
+                      max="10"
+                      value={formData.offsiteRetryAttempts}
+                      onChange={(e) => setFormData({ ...formData, offsiteRetryAttempts: Math.max(1, Math.min(10, parseInt(e.target.value) || 1)) })}
+                    />
+                    <p className="text-xs text-gray-500">
+                      Total rsync attempts per offsite host (default 3, 1 = never retry).
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="offsiteRetryBackoffSeconds">Backoff base (seconds)</Label>
+                    <Input
+                      id="offsiteRetryBackoffSeconds"
+                      type="number"
+                      min="1"
+                      max="600"
+                      value={formData.offsiteRetryBackoffSeconds}
+                      onChange={(e) => setFormData({ ...formData, offsiteRetryBackoffSeconds: Math.max(1, Math.min(600, parseInt(e.target.value) || 15)) })}
+                    />
+                    <p className="text-xs text-gray-500">
+                      Doubled each attempt — 15s gives waits of 15s, then 30s (default 15).
+                    </p>
+                  </div>
+                </div>
+
+                <div className="pt-3 border-t border-purple-200 dark:border-purple-900/40 space-y-3">
+                  <div>
+                    <h4 className="text-sm font-medium">Controller resync (offsite only)</h4>
+                    <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
+                      After the rsync attempts above are exhausted, the controller re-runs just the
+                      replication — never the VM backup — on this slower cadence. The queued time is
+                      shown on the job in Active Backups and History. Leave blank to inherit the
+                      Retry on Failure settings above
+                      {typeof formData.retryCount === 'number' && typeof formData.retryDelayMinutes === 'number' && (
+                        <> (currently {formData.retryCount} attempt{formData.retryCount === 1 ? '' : 's'}, {formData.retryDelayMinutes} min apart)</>
+                      )}.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="offsiteResyncAttempts">Resync attempts</Label>
+                      <Input
+                        id="offsiteResyncAttempts"
+                        type="number"
+                        min="0"
+                        max="20"
+                        placeholder="Inherit"
+                        value={formData.offsiteResyncAttempts}
+                        onChange={(e) => {
+                          const raw = e.target.value
+                          setFormData({
+                            ...formData,
+                            offsiteResyncAttempts: raw === '' ? '' : Math.max(0, Math.min(20, parseInt(raw) || 0)),
+                          })
+                        }}
+                      />
+                      <p className="text-xs text-gray-500">
+                        How many offsite-only resyncs to queue before giving up (0 = never resync).
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label htmlFor="offsiteResyncDelayMinutes">Resync delay (minutes)</Label>
+                      <Input
+                        id="offsiteResyncDelayMinutes"
+                        type="number"
+                        min="0"
+                        max="1440"
+                        placeholder="Inherit"
+                        value={formData.offsiteResyncDelayMinutes}
+                        onChange={(e) => {
+                          const raw = e.target.value
+                          setFormData({
+                            ...formData,
+                            offsiteResyncDelayMinutes: raw === '' ? '' : Math.max(0, Math.min(1440, parseInt(raw) || 0)),
+                          })
+                        }}
+                      />
+                      <p className="text-xs text-gray-500">
+                        Wait before each queued resync. Use a longer wait when the offsite host is
+                        down for maintenance.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Notifications */}
+            <div className="space-y-4 p-4 border rounded-md bg-slate-50 dark:bg-slate-900/20 dark:border-slate-800">
+              <h3 className="font-medium text-sm flex items-center">
+                <span className="mr-2">🔔</span>
+                Notifications
+              </h3>
+              <p className="text-xs text-gray-600 dark:text-gray-400">
+                Choose which events send a message for this schedule. Leave an event on
+                <span className="font-medium"> Inherit </span>
+                to follow the system-wide default from Settings → Notifications.
+              </p>
+
+              <div className="space-y-2 pb-3 mb-1 border-b border-slate-200 dark:border-slate-800">
+                <Label htmlFor="notifyMentions">Notify these people (RocketChat)</Label>
+                <Input
+                  id="notifyMentions"
+                  placeholder="alice, bob"
+                  value={formData.notifyMentions}
+                  onChange={(e) => setFormData({ ...formData, notifyMentions: e.target.value })}
+                />
+                <p className="text-xs text-gray-500">
+                  Comma-separated usernames, @-mentioned at the top of failure messages for this
+                  schedule so someone is visibly on the hook. Leave blank to use the global list
+                  from Settings → Notifications.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                {NOTIFICATION_EVENTS.map(ev => {
+                  const current = formData.notifications[ev.key]
+                  const mode = typeof current === 'boolean' ? (current ? 'on' : 'off') : 'inherit'
+                  return (
+                    <div key={ev.key} className="flex items-center justify-between gap-4 py-1">
+                      <div className="min-w-0">
+                        <Label className="text-sm">{ev.label}</Label>
+                        <p className="text-xs text-gray-500">{ev.hint}</p>
+                      </div>
+                      <Select
+                        className="w-32 shrink-0"
+                        value={mode}
+                        onChange={(e) => {
+                          const next: NotificationEventToggles = { ...formData.notifications }
+                          if (e.target.value === 'inherit') delete next[ev.key]
+                          else next[ev.key] = e.target.value === 'on'
+                          setFormData({ ...formData, notifications: next })
+                        }}
+                      >
+                        <option value="inherit">Inherit</option>
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
+                      </Select>
+                    </div>
+                  )
+                })}
+              </div>
             </div>
           </div>
 

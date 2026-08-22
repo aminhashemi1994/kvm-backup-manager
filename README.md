@@ -360,8 +360,8 @@ PORT=3001
 HOST=0.0.0.0
 NODE_ENV=production
 
-# Controller URL
-CONTROLLER_URL=https://controller-server:3000
+# Controller URL — must include the /api prefix
+CONTROLLER_URL=https://controller-server:3000/api
 
 # JWT Secrets (from generate-jwt-secrets.sh)
 AGENT_JWT_SECRET=<your-agent-jwt-secret>  # MUST match controller!

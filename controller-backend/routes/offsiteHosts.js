@@ -243,8 +243,19 @@ router.post('/:id/test', async (req, res, next) => {
     const backupHosts = await getBackupHosts();
     const backupHost = backupHosts.find(h => h.id === host.backupHostId);
     
-    if (!backupHost || backupHost.status !== 'online') {
-      return res.status(400).json({ success: false, error: 'Backup host is offline' });
+    // Same split as the init route: a missing backup host and an offline one
+    // need different fixes, so they need different messages.
+    if (!backupHost) {
+      return res.status(400).json({
+        success: false,
+        error: `Offsite host "${host.name}" references backup host ${host.backupHostId}, which no longer exists. Re-assign it to a current backup host.`
+      });
+    }
+    if (backupHost.status !== 'online') {
+      return res.status(400).json({
+        success: false,
+        error: `Backup host "${backupHost.name}" is ${backupHost.status || 'not online'} — the test runs through its agent, so it must be online first.`
+      });
     }
 
     const hostUrl = ensureProtocol(backupHost.url);
@@ -274,8 +285,21 @@ router.post('/:id/init', async (req, res, next) => {
     const backupHosts = await getBackupHosts();
     const backupHost = backupHosts.find(h => h.id === host.backupHostId);
     
-    if (!backupHost || backupHost.status !== 'online') {
-      return res.status(400).json({ success: false, error: 'Backup host is offline' });
+    // Report these two separately. Collapsing them into "Backup host is
+    // offline" sends the operator to check a host that is up and reachable,
+    // when the real problem is that the offsite record points at a backup host
+    // id that no longer exists.
+    if (!backupHost) {
+      return res.status(400).json({
+        success: false,
+        error: `Offsite host "${host.name}" references backup host ${host.backupHostId}, which no longer exists. Re-assign it to a current backup host.`
+      });
+    }
+    if (backupHost.status !== 'online') {
+      return res.status(400).json({
+        success: false,
+        error: `Backup host "${backupHost.name}" is ${backupHost.status || 'not online'} — initialization runs through its agent, so it must be online first.`
+      });
     }
 
     // Call agent's init endpoint with offsite host IP

@@ -122,14 +122,30 @@ cleanup_schedule() {
     fi
     info "✓ No tmux session found for ${schedule}"
     
-    # Safety check 2: Verify no lock file exists for this schedule
+    # Safety check 2: Verify no LIVE backup holds the lock for this schedule.
+    #
+    # The lock file is created with `touch` and carries no PID, so its mere
+    # existence proves nothing: a backup killed mid-run (OOM, SIGKILL, reboot)
+    # leaves the lock behind forever. Treating that stale file as "a backup is
+    # running" made cleanup refuse permanently — the exact reason partial files
+    # had to be deleted by hand. Confirm liveness against the real process
+    # table (tmux was already checked above) before honouring the lock.
     local lock_file="$lock_dir/${vm_name}_${schedule}_backup"
     if [[ -f "$lock_file" ]]; then
-        warn "Skipping ${schedule}: Lock file exists at ${lock_file}"
-        warn "A backup process has the lock for this schedule"
-        return 1
+        if pgrep -f "virtnbdbackup.*${vm_name}" >/dev/null 2>&1 || \
+           pgrep -f "Backup_Manager.sh.*${vm_name}" >/dev/null 2>&1; then
+            warn "Skipping ${schedule}: a live backup process holds the lock"
+            return 1
+        fi
+
+        local lock_age=0
+        lock_age=$(( $(date +%s) - $(stat -c %Y "$lock_file" 2>/dev/null || echo 0) ))
+        warn "Stale lock file found for ${schedule} (age: ${lock_age}s) — no tmux session and no backup process"
+        info "Removing stale lock and continuing with cleanup"
+        rm -f "$lock_file" 2>/dev/null || true
+    else
+        info "✓ No lock file found for ${schedule}"
     fi
-    info "✓ No lock file found for ${schedule}"
     
     # NOW check if there are any partial files (AFTER safety checks)
     local partial_files=$(find "$backup_dir" -type f -name "*.partial" 2>/dev/null)

@@ -6,6 +6,8 @@ interface JobStatusBadgeProps {
   phase?: string
   jobType?: 'backup' | 'restore'
   failureReason?: string
+  /** Which stage failed. 'offsite' means the backup itself is fine. */
+  failureStage?: 'backup' | 'offsite' | null
   replay?: boolean
   className?: string
 }
@@ -23,6 +25,7 @@ export default function JobStatusBadge({
   phase,
   jobType = 'backup',
   failureReason,
+  failureStage,
   replay,
   className = '',
 }: JobStatusBadgeProps) {
@@ -81,6 +84,17 @@ export default function JobStatusBadge({
     // Terminal states
     switch (status) {
       case 'completed':
+        // The backup succeeded. If only replication failed, say so here rather
+        // than showing a plain green tick — but never call the backup failed,
+        // because it isn't. The OffsiteSyncBadge carries the detail.
+        if (failureStage === 'offsite') {
+          return {
+            label: 'Backed up · offsite failed',
+            icon: AlertTriangle,
+            color: 'bg-amber-100 text-amber-800 border-amber-200',
+            pulse: false,
+          }
+        }
         return {
           label: 'Completed',
           icon: CheckCircle,
@@ -89,7 +103,7 @@ export default function JobStatusBadge({
         }
       case 'failed':
         return {
-          label: failureReason === 'interrupted' ? 'Interrupted' : 'Failed',
+          label: failureReason === 'interrupted' ? 'Interrupted' : 'Backup failed',
           icon: AlertTriangle,
           color: 'bg-red-100 text-red-800 border-red-200',
           pulse: false,
@@ -137,7 +151,15 @@ export default function JobStatusBadge({
         className={`${config.color} flex items-center gap-1 text-xs font-medium ${
           config.pulse ? 'animate-pulse' : ''
         }`}
-        title={failureReason ? `Reason: ${failureReason}` : undefined}
+        title={
+          failureStage === 'offsite'
+            ? 'The backup completed successfully; only the offsite replication failed'
+            // 'already_running' is an internal enum, and showing it raw reads as
+            // an error code for something that is not an error. Spell it out.
+            : status === 'rejected'
+              ? 'This run never started — the VM was already being backed up by an earlier run. Nothing failed and no backup was lost.'
+              : failureReason ? `Reason: ${failureReason}` : undefined
+        }
       >
         <Icon className="h-3 w-3" />
         {config.label}

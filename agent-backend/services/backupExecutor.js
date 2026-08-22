@@ -562,6 +562,10 @@ class BackupExecutor {
       let finalStatus = 'failed';
       let finalExitCode = exitCode !== null ? exitCode : 1;
       let finalMessage = null;
+      // Which stage actually failed ('backup' | 'offsite'), and the offsite
+      // verdict when we can tell it apart from the backup's own outcome.
+      let finalStage = null;
+      let finalOffsiteStatus = null;
       
       if (exitCode === 0 || completedSuccessfully) {
         finalStatus = 'completed';
@@ -573,11 +577,17 @@ class BackupExecutor {
         finalExitCode = 0;
         console.log(`Job ${jobId} completed (no offsite sync) while agent was down`);
       } else if (backupCompleted && rsyncStarted && !rsyncCompleted) {
-        // Backup completed but rsync failed
-        finalStatus = 'failed';
-        finalExitCode = 1;
-        finalMessage = 'Backup created but offsite sync failed';
-        console.log(`Job ${jobId} failed during offsite sync while agent was down`);
+        // The BACKUP succeeded; only the offsite replication failed. Those are
+        // different failures with different remedies, and reporting this as a
+        // failed backup was wrong: it hid a perfectly good local backup behind
+        // a red "failed" and pushed the VM into the backup-retry path when
+        // what actually needed retrying was the sync.
+        finalStatus = 'completed';
+        finalExitCode = 0;
+        finalStage = 'offsite';
+        finalOffsiteStatus = 'failed';
+        finalMessage = 'Backup created successfully, but the offsite sync did not complete';
+        console.log(`Job ${jobId} backup OK but offsite sync failed while agent was down`);
       } else if (backupCompleted && rsyncCompleted) {
         // Both completed
         finalStatus = 'completed';
@@ -585,6 +595,7 @@ class BackupExecutor {
         console.log(`Job ${jobId} completed with offsite sync while agent was down`);
       } else if (hasError) {
         finalStatus = 'failed';
+        finalStage = 'backup';
         finalMessage = errorMessage || 'Backup failed with errors';
         console.log(`Job ${jobId} failed with errors while agent was down`);
       } else {
@@ -594,19 +605,26 @@ class BackupExecutor {
           finalExitCode = 0;
         } else {
           finalStatus = 'failed';
+          finalStage = 'backup';
           finalMessage = `Backup process exited with code ${exitCode || 'unknown'}`;
         }
         console.log(`Job ${jobId} finished with uncertain status (exit code: ${exitCode})`);
       }
-      
+
       // Clean up state
       this.deleteJobState(jobId);
-      
+
       // Update controller with final status
       if (finalStatus === 'completed') {
-        await this.updateController(jobId, 'completed', finalExitCode);
+        await this.updateController(
+          jobId, 'completed', finalExitCode, finalMessage, null, null, null, null, false,
+          { failureStage: finalStage, offsiteSyncStatus: finalOffsiteStatus }
+        );
       } else {
-        await this.updateController(jobId, 'failed', finalExitCode, finalMessage);
+        await this.updateController(
+          jobId, 'failed', finalExitCode, finalMessage, null, null, null, null, false,
+          { failureStage: finalStage }
+        );
       }
       
     } catch (error) {
@@ -1217,6 +1235,15 @@ class BackupExecutor {
       noCompression = false,
       noVerify = false,
       offsiteHosts = [],
+      // Per-offsite-host rsync retry: attempts before giving up on that host
+      // for this run, and the base (seconds) for the exponential backoff
+      // between attempts. Sourced from the schedule; see Backup_Manager.sh.
+      offsiteRetryAttempts = 3,
+      offsiteRetryBackoffSeconds = 15,
+      // Skip the VM backup entirely and only re-run the offsite sync. Used by
+      // the controller to retry a failed/partial offsite sync without redoing
+      // the (expensive) virtnbdbackup run.
+      offsiteOnly = false,
       verbose = false,
       storagePoolPath = null,
       diskUsageThreshold = null,  // Per-pool disk-usage guard (percent)
@@ -1369,6 +1396,24 @@ class BackupExecutor {
       if (encoded) {
         args.push('--offsite-ip', encoded);
         log(`Offsite hosts: ${encoded}`);
+
+        // Per-host rsync retry. Only meaningful when there's an offsite
+        // target, so it rides along with --offsite-ip.
+        const attempts = parseInt(offsiteRetryAttempts, 10);
+        if (Number.isFinite(attempts) && attempts >= 1 && attempts <= 10) {
+          args.push('--offsite-retry-attempts', String(attempts));
+        }
+        const backoff = parseInt(offsiteRetryBackoffSeconds, 10);
+        if (Number.isFinite(backoff) && backoff >= 1 && backoff <= 600) {
+          args.push('--offsite-retry-backoff-base', String(backoff));
+        }
+        log(`Offsite rsync retry: ${attempts} attempt(s), ${backoff}s backoff base`);
+
+        // Offsite-only resync: no virtnbdbackup, just replicate what's on disk.
+        if (offsiteOnly) {
+          args.push('--offsite-only');
+          log('Offsite-only mode: skipping VM backup, re-syncing existing data');
+        }
       }
     }
 
@@ -1407,6 +1452,29 @@ class BackupExecutor {
 
     const command = `bash ${scriptPath} ${args.join(' ')}`;
     
+    // Run banner, written straight to the job log (and the socket) rather than
+    // through tmux. The flat log accumulates across runs that share a job id —
+    // a scheduled retry, and above all an offsite-only resync — so without an
+    // explicit boundary the resync's output is indistinguishable from the
+    // original backup's, and if tmux capture misses anything the resync looks
+    // like it never happened. This line always lands, even if the pane dies
+    // immediately.
+    log('');
+    log('═'.repeat(60));
+    if (offsiteOnly) {
+      log(`OFFSITE-ONLY RESYNC — replicating existing data, no VM backup`);
+    } else {
+      log(`BACKUP RUN — ${vmName} (${scheduleType})`);
+    }
+    log(`Started: ${new Date().toISOString()}`);
+    // Where the script keeps its own complete log, which survives the agent
+    // and the tmux session entirely. Worth printing: it is the thing to read
+    // when the captured log is short or missing.
+    if (storagePoolPath && vmName && scheduleType) {
+      log(`Script log dir: ${path.join(storagePoolPath, vmName, scheduleType, 'logs')}`);
+    }
+    log('═'.repeat(60));
+
     log(`Creating tmux session: ${tmuxSession}`);
     log(`Executing: ${command}`);
     log(`VM Name: ${vmName}`);
@@ -1443,10 +1511,15 @@ class BackupExecutor {
         // attempt's verdict (a running retry wrongly reconciled as failed) before
         // the shell writes its own code below.
         try { if (fs.existsSync(exitCodeFile)) fs.unlinkSync(exitCodeFile); } catch (_) { /* best effort */ }
-        await execAsync(`tmux send-keys -t ${tmuxSession} "cd '${storagePoolPath}' && ${command}; echo \\$? > '${exitCodeFile}'; exit" C-m`);
-
-        // Capture tmux output to log file
+        // Attach the capture BEFORE starting the command. Doing it the other
+        // way round loses everything the script prints between exec and the
+        // pipe being wired up — usually harmless for a multi-minute backup,
+        // but an offsite-only resync that fails fast (offsite host refusing
+        // the connection, say) can run and exit inside that window, leaving
+        // the job log with no trace of the resync at all.
         await execAsync(`tmux pipe-pane -t ${tmuxSession} -o "cat >> '${logFile}'"`);
+
+        await execAsync(`tmux send-keys -t ${tmuxSession} "cd '${storagePoolPath}' && ${command}; echo \\$? > '${exitCodeFile}'; exit" C-m`);
       });
 
       log(`Backup started in tmux session: ${tmuxSession}`);
@@ -1485,8 +1558,38 @@ class BackupExecutor {
    * Monitor tmux session for completion and progress
    */
   monitorTmuxSession(jobId, tmuxSession, jobData, logFile, logStream) {
-    const { vmName, scheduleType, storagePoolPath } = jobData;
+    const { vmName, scheduleType, storagePoolPath, offsiteOnly } = jobData;
     const monitorStartMs = Date.now();
+
+    // Closing summary for the job log. The tmux pane is gone by the time we
+    // know the outcome, so the verdict — and for a resync the per-host sync
+    // result — has to be written here or it is never recorded anywhere the
+    // operator can see. Writes straight to the file, no tmux involved.
+    // Appends straight to the file rather than through logStream: by the time
+    // the outcome is known the stream has already been end()ed above, and a
+    // write after end would raise an unhandled stream error.
+    const logSummary = (exitCode, offsiteResults) => {
+      try {
+        const ts = new Date().toISOString();
+        const lines = ['', '─'.repeat(60)];
+        lines.push(offsiteOnly
+          ? `OFFSITE-ONLY RESYNC FINISHED — exit code ${exitCode}`
+          : `RUN FINISHED — exit code ${exitCode}`);
+        if (Array.isArray(offsiteResults) && offsiteResults.length > 0) {
+          lines.push('Offsite sync result per host:');
+          for (const r of offsiteResults) {
+            lines.push(`  ${r.ip}: ${r.status}${r.reason ? ` (${r.reason})` : ''}`);
+          }
+        } else if (offsiteOnly) {
+          lines.push('Offsite sync result: no per-host outcome was recorded by the script.');
+        }
+        lines.push(`Finished: ${ts}`);
+        lines.push('─'.repeat(60), '');
+        const entry = lines.map(l => `[${ts}] ${l}`).join('\n') + '\n';
+        fs.appendFileSync(logFile, entry);
+        this.io.to(`job-${jobId}`).emit('backup-log', { jobId, timestamp: ts, message: lines.join('\n') });
+      } catch (_) { /* never let logging break completion handling */ }
+    };
 
     console.log(`Starting monitoring for job ${jobId} in tmux session ${tmuxSession}`);
     
@@ -1496,7 +1599,12 @@ class BackupExecutor {
     console.log(`Progress file: ${progressFile}`);
     
     let progressCheckCount = 0;
-    
+
+    // Set once we've told the controller the backup phase failed while the
+    // script was still busy with its post-failure offsite sync, so the final
+    // exit-code report doesn't repeat the same verdict.
+    let earlyFailureReported = false;
+
     // Read progress file periodically
     const progressInterval = setInterval(() => {
       progressCheckCount++;
@@ -1556,7 +1664,26 @@ class BackupExecutor {
         // Check if tmux session still exists
         try {
           await execAsync(`tmux has-session -t ${tmuxSession} 2>/dev/null`);
-          // Session still exists, continue monitoring
+          // Session still exists, continue monitoring.
+          //
+          // The backup phase may already have failed while the script carries
+          // on with its post-failure offsite sync. Report that verdict NOW
+          // rather than when the session finally ends: on a large chain the
+          // offsite rsync can run for many hours, and waiting for it meant the
+          // controller's retry countdown didn't start until then — which made
+          // configured retries look like they simply never happened.
+          if (!earlyFailureReported) {
+            const phase = this.detectBackupPhaseFailure(vmName, scheduleType, storagePoolPath, monitorStartMs);
+            if (phase && phase.failed) {
+              earlyFailureReported = true;
+              log(`Backup phase failed; reporting failure now (offsite sync continues in the background)`);
+              console.log(`[${jobId}] Backup phase failed — reporting early so the retry can start; offsite sync still running`);
+              await this.updateController(
+                jobId, 'failed', 1, phase.message || 'Backup failed', null, null, 'script_error',
+                null, false, { failureStage: 'backup' }
+              );
+            }
+          }
         } catch (error) {
           // Session no longer exists - backup completed or was killed
           clearInterval(checkInterval);
@@ -1680,11 +1807,20 @@ class BackupExecutor {
           // offsite sync even on failure.
           const offsiteResults = this.collectOffsiteResults(vmName, scheduleType, storagePoolPath, monitorStartMs);
 
-          // Update controller with accurate status
+          logSummary(exitCode, offsiteResults);
+
+          // Update controller with accurate status. When we already reported
+          // this run's failure early (backup phase failed, offsite sync then
+          // ran on), send the offsite outcomes but flag the verdict as a
+          // repeat so the controller doesn't schedule a second retry for the
+          // same attempt.
           if (exitCode === 0) {
             await this.updateController(jobId, 'completed', 0, null, null, null, null, offsiteResults);
           } else {
-            await this.updateController(jobId, 'failed', exitCode, errorMessage, null, null, failureReason, offsiteResults);
+            await this.updateController(
+              jobId, 'failed', exitCode, errorMessage, null, null, failureReason, offsiteResults,
+              earlyFailureReported, { failureStage: 'backup' }
+            );
           }
           
           // Process next in queue
@@ -1740,6 +1876,56 @@ class BackupExecutor {
    * <pool>/<vm>/<schedule>/logs/<ts>_<schedule>_<method>.events.jsonl.
    * Returns [{ ip, poolPath, status, reason }] or null.
    */
+  /**
+   * Has the backup PHASE already failed, while the script is still running?
+   *
+   * Backup_Manager.sh emits `job_fail` and then runs the offsite sync before
+   * exiting, so on a failed run the exit code — and therefore the controller's
+   * notion of "failed" — can be hours late (the offsite rsync of a large chain
+   * routinely runs for many hours). That delay silently defeated the retry
+   * feature: the retry countdown only began once the rsync finished.
+   *
+   * Detecting the event lets us report the failure immediately while the
+   * offsite sync keeps running in the same tmux session.
+   *
+   * @returns {{failed: boolean, message: string|null}|null} null when unknown.
+   */
+  detectBackupPhaseFailure(vmName, scheduleType, storagePoolPath, sinceMs) {
+    try {
+      const file = this._findEventsFile(vmName, scheduleType, storagePoolPath, sinceMs);
+      if (!file) return null;
+      const lines = fs.readFileSync(file, 'utf8').split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.event === 'job_fail') {
+          return { failed: true, message: ev.message || 'Backup failed' };
+        }
+      }
+      return { failed: false, message: null };
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /** Newest events file for this run, or null. Shared by the two scanners. */
+  _findEventsFile(vmName, scheduleType, storagePoolPath, sinceMs) {
+    if (!vmName || !scheduleType || !storagePoolPath) return null;
+    const logsDir = path.join(storagePoolPath, vmName, scheduleType, 'logs');
+    if (!fs.existsSync(logsDir)) return null;
+    const candidates = fs.readdirSync(logsDir)
+      .filter(f => f.endsWith('.events.jsonl') && !f.includes('_offsite_'))
+      .map(f => {
+        const full = path.join(logsDir, f);
+        try { return { full, mtime: fs.statSync(full).mtimeMs }; } catch { return null; }
+      })
+      .filter(Boolean)
+      .filter(x => x.mtime >= sinceMs - 60000)
+      .sort((a, b) => b.mtime - a.mtime);
+    return candidates.length > 0 ? candidates[0].full : null;
+  }
+
   collectOffsiteResults(vmName, scheduleType, storagePoolPath, sinceMs) {
     try {
       if (!vmName || !scheduleType || !storagePoolPath) return null;
@@ -1780,7 +1966,7 @@ class BackupExecutor {
     }
   }
 
-  async updateController(jobId, status, exitCode = null, error = null, progress = null, progressText = null, failureReason = null, offsiteResults = null) {
+  async updateController(jobId, status, exitCode = null, error = null, progress = null, progressText = null, failureReason = null, offsiteResults = null, verdictAlreadyReported = false, extra = null) {
     if (!this.config.controllerUrl) {
       console.log(`No controller URL configured, skipping status update for job ${jobId}`);
       return;
@@ -1820,7 +2006,22 @@ class BackupExecutor {
       if (Array.isArray(offsiteResults) && offsiteResults.length > 0) {
         payload.offsiteResults = offsiteResults;
       }
-      
+
+      // This run's verdict was already sent (backup phase failed early while
+      // the offsite sync carried on). The controller uses this to apply the
+      // offsite results without re-running its retry decision.
+      if (verdictAlreadyReported) {
+        payload.verdictAlreadyReported = true;
+      }
+
+      // Explicit stage attribution ('backup' vs 'offsite') and, where the two
+      // outcomes differ, the offsite verdict on its own.
+      if (extra && typeof extra === 'object') {
+        for (const [k, v] of Object.entries(extra)) {
+          if (v !== null && v !== undefined) payload[k] = v;
+        }
+      }
+
       // Terminal status updates (completed/failed/cancelled) are critical:
       // if one is lost to a transient blip, the controller keeps the job
       // "running" until a much later reconcile, producing a wrong status and
@@ -1854,10 +2055,22 @@ class BackupExecutor {
           }
         }
       }
-      // All terminal retries exhausted — log loudly. The controller-side
-      // periodic reconciler is the final safety net that will still finalize
-      // this job by inspecting the agent's real state.
-      console.error(`[BackupExecutor] CRITICAL: could not report terminal status '${status}' for job ${jobId} after ${attempts} attempts: ${lastErr && lastErr.message}. Controller will reconcile it on its next sync.`);
+      // All terminal retries exhausted. ~31s of backoff is nowhere near enough
+      // to ride out a certificate incident or a controller restart, and a
+      // dropped terminal update leaves the job "running" forever. Spool it to
+      // disk instead: the outbox survives an agent restart and replays as soon
+      // as the controller answers again.
+      console.error(`[BackupExecutor] CRITICAL: could not report terminal status '${status}' for job ${jobId} after ${attempts} attempts: ${lastErr && lastErr.message}. Queued for durable retry.`);
+      try {
+        require('./controllerOutbox').enqueue({
+          endpoint: `/backups/jobs/${jobId}/update`,
+          payload,
+          dedupeKey: `backup-job:${jobId}`,
+          description: `backup job ${jobId} -> ${status}`,
+        });
+      } catch (queueErr) {
+        console.error(`[BackupExecutor] Failed to queue terminal status for ${jobId}: ${queueErr.message}. Controller will reconcile it on its next sync.`);
+      }
     } catch (err) {
       // Don't log every progress update failure to avoid spam
       if (status !== 'running' || !progress) {

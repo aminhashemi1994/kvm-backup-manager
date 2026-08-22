@@ -78,6 +78,62 @@ export function formatDate(date: string | Date): string {
   return new Date(date).toLocaleString()
 }
 
+/**
+ * Short timestamp for dense tables: "08-18 22:34", or "22:34" when the date is
+ * today. The full timestamp stays available via formatDate() in a tooltip.
+ */
+export function formatDateCompact(date: string | Date): string {
+  const d = new Date(date)
+  if (isNaN(d.getTime())) return '-'
+  const p = (n: number) => String(n).padStart(2, '0')
+  const time = `${p(d.getHours())}:${p(d.getMinutes())}`
+  const today = new Date()
+  const sameDay =
+    d.getFullYear() === today.getFullYear() &&
+    d.getMonth() === today.getMonth() &&
+    d.getDate() === today.getDate()
+  return sameDay ? time : `${p(d.getMonth() + 1)}-${p(d.getDate())} ${time}`
+}
+
+/**
+ * One-letter job-type code for the narrow Type column. The full word is shown
+ * on hover — a whole column of the words "BACKUP"/"RESTORE" repeated is a lot
+ * of horizontal space for a value that is almost always the same.
+ */
+export function jobTypeCode(jobType?: string | null): { code: string; label: string; className: string } {
+  switch ((jobType || 'backup').toLowerCase()) {
+    case 'restore':
+      return { code: 'R', label: 'Restore', className: 'bg-purple-50 text-purple-700 border-purple-200' }
+    case 'sync':
+    case 'offsite':
+      return { code: 'S', label: 'Sync (offsite replication)', className: 'bg-teal-50 text-teal-700 border-teal-200' }
+    default:
+      return { code: 'B', label: 'Backup', className: 'bg-blue-50 text-blue-700 border-blue-200' }
+  }
+}
+
+/** One-letter schedule/method code, same reasoning as jobTypeCode(). */
+export function methodCode(method?: string | null): { code: string; label: string } {
+  const raw = (method || '').toLowerCase()
+  const map: Record<string, string> = {
+    daily: 'D',
+    weekly: 'W',
+    monthly: 'M',
+    once: 'O',
+    interval: 'I',
+    cron: 'C',
+    'custom-days': 'X',
+    custom: 'X',
+    full: 'F',
+    inc: 'N',        // iNcremental — I is taken by interval
+    incremental: 'N',
+    copy: 'P',
+  }
+  if (!raw) return { code: '-', label: 'Unknown' }
+  const code = map[raw] || raw.charAt(0).toUpperCase()
+  return { code, label: raw.charAt(0).toUpperCase() + raw.slice(1) }
+}
+
 export function formatRelativeTime(date: string | Date): string {
   const now = new Date()
   const then = new Date(date)

@@ -67,6 +67,37 @@ declare -A OFFSITE_PATH_BY_IP=()
 # Maps an offsite IP → its per-pool disk-usage threshold (percent). Empty when
 # the controller didn't supply one; the global disk_usage_threshold is used then.
 declare -A OFFSITE_THRESHOLD_BY_IP=()
+# Per-host rsync retry: attempts before giving up on that offsite host for this
+# run, and the base delay (seconds) for the exponential backoff between
+# attempts (attempt N waits offsite_retry_backoff_base * 2^(N-1) seconds).
+# Configurable per-schedule from the controller; these are the script defaults
+# when it doesn't supply either.
+offsite_retry_attempts="3"
+offsite_retry_backoff_base="15"
+# Staging directory (relative, on the offsite side) for partially transferred
+# files, enabling a retry to RESUME instead of restarting. Kept relative on
+# purpose: rsync then stages the file inside the destination directory and
+# renames it into its real place once complete, so incomplete data never
+# appears under a real filename, and rsync removes the staging dir itself once
+# the partial has served its purpose.
+#
+# NOTE: the matching --exclude is NOT redundant. rsync auto-adds an exclude for
+# a relative partial-dir, but appends it AFTER any rules we supply, and the
+# manual warns that "the auto-added rule may be ineffective at the end of your
+# other rules". We pass several excludes, so we state our own — that is what
+# stops --delete from wiping the resume data between attempts.
+OFFSITE_PARTIAL_DIR=".rsync-partial"
+# rsync I/O-inactivity timeout (seconds) — NOT a cap on total duration. A
+# transfer that keeps moving bytes runs as long as it needs; a dead connection
+# gives up after this and hands off to the retry loop, which then resumes.
+offsite_rsync_timeout="600"
+# Age (days) after which an orphaned staging file is swept. Orphans only arise
+# when a source file is never transferred again (e.g. its chain was archived).
+offsite_partial_max_age_days="7"
+# When true, skip the VM backup phase entirely and only run offsite_sync
+# against the (already-existing) backup directory. Used by the controller to
+# retry a failed/partial offsite sync without re-running virtnbdbackup.
+offsite_only="false"
 backup_path=""
 events_file=""
 log_file_path=""
@@ -137,6 +168,18 @@ while [[ $# -gt 0 ]]; do
 	--offsite-ip)
 		offsite_ips="$2"
 		shift 2
+		;;
+	--offsite-retry-attempts)
+		offsite_retry_attempts="$2"
+		shift 2
+		;;
+	--offsite-retry-backoff-base)
+		offsite_retry_backoff_base="$2"
+		shift 2
+		;;
+	--offsite-only)
+		offsite_only="true"
+		shift
 		;;
 	--backup-path)
 		backup_path="$2"
@@ -724,6 +767,13 @@ create_backup_lock() {
 }
 
 remove_backup_lock() {
+	# An offsite-only resync never creates the backup lock (it runs no
+	# virtnbdbackup), so it must never delete one either: the lock it would
+	# find belongs to a real backup of the same VM/schedule, and removing it
+	# would make that backup look finished while it is still running.
+	if [[ "$offsite_only" == "true" ]]; then
+		return 0
+	fi
 	if [[ -n "$lock_file" && -f "$lock_file" ]]; then
 		rm -f "$lock_file"
 	fi
@@ -770,6 +820,59 @@ verify_created_backups() {
 ###############################################################################
 # BACKUP STATE HELPERS
 ###############################################################################
+
+# ── Partial (interrupted-run) detection ──────────────────────────────────────
+# virtnbdbackup writes <disk>.<type>.data and renames it on success, so a
+# leftover "*.partial" means a run died mid-write. The TYPE embedded in the
+# name tells us how much damage it did:
+#
+#   *.full.*.partial → the full itself never completed. Nothing in this chain
+#       can be trusted as a base, so the next run must be a FULL. This is the
+#       case that used to slip through: virtnbdrestore can still dump metadata
+#       for a half-written full, so has_full_backup returned true and the
+#       scheduler picked "inc" — which then failed every single time.
+#
+#   *.inc.*.partial → the full is intact and only an incremental was cut off.
+#       The debris is safe to delete and the chain can simply be extended.
+
+# Does the directory hold a partial from an interrupted FULL backup?
+has_partial_full() {
+	local dir="$1"
+	[[ -d "$dir" ]] || return 1
+	local hit=""
+	hit=$(find "$dir" -maxdepth 1 -type f -name "*.full.*.partial" -print -quit 2>/dev/null)
+	[[ -n "$hit" ]]
+}
+
+# Does the directory hold a partial from an interrupted INCREMENTAL backup?
+has_partial_inc() {
+	local dir="$1"
+	[[ -d "$dir" ]] || return 1
+	local hit=""
+	hit=$(find "$dir" -maxdepth 1 -type f \( -name "*.inc.*.partial" -o -name "*.copy.*.partial" \) -print -quit 2>/dev/null)
+	[[ -n "$hit" ]]
+}
+
+# Remove ONLY *.partial debris. Never touches completed data or checkpoints —
+# deleting real backup data belongs to retention/archive, never to this path.
+remove_partial_files() {
+	local dir="$1"
+	local removed=0
+	[[ -d "$dir" ]] || return 0
+	while IFS= read -r pf; do
+		[[ -f "$pf" ]] || continue
+		info "  Removing partial file: $(basename "$pf")"
+		rm -f "$pf"
+		removed=$((removed + 1))
+	done < <(find "$dir" -maxdepth 1 -type f -name "*.partial" 2>/dev/null)
+	if [[ $removed -gt 0 ]]; then
+		info "✓ Removed $removed partial file(s) left by an interrupted run"
+		emit_event "partials_removed" "info" "Removed $removed partial file(s)" "count=$removed"
+		# Disk state changed — any memoised has_full_backup verdict is now stale.
+		invalidate_has_full_cache
+	fi
+	return 0
+}
 
 has_any_backup_data() {
 	local dir="$1"
@@ -914,6 +1017,15 @@ count_existing_backups() {
 # both resolve_method and validate_method_state within a single run.
 _HAS_FULL_CACHE_DIR=""
 _HAS_FULL_CACHE_RC=""
+
+# Must be called by anything that changes what's on disk (archiving a chain,
+# clearing partials). The cache is keyed only by directory, so without this a
+# stale verdict outlives the change that invalidated it.
+invalidate_has_full_cache() {
+	_HAS_FULL_CACHE_DIR=""
+	_HAS_FULL_CACHE_RC=""
+	return 0
+}
 
 has_full_backup() {
 	local dir="$1"
@@ -1295,6 +1407,11 @@ promote_chain_to_full() {
 	prune_archives "$schedule" "$archives_to_keep"
 	mkdir -p "$backup_dir" "$log_dir" 2>/dev/null
 
+	# The directory just changed underneath us — drop the memoised
+	# has_full_backup verdict so any later check re-reads the real state
+	# instead of reporting the chain we just moved away.
+	invalidate_has_full_cache
+
 	method="full"
 	emit_event "chain_promoted_full" "warning" "Promoted inc → full: $reason" "reason=$reason"
 	return 0
@@ -1375,7 +1492,17 @@ validate_method_state() {
 		fi
 		;;
 	inc)
-		if ! has_full_backup "$backup_dir"; then
+		# Same partial-file reasoning as auto_detect_method, for the path where
+		# the method was chosen explicitly rather than detected.
+		if has_partial_full "$backup_dir"; then
+			warn "Requested incremental, but the previous FULL backup never completed."
+			promote_chain_to_full "the previous full backup never completed (partial files present)"
+		elif has_partial_inc "$backup_dir"; then
+			info "Clearing debris from an interrupted incremental before extending the chain."
+			remove_partial_files "$backup_dir"
+		fi
+
+		if [[ "$method" == "inc" ]] && ! has_full_backup "$backup_dir"; then
 			if ! has_any_backup_data "$backup_dir"; then
 				info "No existing backup. Switching to full."
 				method="full"
@@ -1517,6 +1644,29 @@ auto_detect_method() {
 		return 0
 	fi
 
+	# Case 1b: An interrupted FULL left partial debris. virtnbdrestore can still
+	# dump metadata for a half-written full, so has_full_backup() below would
+	# report "chain exists" and we would pick inc — an inc on top of a full that
+	# never finished fails every time. Archive the unusable chain and start a
+	# new full instead.
+	if has_partial_full "$backup_dir"; then
+		warn "Found partial files from an interrupted FULL backup."
+		promote_chain_to_full "the previous full backup never completed (partial files present)"
+		info "Method: full (restarting the chain after an interrupted full)"
+		emit_event "method_auto" "warning" "Auto-selected: full (interrupted full detected)"
+		return 0
+	fi
+
+	# Case 1c: Only an INCREMENTAL was interrupted. The full underneath is
+	# intact, so the chain is still extendable — clear the dead attempt's
+	# debris and carry on with a normal incremental.
+	if has_partial_inc "$backup_dir"; then
+		warn "Found partial files from an interrupted incremental backup."
+		info "Full backup is intact — clearing the failed attempt's debris and continuing."
+		remove_partial_files "$backup_dir"
+		emit_event "partials_cleared_inc" "info" "Cleared interrupted incremental debris"
+	fi
+
 	# Case 2: Content exists but no provable full backup → broken state.
 	# Quarantine rather than delete: this decision rests on inference, and the
 	# cost of being wrong must never be destroyed backups.
@@ -1564,6 +1714,12 @@ write_progress_metadata() {
 }
 
 cleanup_progress_metadata() {
+	# Same reasoning as remove_backup_lock: the progress file is shared per
+	# VM+schedule, and an offsite-only resync must not wipe the progress of a
+	# real backup that may be running alongside it.
+	if [[ "$offsite_only" == "true" ]]; then
+		return 0
+	fi
 	if [[ -n "$progress_file" && -f "$progress_file" ]]; then
 		rm -f "$progress_file" 2>/dev/null
 	fi
@@ -2340,12 +2496,17 @@ offsite_sync() {
 	if [[ "$all_success" == "true" ]]; then
 		info "All offsite syncs completed successfully."
 		emit_event "offsite_complete" "success" "All offsite syncs completed"
+		return 0
 	else
 		warn "Some offsite syncs failed or were skipped. Check logs."
 		emit_event "offsite_complete" "warning" "Some offsite syncs failed" \
 			"skipped=${#offsite_skipped[@]}" "total=${#offsite_host_list[@]}"
+		# Non-zero so --offsite-only callers can tell the resync wasn't fully
+		# successful. Existing callers (post-backup sync) never check this
+		# return value — one calls it bare, the other with `|| true` — so this
+		# is safe to change without touching the normal backup flow.
+		return 1
 	fi
-	return 0
 }
 
 ###############################################################################
@@ -2885,34 +3046,96 @@ offsite_sync_single_host() {
 		fi
 
 		# ── Step 6: rsync with aggregate-style progress bar ──────────────
-		echo ""
-		echo "Starting rsync to $oip ..."
-		write_progress 0 "" "0B" "" "syncing"
-		offsite_emit "offsite_rsync_start" "in_progress" "Starting rsync"
+		# Retried in-place (attempt N waits offsite_retry_backoff_base * 2^(N-1)
+		# seconds before the next try) so a brief network blip doesn't fail the
+		# whole offsite sync for this host — only after every attempt fails is
+		# the host marked FAILED. This is cheap: it just re-runs rsync, not the
+		# VM backup.
+		local rsync_max_attempts="${offsite_retry_attempts:-3}"
+		[[ "$rsync_max_attempts" =~ ^[0-9]+$ ]] || rsync_max_attempts=3
+		[[ "$rsync_max_attempts" -lt 1 ]] && rsync_max_attempts=1
+		local rsync_backoff_base="${offsite_retry_backoff_base:-15}"
+		[[ "$rsync_backoff_base" =~ ^[0-9]+$ ]] || rsync_backoff_base=15
 
-		local rsync_detail_log="$log_dir/${log_timestamp}_offsite_${oip}_rsync_detail.log"
-		local rsync_start_time=0
-		rsync_start_time=$(date +%s)
+		local rsync_attempt=1
+		local rsync_ok="false"
+		local rsync_duration=0
 
-		local rsync_label="${vm_name} → ${oip}"
+		while [[ "$rsync_attempt" -le "$rsync_max_attempts" ]]; do
+			echo ""
+			if [[ "$rsync_attempt" -gt 1 ]]; then
+				echo "Retrying rsync to $oip (attempt $rsync_attempt/$rsync_max_attempts) ..."
+				write_progress 0 "" "0B" "" "syncing"
+				offsite_emit "offsite_rsync_retry" "in_progress" \
+					"Retrying rsync (attempt $rsync_attempt/$rsync_max_attempts)" \
+					"attempt=$rsync_attempt" "max_attempts=$rsync_max_attempts"
+			else
+				echo "Starting rsync to $oip ..."
+				write_progress 0 "" "0B" "" "syncing"
+				offsite_emit "offsite_rsync_start" "in_progress" "Starting rsync"
+			fi
 
-		if run_rsync_for_offsite \
-			"$rsync_detail_log" \
-			"$rsync_label" \
-			-az --delete --sparse \
-			--no-inc-recursive \
-			--exclude='logs/' \
-			--exclude='in_progress_backups/' \
-			--exclude='offsite_locks/' \
-			--exclude='*.partial' \
-			"$vm_base_dir/" \
-			"${remote_user}@${oip}:${remote_vm_dir}/"; then
+			local rsync_detail_log="$log_dir/${log_timestamp}_offsite_${oip}_rsync_detail.log"
+			local rsync_start_time=0
+			rsync_start_time=$(date +%s)
+
+			local rsync_label="${vm_name} → ${oip}"
+
+			if run_rsync_for_offsite \
+				"$rsync_detail_log" \
+				"$rsync_label" \
+				-az --delete --sparse \
+				--no-inc-recursive \
+				--partial-dir="$OFFSITE_PARTIAL_DIR" \
+				--exclude="$OFFSITE_PARTIAL_DIR/" \
+				--timeout="$offsite_rsync_timeout" \
+				--exclude='logs/' \
+				--exclude='in_progress_backups/' \
+				--exclude='offsite_locks/' \
+				--exclude='*.partial' \
+				"$vm_base_dir/" \
+				"${remote_user}@${oip}:${remote_vm_dir}/"; then
+
+				local rsync_end_time=0
+				rsync_end_time=$(date +%s)
+				rsync_duration=$((rsync_end_time - rsync_start_time))
+				rsync_ok="true"
+				break
+			fi
 
 			local rsync_end_time=0
 			rsync_end_time=$(date +%s)
-			local rsync_duration=$((rsync_end_time - rsync_start_time))
+			rsync_duration=$((rsync_end_time - rsync_start_time))
 
+			echo "✗ rsync FAILED after $(format_duration $rsync_duration) (attempt $rsync_attempt/$rsync_max_attempts)"
+			offsite_emit "offsite_rsync_attempt_fail" "error" \
+				"rsync failed (attempt $rsync_attempt/$rsync_max_attempts)" \
+				"duration_seconds=$rsync_duration" "attempt=$rsync_attempt"
+
+			if [[ "$rsync_attempt" -lt "$rsync_max_attempts" ]]; then
+				local rsync_backoff=$((rsync_backoff_base * (1 << (rsync_attempt - 1))))
+				echo "  Waiting ${rsync_backoff}s before retrying ..."
+				write_progress 0 "" "0B" "" "checking"
+				sleep "$rsync_backoff"
+			fi
+
+			rsync_attempt=$((rsync_attempt + 1))
+		done
+
+		if [[ "$rsync_ok" == "true" ]]; then
 			echo "✓ rsync completed in $(format_duration $rsync_duration)"
+
+			# Sweep orphaned resume data. rsync removes a staging file as soon
+			# as it has served its purpose, so anything still here is debris
+			# from a transfer whose source no longer exists (an archived
+			# chain, say) and would otherwise sit on the offsite host forever.
+			# Scoped to THIS VM's remote directory so a concurrent sync of
+			# another VM can never have its in-flight resume data deleted.
+			ssh "${remote_user}@${oip}" \
+				"find '$remote_vm_dir' -type d -name '$OFFSITE_PARTIAL_DIR' \
+                 -exec find {} -type f -mtime +$offsite_partial_max_age_days -delete \; 2>/dev/null" \
+				2>/dev/null || true
+
 			# Ensure progress is set to 100% on success
 			write_progress 100 "0B/s" "0B" "0:00:00" "success"
 			sleep 1 # Give monitor time to read the final progress
@@ -2926,16 +3149,12 @@ offsite_sync_single_host() {
 			echo "  OFFSITE COMPLETE: $vm_name → $oip ($(format_duration $rsync_duration))"
 			echo "═══════════════════════════════════════════════════════════"
 		else
-			local rsync_end_time=0
-			rsync_end_time=$(date +%s)
-			local rsync_duration=$((rsync_end_time - rsync_start_time))
-
-			echo "✗ rsync FAILED after $(format_duration $rsync_duration)"
 			write_progress 0 "0B/s" "0B" "0:00:00" "failed"
-			offsite_emit "offsite_rsync_fail" "error" "rsync failed" \
-				"duration_seconds=$rsync_duration"
+			offsite_emit "offsite_rsync_fail" "error" \
+				"rsync failed after $rsync_max_attempts attempt(s)" \
+				"duration_seconds=$rsync_duration" "attempts=$rsync_max_attempts"
 			rm -f "$offsite_lock"
-			echo "FAILED|rsync transfer failed" >"$status_file"
+			echo "FAILED|rsync transfer failed after $rsync_max_attempts attempt(s)" >"$status_file"
 			return 1
 		fi
 
@@ -3005,8 +3224,10 @@ cleanup_on_exit() {
 		rm -f "$nbd_port_claim_file" 2>/dev/null || true
 	fi
 
-	# Clean up temporary files from organized directories
-	if [[ -n "$vm_name" && -n "$schedule" ]]; then
+	# Clean up temporary files from organized directories. These are named per
+	# VM+schedule, so an offsite-only resync (which never wrote them) must
+	# leave them alone — they may belong to a real backup running alongside it.
+	if [[ -n "$vm_name" && -n "$schedule" && "$offsite_only" != "true" ]]; then
 		rm -f "$BACKUP_TMP_LOGS/backup_${vm_name}_${schedule}_"*.log 2>/dev/null || true
 		rm -f "$BACKUP_TMP_EXIT/backup_exit_${vm_name}_${schedule}.code" 2>/dev/null || true
 	fi
@@ -3016,8 +3237,11 @@ cleanup_on_exit() {
 		echo "Backup did not complete successfully (exit code: $exit_code)"
 		cleanup_progress_metadata
 
-		# Write final error state to progress
-		if [[ -n "$backup_path" ]]; then
+		# Write final error state to progress. Skipped for an offsite-only
+		# resync: the progress file is shared per VM+schedule, and stamping
+		# "Backup interrupted or failed" on it would misreport a backup this
+		# run never touched.
+		if [[ -n "$backup_path" && "$offsite_only" != "true" ]]; then
 			local progress_file="$backup_path/.progress/${vm_name}_${schedule}.progress"
 			if [[ -f "$progress_file" ]]; then
 				local ts
@@ -3117,6 +3341,35 @@ main() {
 
 	emit_event "job_start" "in_progress" "Backup job started"
 	info "Backup started at $(date '+%Y-%m-%d %H:%M:%S')"
+
+	# ── Offsite-only mode ─────────────────────────────────────────────────
+	# Used by the controller to retry a failed/partial offsite sync without
+	# re-running virtnbdbackup: skips the VM backup entirely (no hypervisor
+	# SSH, no checkpoint/retention handling) and just replicates the existing
+	# backup directory to the offsite host(s) named in --offsite-ip.
+	if [[ "$offsite_only" == "true" ]]; then
+		info "Offsite-only mode: skipping VM backup, syncing existing data for $vm_name"
+		emit_event "offsite_only_start" "in_progress" "Offsite-only resync (no VM backup)"
+
+		if [[ -z "$offsite_ips" ]]; then
+			die "--offsite-only requires --offsite-ip."
+		fi
+
+		local offsite_only_rc=0
+		offsite_sync || offsite_only_rc=1
+
+		local end_time=0
+		end_time=$(date +%s)
+		local duration=$((end_time - start_time))
+		if [[ "$offsite_only_rc" -eq 0 ]]; then
+			echo -e "${Green}${CHECK} Offsite-only resync completed after $(format_duration $duration)${NC}"
+			emit_event "job_complete" "success" "Offsite-only resync completed" "duration_seconds=$duration"
+		else
+			echo -e "${Red}${CROSS} Offsite-only resync FAILED after $(format_duration $duration)${NC}"
+			emit_event "job_fail" "error" "Offsite-only resync failed" "duration_seconds=$duration"
+		fi
+		exit "$offsite_only_rc"
+	fi
 
 	# ── Pre-flight checks ────────────────────────────────────────────────
 	if ! check_available_disk; then
@@ -3291,7 +3544,11 @@ main() {
 	remove_backup_lock
 
 	# ── Offsite sync ─────────────────────────────────────────────────
-	offsite_sync
+	# offsite_sync returns non-zero when a host failed or was skipped, but an
+	# offsite problem never fails the backup job itself — the primary backup
+	# already succeeded. The controller picks up the per-host outcomes from the
+	# events file and schedules an offsite-only retry if needed.
+	offsite_sync || true
 
 	# ── Summary ──────────────────────────────────────────────────────
 	local end_time=$(date +%s)
