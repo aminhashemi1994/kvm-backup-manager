@@ -1,12 +1,15 @@
 import { useState, useEffect } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
-import { Settings, Users, Shield, Bell, MessageSquare, Sun, Moon, Save, Send, Loader2, ChevronDown, ChevronRight } from 'lucide-react'
+import { Settings, Users, Shield, Bell, MessageSquare, Sun, Moon, Save, Send, Loader2, ChevronDown, ChevronRight, Plus, Trash2, Server, ArrowRightLeft } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTheme } from '@/contexts/ThemeContext'
 import { notificationsApi, settingsApi } from '@/services/api'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/ui/confirm-dialog'
-import { NOTIFICATION_EVENTS, NOTIFICATION_TYPES, NOTIFICATION_TYPE_GROUPS, type NotificationEventToggles } from '@/types'
+import { useBackupHosts } from '@/hooks/useBackupHosts'
+import { useVersion } from '@/hooks/useVersion'
+import { NOTIFICATION_TYPES, NOTIFICATION_TYPE_GROUPS } from '@/types'
+import { getErrorMessage } from '@/lib/errors'
 
 /**
  * Turn the comma-separated text of a mentions field into clean usernames.
@@ -87,11 +90,15 @@ function SettingsContent() {
 
 function GeneralSettings() {
   const { theme, toggleTheme } = useTheme()
+  // Reported by the controller so this can never drift from the sidebar again.
+  const { data: version } = useVersion()
   type Settings = {
     defaultMaxConcurrentBackups: number
     healthCheckIntervalSeconds: number
     defaultMissedRunPolicy: 'immediate' | 'most-recent' | 'skip'
     jobLogRetentionDays: number
+    replicationCheckIntervalHours: number
+    replicationCheckAutoSync: boolean
   }
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -100,6 +107,8 @@ function GeneralSettings() {
     healthCheckIntervalSeconds: 60,
     defaultMissedRunPolicy: 'immediate',
     jobLogRetentionDays: 90,
+    replicationCheckIntervalHours: 24,
+    replicationCheckAutoSync: true,
   })
   const [applyConcurrencyToAllHosts, setApplyConcurrencyToAllHosts] = useState(false)
 
@@ -119,6 +128,10 @@ function GeneralSettings() {
             jobLogRetentionDays: data.jobLogRetentionDays != null
               ? Number(data.jobLogRetentionDays)
               : 90,
+            replicationCheckIntervalHours: data.replicationCheckIntervalHours != null
+              ? Number(data.replicationCheckIntervalHours)
+              : 24,
+            replicationCheckAutoSync: data.replicationCheckAutoSync !== false,
           })
         }
       })
@@ -148,7 +161,7 @@ function GeneralSettings() {
       // Reset the propagate checkbox after a successful apply
       if (applyConcurrencyToAllHosts) setApplyConcurrencyToAllHosts(false)
     } catch (err: any) {
-      toast.error(err.response?.data?.error || err.message || 'Save failed')
+      toast.error(getErrorMessage(err, 'Save failed'))
     } finally {
       setSaving(false)
     }
@@ -288,17 +301,101 @@ function GeneralSettings() {
           </p>
         </div>
 
-        <div className="pt-2">
+      </div>
+
+      {/* Offsite replication — the periodic audit comparing each VM's backup
+          directory against its offsite copies. Saved by the same button as the
+          block above. */}
+      <div className="space-y-4 p-4 border border-gray-200 dark:border-gray-700 rounded-xl max-w-lg">
+        <h3 className="text-sm font-semibold flex items-center gap-2">
+          <ArrowRightLeft className="h-4 w-4" />
+          Offsite replication check
+        </h3>
+        <p className="text-xs text-gray-500">
+          Replication runs on its own — a backup finishing only asks for a sync, it never waits for
+          one. This check is the safety net: it walks every VM that has an offsite destination and
+          compares both ends, so replication that has quietly fallen behind gets noticed.
+        </p>
+
+        <div className="space-y-2">
+          <label className="text-sm font-medium">Check Interval (hours)</label>
+          <input
+            type="number"
+            value={settings.replicationCheckIntervalHours}
+            onChange={(e) => {
+              const n = Number(e.target.value)
+              updateField('replicationCheckIntervalHours', Number.isFinite(n) && n >= 0 ? n : 0)
+            }}
+            min={0}
+            max={168}
+            className={inputCls}
+          />
+          <p className="text-xs text-gray-500">
+            How often every VM's backup directory is compared against its offsite copies. The check
+            stats the whole tree at both ends, so it is a periodic audit rather than something to
+            watch — replication falling behind is a state measured in days, not minutes.{' '}
+            <strong>Set to 0 to disable</strong> the periodic check; it can still be run on demand
+            from the Offsite Replication page. Maximum 168 (one week).
+          </p>
+        </div>
+
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex-1">
+            <p className="text-sm font-medium">Sync automatically when a VM is found behind</p>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Queues a replication job for each VM the check finds out of sync. A VM that already has
+              a sync queued or running is left alone. Turn this off to have the check report only and
+              start the syncs yourself.
+            </p>
+            <p className="text-xs text-gray-500 mt-1">
+              A VM whose backup pool is not mounted is never auto-synced either way — syncing from an
+              empty mount point would delete its offsite copies.
+            </p>
+          </div>
           <button
             type="button"
-            onClick={handleSave}
-            disabled={saving}
-            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+            onClick={() => updateField('replicationCheckAutoSync', !settings.replicationCheckAutoSync)}
+            role="switch"
+            aria-checked={settings.replicationCheckAutoSync}
+            aria-label="Sync automatically when a VM is found behind"
+            className={cn(
+              'relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors duration-200 mt-0.5',
+              settings.replicationCheckAutoSync ? 'bg-primary' : 'bg-gray-300 dark:bg-gray-600'
+            )}
           >
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-            {saving ? 'Saving...' : 'Save Settings'}
+            <span
+              className={cn(
+                'inline-block h-5 w-5 transform rounded-full bg-white shadow-md transition-transform duration-200',
+                settings.replicationCheckAutoSync ? 'translate-x-6' : 'translate-x-1'
+              )}
+            />
           </button>
         </div>
+
+        <div className="pt-1">
+          <NavLink
+            to="/offsite"
+            className="text-xs text-primary hover:underline inline-flex items-center gap-1"
+          >
+            <ArrowRightLeft className="h-3 w-3" />
+            Open Offsite Replication to run a check now or review the results
+          </NavLink>
+        </div>
+      </div>
+
+      <div className="max-w-lg">
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+        >
+          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+          {saving ? 'Saving...' : 'Save Settings'}
+        </button>
+        <p className="text-xs text-gray-500 mt-2">
+          Saves every field above, including the replication settings.
+        </p>
       </div>
 
       {/* About section */}
@@ -307,11 +404,11 @@ function GeneralSettings() {
         <div className="grid gap-2 text-sm">
           <div className="flex items-center justify-between">
             <span className="text-gray-500">Version</span>
-            <span className="font-mono">1.1.0</span>
+            <span className="font-mono">{version ? version.version : '…'}</span>
           </div>
           <div className="flex items-center justify-between">
             <span className="text-gray-500">License</span>
-            <span>MIT (Open Source)</span>
+            <span>{version ? `${version.license} (Open Source)` : 'Open Source'}</span>
           </div>
           <div className="flex items-center justify-between">
             <span className="text-gray-500">Built by</span>
@@ -830,7 +927,20 @@ function AuditSettings() {
 function NotificationSettings() {
   type RcSettings = {
     enabled: boolean
+    // 'webhook' = Incoming Webhook, fire-only — no support for editing a
+    // message once sent. 'api' = REST API (chat.postMessage/chat.update)
+    // against a personal access token — required for anything that edits a
+    // message in place, e.g. the daily incident board.
+    mode: 'webhook' | 'api'
     webhookUrl: string
+    url: string
+    authToken: string
+    // True when a token is already saved server-side. GET redacts the real
+    // value, so the form can show "leave blank to keep the current token"
+    // instead of treating blank as "no token".
+    authTokenSet: boolean
+    userId: string
+    channel: string
     entity: string
     version: string
   }
@@ -840,13 +950,16 @@ function NotificationSettings() {
   const [testing, setTesting] = useState(false)
   const [rc, setRc] = useState<RcSettings>({
     enabled: false,
+    mode: 'webhook',
     webhookUrl: '',
+    url: '',
+    authToken: '',
+    authTokenSet: false,
+    userId: '',
+    channel: '',
     entity: 'Backup Manager',
     version: '',
   })
-  // System-wide default for each event. A schedule may override any of these;
-  // these values are what "Inherit" resolves to in the schedule forms.
-  const [events, setEvents] = useState<NotificationEventToggles>({})
   // Master on/off per notification, and who gets @-mentioned on each.
   // Mentions are held as the raw comma-separated text the user typed and only
   // split on save, so typing a comma doesn't fight the input.
@@ -857,6 +970,12 @@ function NotificationSettings() {
   const [mentionsByGroup, setMentionsByGroup] = useState<Record<string, string>>({})
   const [defaultMentions, setDefaultMentions] = useState('')
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({})
+  // Who to @-mention on the daily incident board (backup failed/offsite sync
+  // failed/backup skipped — those always send now, no on/off switch), keyed
+  // by backup host rather than by type or schedule. A host not in this list
+  // still gets its entries on the board, just without a mention.
+  const [hostMentions, setHostMentions] = useState<Array<{ backupHostId: string; mentions: string }>>([])
+  const { data: backupHosts } = useBackupHosts()
 
   useEffect(() => {
     let mounted = true
@@ -868,13 +987,17 @@ function NotificationSettings() {
           setRc(prev => ({
             ...prev,
             enabled: !!data.enabled,
+            mode: data.mode === 'api' ? 'api' : 'webhook',
             webhookUrl: data.webhookUrl || '',
+            url: data.url || '',
+            authToken: '', // never sent back by the API — redacted on GET
+            authTokenSet: !!data.authTokenSet,
+            userId: data.userId || '',
+            channel: data.channel || '',
             entity: data.entity || prev.entity,
             version: data.version || prev.version,
           }))
         }
-        const incomingEvents = res.data?.data?.events
-        if (incomingEvents) setEvents(incomingEvents)
         const incomingTypes = res.data?.data?.types
         if (incomingTypes) setTypes(incomingTypes)
         const m = res.data?.data?.mentions
@@ -896,6 +1019,13 @@ function NotificationSettings() {
           })
           setMentionsByGroup(byGroup)
         }
+        const hm = res.data?.data?.hostMentions
+        if (Array.isArray(hm)) {
+          setHostMentions(hm.map((h: any) => ({
+            backupHostId: h?.backupHostId || '',
+            mentions: (Array.isArray(h?.mentions) ? h.mentions : []).join(', '),
+          })))
+        }
       })
       .catch(err => toast.error(`Failed to load settings: ${err.message}`))
       .finally(() => mounted && setLoading(false))
@@ -907,17 +1037,19 @@ function NotificationSettings() {
 
   const buildPayload = (override?: Partial<RcSettings>) => ({
     rocketChat: {
-      // Webhook is the only supported mode now. The API mode was removed
-      // because the simple webhook covers every use case here and avoids
-      // the extra configuration burden (auth token, user id, channel).
-      mode: 'webhook' as const,
+      mode: rc.mode,
       enabled: rc.enabled,
       webhookUrl: rc.webhookUrl,
+      url: rc.url,
+      // Blank means "unchanged" — the backend keeps the stored token unless
+      // this carries a real value, so an untouched field never wipes it.
+      authToken: rc.authToken,
+      userId: rc.userId,
+      channel: rc.channel,
       entity: rc.entity,
       version: rc.version,
       ...override,
     },
-    events,
     types,
     mentions: {
       default: splitMentions(defaultMentions),
@@ -925,6 +1057,9 @@ function NotificationSettings() {
         NOTIFICATION_TYPES.map(t => [t.key, splitMentions(mentionsByGroup[t.group] || '')])
       ),
     },
+    hostMentions: hostMentions
+      .filter(h => h.backupHostId)
+      .map(h => ({ backupHostId: h.backupHostId, mentions: splitMentions(h.mentions) })),
   })
 
   const handleSave = async () => {
@@ -932,28 +1067,45 @@ function NotificationSettings() {
     try {
       const res = await notificationsApi.saveSettings(buildPayload())
       const fresh = res.data?.data?.rocketChat
-      if (res.data?.data?.events) setEvents(res.data.data.events)
       if (res.data?.data?.types) setTypes(res.data.data.types)
+      if (Array.isArray(res.data?.data?.hostMentions)) {
+        setHostMentions(res.data.data.hostMentions.map((h: any) => ({
+          backupHostId: h?.backupHostId || '',
+          mentions: (Array.isArray(h?.mentions) ? h.mentions : []).join(', '),
+        })))
+      }
       if (fresh) {
         setRc(prev => ({
           ...prev,
           enabled: !!fresh.enabled,
+          mode: fresh.mode === 'api' ? 'api' : 'webhook',
           webhookUrl: fresh.webhookUrl || prev.webhookUrl,
+          url: fresh.url || prev.url,
+          authToken: '',
+          authTokenSet: !!fresh.authTokenSet,
+          userId: fresh.userId || prev.userId,
+          channel: fresh.channel || prev.channel,
           entity: fresh.entity ?? prev.entity,
           version: fresh.version ?? prev.version,
         }))
       }
       toast.success('Notification settings saved')
     } catch (err: any) {
-      toast.error(err.response?.data?.error || err.message || 'Save failed')
+      toast.error(getErrorMessage(err, 'Save failed'))
     } finally {
       setSaving(false)
     }
   }
 
+  const canTest = rc.mode === 'api'
+    ? !!(rc.url && rc.userId && (rc.authToken || rc.authTokenSet))
+    : !!rc.webhookUrl
+
   const handleTest = async () => {
-    if (!rc.webhookUrl) {
-      toast.error('Enter the webhook URL first')
+    if (!canTest) {
+      toast.error(rc.mode === 'api'
+        ? 'Enter the server URL, access token, and user ID first'
+        : 'Enter the webhook URL first')
       return
     }
     setTesting(true)
@@ -973,7 +1125,7 @@ function NotificationSettings() {
         toast.error(res.data?.error || 'Test failed (no error returned)')
       }
     } catch (err: any) {
-      toast.error(err.response?.data?.error || err.message || 'Test failed')
+      toast.error(getErrorMessage(err, 'Test failed'))
     } finally {
       setTesting(false)
     }
@@ -1032,23 +1184,120 @@ function NotificationSettings() {
 
         <div className="grid gap-3 max-w-lg">
           <div className="space-y-1">
-            <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Webhook URL</label>
-            <input
-              type="url"
-              placeholder="https://chat.example.com/hooks/<hookId>/<secret>"
-              value={rc.webhookUrl}
-              onChange={(e) => updateField('webhookUrl', e.target.value)}
-              className={inputCls}
-              spellCheck={false}
-              autoComplete="off"
-            />
-            <p className="text-xs text-gray-500">
-              In RocketChat: <em>Administration → Workspace → Integrations → New → Incoming</em>.
-              Create the integration, then copy the URL labeled <strong>Webhook URL</strong> from
-              that page (it looks like <code>https://your-chat.example/hooks/&lt;id&gt;/&lt;secret&gt;</code>)
-              and paste it here.
-            </p>
+            <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Connection mode</label>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => updateField('mode', 'webhook')}
+                className={cn(
+                  'flex-1 px-3 py-2 rounded-lg border text-sm text-left',
+                  rc.mode === 'webhook'
+                    ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-400'
+                    : 'border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800/40'
+                )}
+              >
+                <div className="font-medium">Incoming Webhook</div>
+                <div className="text-xs text-gray-500 mt-0.5">Simple, but can't edit a message once sent</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => updateField('mode', 'api')}
+                className={cn(
+                  'flex-1 px-3 py-2 rounded-lg border text-sm text-left',
+                  rc.mode === 'api'
+                    ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-400'
+                    : 'border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800/40'
+                )}
+              >
+                <div className="font-medium">REST API</div>
+                <div className="text-xs text-gray-500 mt-0.5">Needed for the daily incident board to edit in place</div>
+              </button>
+            </div>
           </div>
+
+          {rc.mode === 'webhook' ? (
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Webhook URL</label>
+              <input
+                type="url"
+                placeholder="https://chat.example.com/hooks/<hookId>/<secret>"
+                value={rc.webhookUrl}
+                onChange={(e) => updateField('webhookUrl', e.target.value)}
+                className={inputCls}
+                spellCheck={false}
+                autoComplete="off"
+              />
+              <p className="text-xs text-gray-500">
+                In RocketChat: <em>Administration → Workspace → Integrations → New → Incoming</em>.
+                Create the integration, then copy the URL labeled <strong>Webhook URL</strong> from
+                that page (it looks like <code>https://your-chat.example/hooks/&lt;id&gt;/&lt;secret&gt;</code>)
+                and paste it here.
+              </p>
+              <p className="text-xs text-amber-600 dark:text-amber-500">
+                Webhooks can only post new messages — the daily incident board needs to edit a
+                message in place, so switch to REST API for that to work.
+              </p>
+            </div>
+          ) : (
+            <>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Server URL</label>
+                <input
+                  type="url"
+                  placeholder="https://chat.example.com"
+                  value={rc.url}
+                  onChange={(e) => updateField('url', e.target.value)}
+                  className={inputCls}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Personal Access Token</label>
+                <input
+                  type="password"
+                  placeholder={rc.authTokenSet ? '•••••••• (leave blank to keep the current token)' : 'Personal access token'}
+                  value={rc.authToken}
+                  onChange={(e) => updateField('authToken', e.target.value)}
+                  className={inputCls}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <p className="text-xs text-gray-500">
+                  RocketChat: <em>My Account → Personal Access Tokens</em>. Stored on the
+                  controller and never shown again after saving.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">User ID</label>
+                <input
+                  type="text"
+                  placeholder="The user id the token above belongs to"
+                  value={rc.userId}
+                  onChange={(e) => updateField('userId', e.target.value)}
+                  className={inputCls}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <p className="text-xs text-gray-500">
+                  Shown next to the token when you create it on that same page.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-gray-600 dark:text-gray-400">Channel</label>
+                <input
+                  type="text"
+                  placeholder="backup-notifications"
+                  value={rc.channel}
+                  onChange={(e) => updateField('channel', e.target.value)}
+                  className={inputCls}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+                <p className="text-xs text-gray-500">Channel name to post into, without the leading #.</p>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="grid gap-3 max-w-lg pt-2 border-t border-gray-200 dark:border-gray-700">
@@ -1091,8 +1340,10 @@ function NotificationSettings() {
           <button
             type="button"
             onClick={handleTest}
-            disabled={testing || !rc.webhookUrl}
-            title={!rc.webhookUrl ? 'Enter the webhook URL first' : 'Sends a test message using the values currently in the form'}
+            disabled={testing || !canTest}
+            title={!canTest
+              ? (rc.mode === 'api' ? 'Enter the server URL, access token, and user ID first' : 'Enter the webhook URL first')
+              : 'Sends a test message using the values currently in the form'}
             className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50"
           >
             {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
@@ -1253,61 +1504,71 @@ function NotificationSettings() {
         </div>
       </div>
 
-      {/* System-wide event defaults. These are what "Inherit" resolves to on
-          every schedule, so this is the one place to turn an event class off
-          across the whole platform. */}
+      {/* Backup failed / offsite sync failed / backup skipped always send now,
+          via the daily incident board — no toggle for them above. This is the
+          one thing still configurable for those three: who gets @-mentioned,
+          scoped by which backup host the event happened on rather than by
+          type or schedule. A host left off this list still gets its entries
+          on the board, just without a mention. */}
       <div className="space-y-4 p-4 border border-gray-200 dark:border-gray-700 rounded-xl">
         <div>
           <h3 className="text-sm font-semibold flex items-center gap-2">
-            <Bell className="h-4 w-4" /> Per-schedule event defaults
+            <Server className="h-4 w-4" /> Notify by backup host
           </h3>
           <p className="text-xs text-gray-500 mt-1">
-            A second, narrower layer: these are the values a schedule inherits when its own
-            Notifications tab is left on <span className="font-medium">Inherit</span>
-            (Schedules → Edit, or Bulk Edit → Notifications). They decide whether a given
-            schedule participates in an event — the switches above decide whether that kind of
-            message is ever sent at all.
+            Backup failed, offsite sync failed, and backup skipped always post to the daily
+            incident board — there's no switch to turn those off. Add a backup host here to
+            @-mention people whenever one of those happens on it; a host not listed still gets
+            its entry on the board, just silently.
           </p>
         </div>
 
-        <div className="space-y-1 max-w-2xl">
-          {NOTIFICATION_EVENTS.map(ev => {
-            const on = events[ev.key] !== false
-            return (
-              <label
-                key={ev.key}
-                className="flex items-start gap-3 py-2 px-3 rounded-lg cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/40"
+        <div className="space-y-2 max-w-2xl">
+          {hostMentions.map((row, idx) => (
+            <div key={idx} className="flex items-center gap-2">
+              <select
+                value={row.backupHostId}
+                onChange={(e) => {
+                  const value = e.target.value
+                  setHostMentions(prev => prev.map((r, i) => i === idx ? { ...r, backupHostId: value } : r))
+                }}
+                className={cn(inputCls, 'sm:w-56 shrink-0')}
               >
-                <input
-                  type="checkbox"
-                  checked={on}
-                  onChange={(e) => {
-                    const checked = e.target.checked
-                    setEvents(prev => {
-                      const next: NotificationEventToggles = { ...prev }
-                      next[ev.key] = checked
-                      return next
-                    })
-                  }}
-                  className="h-4 w-4 mt-0.5"
-                />
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium">{ev.label}</div>
-                  <div className="text-xs text-gray-500">{ev.hint}</div>
-                </div>
-                <span
-                  className={cn(
-                    'text-xs font-medium px-2 py-0.5 rounded-full shrink-0',
-                    on
-                      ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
-                      : 'bg-gray-200 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
-                  )}
-                >
-                  {on ? 'On' : 'Off'}
-                </span>
-              </label>
-            )
-          })}
+                <option value="">Select a backup host…</option>
+                {(backupHosts || []).map(h => (
+                  <option key={h.id} value={h.id}>{h.name}</option>
+                ))}
+              </select>
+              <input
+                type="text"
+                placeholder="Mention… e.g. alice, bob"
+                value={row.mentions}
+                onChange={(e) => {
+                  const value = e.target.value
+                  setHostMentions(prev => prev.map((r, i) => i === idx ? { ...r, mentions: value } : r))
+                }}
+                className={cn(inputCls, 'flex-1')}
+                spellCheck={false}
+                autoComplete="off"
+              />
+              <button
+                type="button"
+                onClick={() => setHostMentions(prev => prev.filter((_, i) => i !== idx))}
+                className="shrink-0 p-2 text-gray-400 hover:text-red-600 dark:hover:text-red-400"
+                title="Remove"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
+
+          <button
+            type="button"
+            onClick={() => setHostMentions(prev => [...prev, { backupHostId: '', mentions: '' }])}
+            className="inline-flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-700 dark:text-blue-400 dark:hover:text-blue-300"
+          >
+            <Plus className="h-4 w-4" /> Add backup host
+          </button>
         </div>
 
         <div className="pt-2">

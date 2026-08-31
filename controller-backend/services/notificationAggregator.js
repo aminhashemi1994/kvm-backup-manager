@@ -48,6 +48,12 @@ class NotificationAggregator {
       windowMs: DEFAULT_WINDOW_MS,
       maxWaitMs: DEFAULT_MAX_WAIT_MS,
       suppressRepeats: true,
+      // Suppression must not be permanent. Without this, a fault that recurs
+      // every night is announced exactly once and then never again — the
+      // operator sees a warning in the panel and no message anywhere, which is
+      // precisely how a broken offsite destination goes unnoticed for days.
+      // A standing incident re-announces on this interval.
+      repeatRenotifyMs: 24 * 60 * 60 * 1000,
       // The counterweight to suppression — see sendDigest().
       digestEnabled: true,
       digestHour: 9,
@@ -77,6 +83,10 @@ class NotificationAggregator {
   applySettings(settings = {}) {
     if (typeof settings.enabled === 'boolean') this.settings.enabled = settings.enabled;
     if (typeof settings.suppressRepeats === 'boolean') this.settings.suppressRepeats = settings.suppressRepeats;
+    // 0 restores the old behaviour: suppress a standing incident forever.
+    if (Number.isFinite(settings.repeatRenotifyHours) && settings.repeatRenotifyHours >= 0) {
+      this.settings.repeatRenotifyMs = settings.repeatRenotifyHours * 60 * 60 * 1000;
+    }
     if (Number.isFinite(settings.windowSeconds) && settings.windowSeconds > 0) {
       this.settings.windowMs = settings.windowSeconds * 1000;
     }
@@ -261,20 +271,43 @@ class NotificationAggregator {
     if (isFailure && this.settings.suppressRepeats) {
       const known = this.knownFailing.get(stateKey);
       if (known && known.cause === cause) {
-        // Same VM, same fault, still broken. Count it, don't announce it.
+        // Same VM, same fault, still broken.
         known.count = (known.count || 1) + 1;
         known.lastAt = new Date().toISOString();
-        this.enqueue(ev.kind, cause, { ...ev, repeat: true });
-        return;
+
+        // Announce again once the re-notify interval has passed, so a fault
+        // that keeps recurring keeps being reported — daily by default rather
+        // than once and then silence. Older state files have no
+        // lastAnnouncedAt; fall back to `since`, which is when the incident
+        // was first announced.
+        const lastAnnounced = Date.parse(known.lastAnnouncedAt || known.since || '') || 0;
+        const due = this.settings.repeatRenotifyMs > 0
+          && Date.now() - lastAnnounced >= this.settings.repeatRenotifyMs;
+
+        if (!due) {
+          this.enqueue(ev.kind, cause, { ...ev, repeat: true });
+          return;
+        }
+
+        known.lastAnnouncedAt = new Date().toISOString();
+        this.saveState().catch(() => {});
+        // Fall through and treat it as fresh: it is still news, just not new.
+      } else {
+        this.knownFailing.set(stateKey, {
+          cause,
+          since: new Date().toISOString(),
+          lastAt: new Date().toISOString(),
+          lastAnnouncedAt: new Date().toISOString(),
+          count: 1,
+        });
+        this.saveState().catch(() => {});
       }
-      this.knownFailing.set(stateKey, {
-        cause,
-        since: new Date().toISOString(),
-        lastAt: new Date().toISOString(),
-        count: 1,
-      });
-      this.saveState().catch(() => {});
     }
+
+    // The daily incident board now owns the message for this event; we're
+    // only here to keep knownFailing accurate so a later success still
+    // triggers a recovery announcement.
+    if (ev.trackOnly) return;
 
     if (!isFailure) {
       // A success clears any open incident for this subject, and that
@@ -374,15 +407,15 @@ class NotificationAggregator {
     let mentions = [];
     try {
       const scheduleIds = fresh.map(e => e.scheduleId).filter(Boolean);
-      // Map the aggregator's internal kind back to the settings type key, so
-      // "who owns offsite failures" is configurable separately from "who owns
-      // backup failures". Successes and recoveries are mentioned too: they are
-      // grouped messages a person asked to be named on, and staying silent on
-      // them is exactly the bug where configured people never appeared.
+      // Map the aggregator's internal kind back to the settings type key.
+      // 'backup-failed'/'offsite-failed' never reach here: rocketChatService
+      // submits those with trackOnly:true (the daily incident board owns
+      // their messaging), so submit() returns before enqueue(). Successes and
+      // recoveries are mentioned too: they are grouped messages a person
+      // asked to be named on, and staying silent on them is exactly the bug
+      // where configured people never appeared.
       const TYPE_BY_KIND = {
-        'backup-failed': 'backupFailed',
         'backup-repeat-failure': 'multipleBackupFailures',
-        'offsite-failed': 'offsiteSyncFailed',
         'backup-completed': 'backupCompleted',
         'recovered': 'backupCompleted',
       };

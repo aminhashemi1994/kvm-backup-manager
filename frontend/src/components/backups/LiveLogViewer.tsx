@@ -7,7 +7,7 @@ import { X, Download, XCircle, Loader2 } from 'lucide-react'
 import { useBackupJob, useBackupJobLogs, useKillBackupJob } from '@/hooks/useBackups'
 import { useRestoreJob, useRestoreJobLogs, useKillRestoreJob } from '@/hooks/useRestores'
 import { useJobSubscription } from '@/hooks/useSocket'
-import { getStatusColor } from '@/lib/utils'
+import { getStatusColor, formatDate, formatDuration } from '@/lib/utils'
 import AnsiToHtml from 'ansi-to-html'
 import { toast } from 'sonner'
 import { useConfirm } from '@/components/ui/confirm-dialog'
@@ -223,7 +223,40 @@ export default function LiveLogViewer({ jobId, jobType = 'backup', onClose }: Li
           </div>
         </DialogHeader>
 
-        <div className="flex items-center justify-between mb-2">
+        {/* Same compact context strip as the replication log viewer — which
+            host it ran on, where from (backups only), and how long it took —
+            so switching between backup/restore and replication logs doesn't
+            mean re-learning where to look. */}
+        {job && (
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs border-b border-gray-200 dark:border-gray-700 pb-3 mb-4">
+            <div>
+              <div className="text-gray-500">Backup host</div>
+              <div className="font-medium truncate" title={job.backupHostName}>
+                {job.backupHostName || '-'}
+              </div>
+            </div>
+            {jobType === 'backup' && (
+              <div>
+                <div className="text-gray-500">Hypervisor</div>
+                <div className="font-medium truncate" title={(job as typeof backupJob)?.hypervisorIp}>
+                  {(job as typeof backupJob)?.hypervisorIp || '-'}
+                </div>
+              </div>
+            )}
+            <div>
+              <div className="text-gray-500">Started</div>
+              <div className="font-medium">{job.startTime ? formatDate(job.startTime) : 'Not yet'}</div>
+            </div>
+            <div>
+              <div className="text-gray-500">Duration</div>
+              <div className="font-medium tabular-nums">
+                {job.startTime ? formatDuration(job.startTime, job.endTime || undefined) : '-'}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="flex items-center justify-between mb-4">
           <div className="flex items-center space-x-2">
             <label className="flex items-center space-x-2 text-sm">
               <input
@@ -245,7 +278,7 @@ export default function LiveLogViewer({ jobId, jobType = 'backup', onClose }: Li
 
         {/* Progress Bars */}
         {progressBars.length > 0 && (
-          <div className="mb-2 p-3 bg-gray-900 rounded-md border border-gray-700">
+          <div className="mb-4 p-3 bg-gray-900 rounded-md border border-gray-700">
             <div className="space-y-1">
               {progressBars.map((progress, index) => (
                 <div key={index} className="text-xs font-mono text-green-400 whitespace-pre">

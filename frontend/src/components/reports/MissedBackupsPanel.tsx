@@ -110,23 +110,38 @@ export default function MissedBackupsPanel({ backupHostId }: MissedBackupsPanelP
             Missed Backups
           </CardTitle>
           <div className="flex items-center gap-2">
-            <span className="text-sm text-gray-600">Window:</span>
-            <Select
-              value={days.toString()}
-              onChange={(e) => setDays(Number(e.target.value))}
-              className="w-28"
+            <label
+              htmlFor="missed-backups-window"
+              className="text-sm text-gray-600 whitespace-nowrap"
             >
-              <option value="7">Last 7 days</option>
-              <option value="30">Last 30 days</option>
-              <option value="90">Last 90 days</option>
-              <option value="180">Last 180 days</option>
-              <option value="365">Last year</option>
-            </Select>
+              Window
+            </label>
+            {/* The wrapper carries the width so the chevron the Select draws
+                stays pinned to the control's right edge. 9.5rem fits the
+                longest option ("Last 180 days") without it sliding under. */}
+            <div className="w-[9.5rem] flex-shrink-0">
+              <Select
+                id="missed-backups-window"
+                aria-label="Missed backups time window"
+                value={days.toString()}
+                onChange={(e) => setDays(Number(e.target.value))}
+                className="hover:border-gray-400 transition-colors"
+              >
+                <option value="7">Last 7 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="90">Last 90 days</option>
+                <option value="180">Last 180 days</option>
+                <option value="365">Last year</option>
+              </Select>
+            </div>
             <Button
               variant="outline"
               size="sm"
               onClick={() => refetch()}
               disabled={isFetching}
+              aria-label="Refresh missed backups"
+              title="Refresh"
+              className="h-9 w-9 p-0 flex-shrink-0"
             >
               <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
             </Button>

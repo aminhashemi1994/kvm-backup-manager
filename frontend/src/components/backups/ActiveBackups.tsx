@@ -7,6 +7,9 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Eye, Loader2, XCircle, Download, Upload, Search } from 'lucide-react'
 import { useActiveBackups, useKillBackupJob } from '@/hooks/useBackups'
 import { useActiveRestores, useKillRestoreJob } from '@/hooks/useRestores'
+import { useActiveOffsiteJobs, useCancelOffsiteJob, useOffsiteJobEvents } from '@/hooks/useOffsiteJobs'
+import { toUnifiedJobs } from '@/lib/offsiteJobAdapter'
+import OffsiteLogViewer from '@/components/offsite/OffsiteLogViewer'
 import { formatDuration, jobTypeCode, methodCode } from '@/lib/utils'
 import LiveLogViewer from './LiveLogViewer'
 import JobStatusIcons from './JobStatusIcons'
@@ -30,14 +33,24 @@ export default function ActiveBackups() {
   const queryClient = useQueryClient()
   const { data: activeBackups, isLoading: isLoadingBackups } = useActiveBackups()
   const { data: activeRestores, isLoading: isLoadingRestores } = useActiveRestores()
+  const { data: activeReplications } = useActiveOffsiteJobs()
   const killBackupMutation = useKillBackupJob()
   const killRestoreMutation = useKillRestoreJob()
+  const cancelOffsiteMutation = useCancelOffsiteJob()
   const confirm = useConfirm()
 
-  // Combine backups and restores into a single list
+  // Live replication updates. Without this the transfer rows only move on the
+  // list's own refetch, while backup rows update instantly — the same table
+  // would visibly tick at two different rates.
+  useOffsiteJobEvents()
+
+  // Combine backups, restores and replications into a single list. Replication
+  // runs independently of the backup that asked for it, so a transfer can be
+  // the only thing running long after its backup finished — it belongs here.
   const allActiveJobs = [
     ...(activeBackups || []).map(job => ({ ...job, jobType: 'backup' as const })),
-    ...(activeRestores || []).map(job => ({ ...job, jobType: 'restore' as const }))
+    ...(activeRestores || []).map(job => ({ ...job, jobType: 'restore' as const })),
+    ...toUnifiedJobs(activeReplications),
   ].sort((a, b) => new Date(b.startTime).getTime() - new Date(a.startTime).getTime())
 
   // Filter jobs based on search query
@@ -191,25 +204,45 @@ export default function ActiveBackups() {
     }
   }, [queryClient])
 
-  const handleKill = async (jobId: string, vmName: string, jobType: 'backup' | 'restore') => {
-    const action = jobType === 'backup' ? 'backup' : 'restore'
+  type ActiveJobType = 'backup' | 'restore' | 'replication'
+
+  const handleKill = async (jobId: string, vmName: string, jobType: ActiveJobType) => {
+    const action = jobType === 'replication' ? 'replication' : jobType
     const ok = await confirm({
       title: `Cancel ${action}?`,
-      description: `This will terminate the running ${action} for "${vmName}".`,
+      description: jobType === 'replication'
+        // Cancelling a transfer is far less destructive than cancelling a
+        // backup, and saying so stops operators leaving a stuck sync running
+        // for hours because they fear losing the transferred data.
+        ? `The transfer for "${vmName}" stops where it is. Everything already copied stays at the `
+          + 'destination and the file in flight is kept, so a later sync resumes from it. '
+          + 'Nothing offsite is deleted.'
+        : `This will terminate the running ${action} for "${vmName}".`,
       confirmText: `Cancel ${action}`,
       cancelText: 'Keep running',
       variant: 'danger',
     })
-    if (ok) {
-      if (jobType === 'backup') {
-        await killBackupMutation.mutateAsync(jobId)
-      } else {
-        await killRestoreMutation.mutateAsync(jobId)
-      }
+    if (!ok) return
+
+    if (jobType === 'backup') {
+      await killBackupMutation.mutateAsync(jobId)
+    } else if (jobType === 'replication') {
+      await cancelOffsiteMutation.mutateAsync({ id: jobId, vmName })
+    } else {
+      await killRestoreMutation.mutateAsync(jobId)
     }
   }
 
-  const handleViewLogs = (jobId: string, jobType: 'backup' | 'restore') => {
+  // Replication logs come from a different store and a different agent route,
+  // so they open their own viewer rather than being squeezed into the backup
+  // one behind a third branch.
+  const [replicationLogId, setReplicationLogId] = useState<string | null>(null)
+
+  const handleViewLogs = (jobId: string, jobType: ActiveJobType) => {
+    if (jobType === 'replication') {
+      setReplicationLogId(jobId)
+      return
+    }
     setSelectedJobId(jobId)
     setSelectedJobType(jobType)
   }
@@ -253,7 +286,7 @@ export default function ActiveBackups() {
                   <TableHead className="w-[90px]" title="Job type">Type</TableHead>
                   <TableHead>VM</TableHead>
                   <TableHead className="w-[90px]" title="Schedule / method">Method</TableHead>
-                  <TableHead className="w-[44px] pl-3 pr-0">Status</TableHead>
+                  <TableHead className="w-[100px] pl-3 pr-0" title="Backup outcome, then offsite replication">Status</TableHead>
                   <TableHead className="w-[32%] pl-3">Progress</TableHead>
                   <TableHead className="w-[72px]">Duration</TableHead>
                   <TableHead className="w-[104px] whitespace-nowrap text-right">Actions</TableHead>
@@ -286,7 +319,11 @@ export default function ActiveBackups() {
                         )
                       })()}
                     </TableCell>
-                    <TableCell className="w-[44px] pl-3 pr-0">
+                    {/* Backup outcome only. The replication that may be running
+                        alongside this backup is already its own row in this list
+                        (merged in via toUnifiedJobs), so the cell no longer carries
+                        a second dot — one icon per row, scoped to the job. */}
+                    <TableCell className="w-[80px] pl-3 pr-0">
                       <JobStatusIcons job={job as any} />
                     </TableCell>
                     <TableCell className="pl-3">
@@ -361,6 +398,12 @@ export default function ActiveBackups() {
           jobId={selectedJobId}
           jobType={selectedJobType}
           onClose={() => setSelectedJobId(null)}
+        />
+      )}
+      {replicationLogId && (
+        <OffsiteLogViewer
+          jobId={replicationLogId}
+          onClose={() => setReplicationLogId(null)}
         />
       )}
     </>

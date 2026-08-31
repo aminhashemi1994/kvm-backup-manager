@@ -206,6 +206,9 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
           name: `${vm.name} - ${formData.scheduleType} backup`,
           scheduleType: formData.scheduleType,
           noCompression: formData.noCompression,
+          // The level was held in state but never sent, so every bulk-created
+          // schedule was stored at the server default regardless.
+          compression: formData.noCompression ? 0 : formData.compression,
           noVerify: formData.noVerify,
           enabled: formData.enabled,
           syncToOffsite: formData.syncToOffsite,
@@ -772,7 +775,7 @@ export default function BulkScheduleDialog({ vmIds, backupHostId, hypervisorId, 
                               <Label htmlFor={`bulk-offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
                                 {host.name} ({host.ip})
                               </Label>
-                              {host.status === 'online' ? (
+                              {host.status === 'connected' ? (
                                 <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
                                   Connected
                                 </Badge>

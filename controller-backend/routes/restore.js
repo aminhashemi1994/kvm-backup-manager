@@ -889,6 +889,17 @@ router.post('/jobs/:restoreId/update', async (req, res, next) => {
 
     console.log(`[Restore] Updated job ${restoreId}: ${job.status} (${job.progress}%)`);
 
+    // Restore outcomes are counted at the same point RocketChat is told, so
+    // the two can never disagree about how a restore ended.
+    if (status === 'completed' || status === 'failed' || status === 'cancelled') {
+      try {
+        require('../services/prometheusMetricsService')
+          .recordRestoreFinished({ vmName: job.vmName, status });
+      } catch (metricsErr) {
+        console.error('[Metrics] Failed to record restore counter:', metricsErr.message);
+      }
+    }
+
     // Notify RocketChat on status changes
     if (status === 'completed') {
       const duration = job.endTime && job.startTime 

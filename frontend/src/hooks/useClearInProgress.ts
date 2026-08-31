@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { backupStatusApi } from '@/services/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 interface ClearInProgressParams {
   vmId: string
@@ -33,7 +34,7 @@ export function useClearInProgress() {
       queryClient.invalidateQueries({ queryKey: ['vms'] })
     },
     onError: (error: any, variables) => {
-      const message = error.response?.data?.error || error.message || 'Failed to clear in-progress state'
+      const message = getErrorMessage(error, 'Failed to clear in-progress state')
       toast.error(`Clear in-progress failed for ${variables.vmName}: ${message}`)
     },
   })

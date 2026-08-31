@@ -233,8 +233,18 @@ class BackupExecutor {
       const sanitizedVmName = vmName.replace(/[^a-zA-Z0-9-]/g, '_');
       
       // Look for sessions matching our pattern: sanitizedVmName_scheduleType_*
+      //
+      // Offsite syncs are separate jobs with their own sessions, and one for
+      // this same VM may well be running right now. Theirs are named
+      // <vm>_rsync_<jobid8>. This skip is the only thing keeping a backup job
+      // from adopting a transfer's session and reporting rsync progress as its
+      // own, so it is stated rather than left to be re-derived by whoever
+      // renames a session next. Matched on the full tail rather than a bare
+      // "_rsync_" so a VM whose name happens to contain it is not skipped.
+      const RSYNC_SESSION = /_rsync_[0-9a-f]{8}$/i;
       const sessions = stdout.trim().split('\n');
       for (const session of sessions) {
+        if (RSYNC_SESSION.test(session)) continue;
         if (session.startsWith(`${sanitizedVmName}_${scheduleType}_`)) {
           console.log(`Found matching tmux session: ${session}`);
           return session;
@@ -1240,6 +1250,9 @@ class BackupExecutor {
       // between attempts. Sourced from the schedule; see Backup_Manager.sh.
       offsiteRetryAttempts = 3,
       offsiteRetryBackoffSeconds = 15,
+      // rsync I/O-inactivity timeout. Matches the script default; raise it for
+      // links that go quiet for long stretches rather than dropping outright.
+      offsiteRsyncTimeoutSeconds = 1800,
       // Skip the VM backup entirely and only re-run the offsite sync. Used by
       // the controller to retry a failed/partial offsite sync without redoing
       // the (expensive) virtnbdbackup run.
@@ -1404,10 +1417,17 @@ class BackupExecutor {
           args.push('--offsite-retry-attempts', String(attempts));
         }
         const backoff = parseInt(offsiteRetryBackoffSeconds, 10);
-        if (Number.isFinite(backoff) && backoff >= 1 && backoff <= 600) {
+        if (Number.isFinite(backoff) && backoff >= 1 && backoff <= 3600) {
           args.push('--offsite-retry-backoff-base', String(backoff));
         }
-        log(`Offsite rsync retry: ${attempts} attempt(s), ${backoff}s backoff base`);
+        // Upper bound is generous (6h) because this is an INACTIVITY timeout,
+        // not a cap on how long a transfer may take: a healthy multi-hour
+        // transfer is never affected by it.
+        const rsyncTimeout = parseInt(offsiteRsyncTimeoutSeconds, 10);
+        if (Number.isFinite(rsyncTimeout) && rsyncTimeout >= 60 && rsyncTimeout <= 21600) {
+          args.push('--offsite-rsync-timeout', String(rsyncTimeout));
+        }
+        log(`Offsite rsync retry: ${attempts} attempt(s), ${backoff}s backoff base, ${rsyncTimeout}s inactivity timeout`);
 
         // Offsite-only resync: no virtnbdbackup, just replicate what's on disk.
         if (offsiteOnly) {
@@ -1605,6 +1625,15 @@ class BackupExecutor {
     // exit-code report doesn't repeat the same verdict.
     let earlyFailureReported = false;
 
+    // When we last told the controller anything about this job's progress.
+    // A big offsite rsync moves whole percent points only every couple of
+    // minutes, so gating purely on the integer percentage left the bar and its
+    // byte/speed/ETA text frozen for minutes at a time — the "stuck progress"
+    // symptom. We now also push on a changed text line, and force one through
+    // at least this often regardless.
+    let lastProgressPushAt = 0;
+    const PROGRESS_PUSH_INTERVAL_MS = 5000;
+
     // Read progress file periodically
     const progressInterval = setInterval(() => {
       progressCheckCount++;
@@ -1627,8 +1656,15 @@ class BackupExecutor {
             job.progressText = progressData.text || `${progressData.type}: ${progressData.percentage}%`;
             job.progressType = progressData.type || 'backup';
             
-            // Always update controller and save state
-            if (oldProgress !== job.progress || progressCheckCount === 1) {
+            // Push the moment the percentage moves, and otherwise on a timer.
+            // The bytes/speed/ETA line changes every second, but posting that
+            // every second would be one request per second per running job for
+            // no visible gain — the timer keeps the panel fresh without the
+            // traffic, and whatever text is current rides along with it.
+            const now = Date.now();
+            const stale = now - lastProgressPushAt >= PROGRESS_PUSH_INTERVAL_MS;
+            if (oldProgress !== job.progress || stale || progressCheckCount === 1) {
+              lastProgressPushAt = now;
               console.log(`[${jobId}] Progress: ${job.progress}% - ${job.progressText}`);
               this.saveJobState(jobId, job);
               this.updateController(jobId, 'running', null, null, job.progress, job.progressText);

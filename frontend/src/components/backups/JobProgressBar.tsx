@@ -2,7 +2,7 @@ interface JobProgressBarProps {
   progress: number
   phase?: string
   progressText?: string
-  jobType?: 'backup' | 'restore'
+  jobType?: 'backup' | 'restore' | 'replication'
   status?: string
 }
 
@@ -39,9 +39,12 @@ export default function JobProgressBar({
       case 'queued':
         return 'bg-gray-400'
       default:
-        return jobType === 'restore'
-          ? 'bg-gradient-to-r from-green-500 to-emerald-600'
-          : 'bg-gradient-to-r from-blue-500 to-blue-600'
+        if (jobType === 'restore') return 'bg-gradient-to-r from-green-500 to-emerald-600'
+        // Replication shares the purple the 'rsync' phase already uses, so a
+        // transfer reads the same whether it is a phase of a backup or a job
+        // of its own.
+        if (jobType === 'replication') return 'bg-gradient-to-r from-purple-500 to-purple-600'
+        return 'bg-gradient-to-r from-blue-500 to-blue-600'
     }
   }
 

@@ -1,12 +1,12 @@
 {
   "rocketChat": {
     "enabled": true,
-    "mode": "webhook",
+    "mode": "api",
     "webhookUrl": "https://chat.partcorp.ir/hooks/x4zYq3exkeYtBmHtv/NPWNBmMNhYwck2bwaJkBXd4FM7NiHwqKxBbpsNwmDyZA8Pt6",
-    "url": "",
-    "authToken": "NPWNBmMNhYwck2bwaJkBXd4FM7NiHwqKxBbpsNwmDyZA8Pt6",
-    "userId": "",
-    "channel": "",
+    "url": "https://chat.partcorp.ir",
+    "authToken": "wmT05OGlqLWXiRSCRFTx7suTdxlENvYJVr0TGgaZtta",
+    "userId": "ZyDJx8fGTXaN2JGse",
+    "channel": "event-cando-backup-migration",
     "entity": "Backup Manager",
     "version": "1.0.0"
   }

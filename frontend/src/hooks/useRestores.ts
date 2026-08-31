@@ -1,12 +1,15 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { restoreApi } from '@/services/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 export interface RestoreJob {
   id: string
   vmName: string
   method: string
   agentName: string
+  backupHostId?: string
+  backupHostName?: string
   status: 'queued' | 'running' | 'completed' | 'failed'
   progress: number
   progressText: string
@@ -98,7 +101,7 @@ export function useTriggerRestore() {
       toast.success('Restore started successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to start restore')
+      toast.error(getErrorMessage(error, 'Failed to start restore'))
     },
   })
 }
@@ -117,7 +120,7 @@ export function useKillRestoreJob() {
       toast.success('Restore job cancelled')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to cancel restore job')
+      toast.error(getErrorMessage(error, 'Failed to cancel restore job'))
     },
   })
 }

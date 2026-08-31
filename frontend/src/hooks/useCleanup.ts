@@ -1,6 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { cleanupApi } from '@/services/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 export interface CleanupFile {
   path: string
@@ -70,7 +71,7 @@ export function useExecuteCleanup() {
       toast.success(`Deleted ${data.data.totalDeleted} files (${formatBytes(data.data.totalSize)})`)
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to execute cleanup')
+      toast.error(getErrorMessage(error, 'Failed to execute cleanup'))
     },
   })
 }
@@ -90,7 +91,7 @@ export function useCleanupControllerJobs() {
       toast.success(`Deleted ${data.data.deletedCount} old restore jobs`)
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to cleanup controller jobs')
+      toast.error(getErrorMessage(error, 'Failed to cleanup controller jobs'))
     },
   })
 }

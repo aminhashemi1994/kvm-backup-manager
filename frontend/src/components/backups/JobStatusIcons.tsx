@@ -1,4 +1,6 @@
-import { CheckCircle, AlertTriangle, XCircle, HelpCircle, Loader2, Clock, Lock, RefreshCw } from 'lucide-react'
+import {
+  CheckCircle, AlertTriangle, XCircle, HelpCircle, Loader2, Clock, Lock, RefreshCw,
+} from 'lucide-react'
 import type { BackupJob } from '@/types'
 
 interface JobStatusIconsProps {
@@ -24,39 +26,45 @@ type IconKind =
   | 'rejected'
 
 /**
- * One icon per job summarising the outcome.
+ * One icon per backup/restore job summarising the outcome.
  *
  * Four outcome icons cover the request:
- *   - success (green)  — backup and (if scheduled) offsite sync both ok
- *   - warning (amber)  — partial success: e.g. backup ok but rsync failed,
- *                        or rsync ended as `partial`. An indeterminate failure
- *                        (no evidence either way) also lands here because the
- *                        safe read is "verify before trusting".
+ *   - success (green)  — backup completed (exit code 0, agent confirmed)
+ *   - warning (amber)  — finished but unverified (no exit code, agent never
+ *                        confirmed completion) — the safe read is "verify
+ *                        before trusting"
  *   - fail    (red)    — the backup itself failed
- *   - unknown (gray)   — we don't know: agent never confirmed the outcome,
- *                        or the only evidence is a `unknown` offsite result.
+ *   - unknown (gray)   — indeterminate: no agent record, no exit code
  *
- * Active jobs get their own transient icons (running/queued/retrying) plus
- * the matching OffsiteSyncBadge further down for the sync side.
+ * Active jobs get their own transient icons (running/queued/retrying).
  *
- * The full detail — exit code, offsite results, failure stage/reason,
- * verification status — is on hover so a single icon carries all four
- * status words without taking column width.
+ * Replication status used to be folded into this icon (a second dot beside
+ * the primary). Replication is now its own job with its own history page, so
+ * the offsite half lives there and this component is the backup half alone.
+ *
+ * The full detail — exit code, failure stage/reason, retry lineage — is on
+ * hover so a single icon carries everything without taking column width.
  */
-export default function JobStatusIcons({ job, coveringJob, className = '' }: JobStatusIconsProps) {
+export default function JobStatusIcons({
+  job,
+  coveringJob,
+  className = '',
+}: JobStatusIconsProps) {
   const kind = classify(job)
   const { Icon, color, label, animate } = ICONS[kind]
   const tooltip = buildTooltip(job, coveringJob)
 
   return (
-    <div
-      className={`inline-flex items-center justify-center h-7 w-7 rounded-full ${color} ${
-        animate ? 'animate-pulse' : ''
-      } ${className}`}
-      title={tooltip}
-      aria-label={label}
-    >
-      <Icon className="h-4 w-4" />
+    <div className="inline-flex items-center gap-1">
+      <div
+        className={`inline-flex items-center justify-center h-7 w-7 rounded-full ${color} ${
+          animate ? 'animate-pulse' : ''
+        } ${className}`}
+        title={tooltip}
+        aria-label={label}
+      >
+        <Icon className="h-4 w-4" />
+      </div>
     </div>
   )
 }
@@ -73,7 +81,7 @@ const ICONS: Record<
   warning: {
     Icon: AlertTriangle,
     color: 'bg-amber-100 text-amber-700',
-    label: 'Partial success',
+    label: 'Unverified',
   },
   fail: {
     Icon: XCircle,
@@ -117,8 +125,6 @@ const ICONS: Record<
 function classify(job: BackupJob): IconKind {
   const {
     status,
-    offsiteSyncStatus,
-    offsiteResults,
     verified,
     unverified,
     failureReason,
@@ -140,38 +146,14 @@ function classify(job: BackupJob): IconKind {
   }
 
   if (status === 'completed') {
-    // Trust the per-target offsite results: if every configured offsite
-    // target reports `success`, the job is fully successful regardless of
-    // a stale `failureStage === 'offsite'` flag left over from an earlier
-    // terminal update (a later retry/ingest can leave the flag set even
-    // after the sync has since completed). Without this, "backup ok,
-    // offsite ok after a retry" would still be painted as a warning.
-    const results = Array.isArray(offsiteResults) ? offsiteResults : []
-    let offsiteOk: boolean | null = null
-    if (results.length > 0) {
-      offsiteOk = results.every(r => r && (r.status === 'success' || r.status === 'synced'))
-    } else if (offsiteSyncStatus === 'completed') {
-      offsiteOk = true
-    } else if (offsiteSyncStatus === 'partial' || offsiteSyncStatus === 'failed') {
-      offsiteOk = false
-    } else if (offsiteSyncStatus === 'unknown') {
-      offsiteOk = null
-    }
-
     const noExitEvidence =
       unverified === true ||
       (verified === false && (exitCode === null || exitCode === undefined))
 
     // If we can't verify completion (no exit code, no agent confirmation),
     // we don't actually know the backup worked — even if the scheduler
-    // marks it completed. Treat the same as `unknown`.
-    if (noExitEvidence) {
-      // Without a confirmed backup, offsite couldn't have legitimately
-      // succeeded either — collapse to unknown.
-      return 'unknown'
-    }
-    if (offsiteOk === false) return 'warning'
-    if (offsiteOk === null && offsiteSyncStatus) return 'unknown'
+    // marks it completed. Treat as warning rather than green.
+    if (noExitEvidence) return 'warning'
     return 'success'
   }
 
@@ -189,8 +171,6 @@ function buildTooltip(job: BackupJob, coveringJob?: BackupJob): string {
     failureReason,
     verified,
     unverified,
-    offsiteSyncStatus,
-    offsiteResults,
     progress,
     phase,
     method,
@@ -202,7 +182,6 @@ function buildTooltip(job: BackupJob, coveringJob?: BackupJob): string {
     lines.push(`${typeLabel}: ${status}`)
     if (phase) lines.push(`Phase: ${phase}`)
     if (typeof progress === 'number') lines.push(`Progress: ${progress}%`)
-    if (offsiteSyncStatus) lines.push(`Offsite sync: ${offsiteSyncStatus}`)
     if ((job as any).retryOf) lines.push(`Retry of: ${(job as any).retryOf.substring(0, 8)}`)
     return lines.join('\n')
   }
@@ -213,17 +192,6 @@ function buildTooltip(job: BackupJob, coveringJob?: BackupJob): string {
       lines.push('Verified: no — agent never confirmed completion')
     } else if (verified) {
       lines.push('Verified: yes')
-    }
-    if (offsiteSyncStatus) {
-      lines.push(`Offsite sync: ${offsiteSyncStatus}`)
-      if (offsiteResults?.length) {
-        for (const r of offsiteResults) {
-          lines.push(`  ${r.ip}: ${r.status}${r.reason ? ` — ${r.reason}` : ''}`)
-        }
-      }
-      if (failureStage === 'offsite') lines.push('Offsite stage failed')
-    } else {
-      lines.push('Offsite sync: not scheduled')
     }
     if (error) lines.push(`Note: ${error}`)
     if ((job as any).retryOf) lines.push(`Retry of: ${(job as any).retryOf.substring(0, 8)}`)
@@ -240,14 +208,6 @@ function buildTooltip(job: BackupJob, coveringJob?: BackupJob): string {
       if (failureReason) lines.push(`Reason: ${failureReason}`)
       if (exitCode != null) lines.push(`Exit code: ${exitCode}`)
       if (method) lines.push(`Method: ${method}`)
-    }
-    if (offsiteSyncStatus) {
-      lines.push(`Offsite sync: ${offsiteSyncStatus}`)
-      if (offsiteResults?.length) {
-        for (const r of offsiteResults) {
-          lines.push(`  ${r.ip}: ${r.status}${r.reason ? ` — ${r.reason}` : ''}`)
-        }
-      }
     }
     if (error) lines.push(`Error: ${error}`)
     if ((job as any).retryOf) lines.push(`Retry of: ${(job as any).retryOf.substring(0, 8)}`)

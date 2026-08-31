@@ -298,6 +298,44 @@ export const certificatesApi = {
   check: () => api.post('/certificates/check'),
 }
 
+// Offsite replication jobs.
+//
+// Deliberately separate from backupsApi: a replication job has its own
+// lifecycle and its own meaning of failure, and the backup views should never
+// have to tell the two apart.
+export const offsiteJobsApi = {
+  getAll: (params?: { vmId?: string; status?: string; active?: string | number; limit?: number }) =>
+    api.get('/offsite-jobs', { params }),
+  getActive: () => api.get('/offsite-jobs', { params: { active: 1 } }),
+  getOne: (id: string) => api.get(`/offsite-jobs/${id}`),
+  getLog: (id: string) => api.get(`/offsite-jobs/${id}/log`),
+  // Start a sync for one VM. The controller coalesces: if a sync for this VM
+  // is already queued or running it answers 200 with that job instead of
+  // creating a second one.
+  create: (data: { vmId: string; scheduleId?: string | null }) => api.post('/offsite-jobs', data),
+  // `resetSourceGuard` re-records the source-filesystem baseline instead of
+  // refusing. It disarms the check that stops an unmounted pool from deleting
+  // the offsite copies, so it is only ever correct for a pool that has
+  // genuinely moved to new storage.
+  retry: (id: string, opts?: { resetSourceGuard?: boolean }) =>
+    api.post(`/offsite-jobs/${id}/retry`, { resetSourceGuard: opts?.resetSourceGuard === true }),
+  cancel: (id: string) => api.post(`/offsite-jobs/${id}/cancel`),
+  // Replication check — the periodic audit comparing each VM's backup
+  // directory against its offsite copies.
+  getCheckResults: () => api.get(`/offsite-jobs/check/results?t=${Date.now()}`),
+  // Runs synchronously on the controller and walks every VM's backup tree at
+  // both ends, so it needs far longer than the default. If it still outruns
+  // this, the check continues server-side and reports over the socket.
+  runCheck: (data?: { backupHostId?: string | null; sync?: boolean }) =>
+    api.post('/offsite-jobs/check/run', data || {}, { timeout: 15 * 60 * 1000 }),
+}
+
+// The panel's version, straight from the controller's package.json. The one
+// place any version string comes from — see routes/version.js.
+export const versionApi = {
+  get: () => api.get('/version'),
+}
+
 // General system settings (panel-managed defaults)
 export const settingsApi = {
   get: () => api.get('/settings'),

@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { cleanupBackupApi } from '@/services/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 interface CleanupBackupParams {
   vmId: string
@@ -25,7 +26,7 @@ export function useCleanupBackup() {
       queryClient.invalidateQueries({ queryKey: ['hypervisors'] })
     },
     onError: (error: any, variables) => {
-      const message = error.response?.data?.error || error.message || 'Failed to cleanup backup'
+      const message = getErrorMessage(error, 'Failed to cleanup backup')
       const details = error.response?.data?.message || ''
       const fullMessage = details ? `${message}\n${details}` : message
       toast.error(`Cleanup backup failed for ${variables.vmName}: ${fullMessage}`)

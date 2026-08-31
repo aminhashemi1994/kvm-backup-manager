@@ -11,6 +11,7 @@ import {
   FolderCog,
   HardDrive,
   Trash2,
+  ArrowRightLeft,
   Settings,
   Users,
   Shield,
@@ -20,6 +21,7 @@ import {
 import { cn } from '@/lib/utils'
 import { useState } from 'react'
 import { useSidebar } from '@/contexts/SidebarContext'
+import { useVersion } from '@/hooks/useVersion'
 
 interface NavGroup {
   label: string
@@ -57,6 +59,7 @@ const navGroups: NavGroup[] = [
       { name: 'Active Jobs', to: '/backups/active', icon: Activity },
       { name: 'Schedules', to: '/schedules', icon: Calendar },
       { name: 'History', to: '/backups/history', icon: History },
+      { name: 'Offsite Replication', to: '/offsite', icon: ArrowRightLeft },
     ],
   },
   {
@@ -83,6 +86,8 @@ const navGroups: NavGroup[] = [
 export default function Sidebar() {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const { collapsed: sidebarCollapsed, toggle: toggleSidebar } = useSidebar()
+  // From the controller, not a literal here — see hooks/useVersion.
+  const { data: version } = useVersion()
 
   const toggleGroup = (label: string) => {
     setCollapsed(prev => ({ ...prev, [label]: !prev[label] }))
@@ -165,8 +170,10 @@ export default function Sidebar() {
       {/* Footer */}
       <div className="p-3 border-t border-gray-200/30 dark:border-gray-700/30">
         <div className="rounded-xl bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-800 dark:to-gray-900 p-3">
-          <p className="text-[10px] font-medium text-gray-500 dark:text-gray-400">KVM Backup Manager</p>
-          <p className="text-[10px] text-gray-400 dark:text-gray-500">v1.0.0 • Open Source</p>
+          <p className="text-[10px] font-medium text-gray-500 dark:text-gray-400">{version?.name || 'KVM Backup Manager'}</p>
+          <p className="text-[10px] text-gray-400 dark:text-gray-500">
+            {version ? `v${version.version}` : 'v…'} • Open Source
+          </p>
           <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5 pt-1.5 border-t border-gray-200/40 dark:border-gray-700/40">
             Built by{' '}
             <a

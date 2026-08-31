@@ -30,6 +30,69 @@ router.get('/', async (req, res, next) => {
   }
 });
 
+// How long a single hypervisor is allowed to hold up the live-status sweep
+// below. Kept short and independent of `config.agentRequestTimeout` (which is
+// minutes, sized for real backup/restore calls) so one unreachable
+// hypervisor can't stall the others — each is probed in parallel and given
+// this long to answer before it's reported unreachable.
+const HYPERVISOR_STATUS_CHECK_TIMEOUT_MS = 10000;
+
+// Probe every hypervisor's live status in the background and push results
+// out as they land, instead of making the list request wait on all of them.
+// Previously this loop ran serially, inline, before the response was sent —
+// one unreachable hypervisor (each retried against the full multi-minute
+// agent timeout) could hold up the entire backup host's hypervisor list.
+function checkHypervisorStatusesInBackground(io, backupHostId, hostUrl, hostHypervisors) {
+  hostHypervisors.forEach((hypervisor) => {
+    agentService.testHypervisor(hostUrl, hypervisor.id, HYPERVISOR_STATUS_CHECK_TIMEOUT_MS)
+      .then(async (result) => {
+        const newStatus = result.success ? 'connected' : 'error';
+        const newLastError = result.success ? null : result.message;
+
+        const unchanged = hypervisor.status === newStatus && hypervisor.lastError === newLastError;
+
+        if (!unchanged) {
+          const allHypervisors = await getHypervisors();
+          const index = allHypervisors.findIndex(h => h.id === hypervisor.id);
+          if (index === -1) return; // deleted while the probe was in flight
+
+          allHypervisors[index] = {
+            ...allHypervisors[index],
+            status: newStatus,
+            lastError: newLastError,
+            updatedAt: new Date().toISOString(),
+          };
+          await saveHypervisors(allHypervisors);
+
+          if (!result.success) {
+            rocketChatService.notifyHypervisorConnectionFailed(
+              hypervisor.name,
+              hypervisor.ip,
+              result.message
+            );
+          }
+        }
+
+        // Always broadcast, even when nothing changed — the frontend re-arms
+        // its "Connecting..." state on every poll (see the `checking: true`
+        // overlay below) and relies on this event to clear it. Skipping the
+        // emit for the common steady-state case (already connected, still
+        // connected) left the card stuck showing "Connecting..." forever.
+        if (io) {
+          io.emit('hypervisor-status-updated', {
+            backupHostId,
+            hypervisorId: hypervisor.id,
+            status: newStatus,
+            lastError: newLastError,
+          });
+        }
+      })
+      .catch((error) => {
+        console.error(`[Hypervisors] Background status check failed for ${hypervisor.id}: ${error.message}`);
+      });
+  });
+}
+
 // GET /api/hypervisors/backup-host/:backupHostId
 router.get('/backup-host/:backupHostId', async (req, res, next) => {
   try {
@@ -37,64 +100,30 @@ router.get('/backup-host/:backupHostId', async (req, res, next) => {
     const vms = await getVirtualMachines();
     const hosts = await getBackupHosts();
     const host = hosts.find(h => h.id === req.params.backupHostId);
-    
+
     const hostHypervisors = hypervisors
       .filter(h => h.backupHostId === req.params.backupHostId)
       .map(h => {
         const hypervisorVMs = vms.filter(vm => vm.hypervisorId === h.id);
         return { ...h, vmCount: hypervisorVMs.length };
       });
-    
-    // If backup host is online, verify hypervisor status
-    if (host && host.status === 'online') {
+
+    // Respond immediately with what's already known — do not make the whole
+    // list wait on live connectivity checks. If the backup host is online,
+    // kick off a live status sweep in the background; the frontend shows a
+    // "checking" state per hypervisor until a `hypervisor-status-updated`
+    // socket event (or its own timeout) resolves it.
+    let checking = false;
+    if (host && host.status === 'online' && hostHypervisors.length > 0) {
       const hostUrl = ensureProtocol(host.url);
-      let statusUpdated = false;
-      
-      for (const hypervisor of hostHypervisors) {
-        try {
-          // Test hypervisor connection via agent
-          const result = await agentService.testHypervisor(hostUrl, hypervisor.id);
-          const newStatus = result.success ? 'connected' : 'error';
-          
-          // Update status if changed
-          if (hypervisor.status !== newStatus) {
-            hypervisor.status = newStatus;
-            hypervisor.lastError = result.success ? null : result.message;
-            hypervisor.updatedAt = new Date().toISOString();
-            statusUpdated = true;
-          }
-        } catch (error) {
-          // If test fails, mark as error
-          if (hypervisor.status !== 'error') {
-            hypervisor.status = 'error';
-            hypervisor.lastError = error.message;
-            hypervisor.updatedAt = new Date().toISOString();
-            statusUpdated = true;
-            
-            // Notify about hypervisor connection failure
-            rocketChatService.notifyHypervisorConnectionFailed(
-              hypervisor.name,
-              hypervisor.ip,
-              error.message
-            );
-          }
-        }
-      }
-      
-      // Save updated statuses
-      if (statusUpdated) {
-        const allHypervisors = await getHypervisors();
-        for (const updated of hostHypervisors) {
-          const index = allHypervisors.findIndex(h => h.id === updated.id);
-          if (index !== -1) {
-            allHypervisors[index] = updated;
-          }
-        }
-        await saveHypervisors(allHypervisors);
-      }
+      checkHypervisorStatusesInBackground(req.app.get('io'), host.id, hostUrl, hostHypervisors);
+      checking = true;
     }
-    
-    res.json({ success: true, data: hostHypervisors });
+
+    res.json({
+      success: true,
+      data: checking ? hostHypervisors.map(h => ({ ...h, checking: true })) : hostHypervisors,
+    });
   } catch (error) {
     next(error);
   }

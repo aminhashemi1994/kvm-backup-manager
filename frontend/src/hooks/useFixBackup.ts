@@ -1,6 +1,7 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { fixBackupApi } from '@/services/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 interface FixBackupParams {
   vmId: string
@@ -24,7 +25,7 @@ export function useFixBackup() {
       queryClient.invalidateQueries({ queryKey: ['hypervisors'] })
     },
     onError: (error: any, variables) => {
-      const message = error.response?.data?.error || error.message || 'Failed to fix backup'
+      const message = getErrorMessage(error, 'Failed to fix backup')
       toast.error(`Fix backup failed for ${variables.vmName}: ${message}`)
     },
   })

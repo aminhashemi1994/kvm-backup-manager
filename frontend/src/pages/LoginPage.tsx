@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Database, Loader2, AlertCircle } from 'lucide-react'
 import { toast } from '@/lib/utils'
+import { getErrorMessage } from '@/lib/errors'
 
 export default function LoginPage() {
   const [username, setUsername] = useState('')
@@ -39,7 +40,7 @@ export default function LoginPage() {
       }
     } catch (error: any) {
       console.error('Login error:', error)
-      const errorMessage = error.response?.data?.error || error.message || 'An error occurred during login. Please try again.'
+      const errorMessage = getErrorMessage(error, 'An error occurred during login. Please try again.')
       setError(errorMessage)
       toast.error('Login failed', {
         description: errorMessage,

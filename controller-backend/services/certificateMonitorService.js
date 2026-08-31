@@ -4,7 +4,8 @@ const crypto = require('crypto');
 const config = require('../config/config');
 const rocketChatService = require('./rocketChatService');
 const notificationPolicy = require('./notificationPolicyService');
-const { getBackupHosts } = require('./fileStorage');
+const { getBackupHosts, readJSON, writeJSON } = require('./fileStorage');
+const path = require('path');
 const agentService = require('./agentService');
 
 /**
@@ -26,8 +27,26 @@ const agentService = require('./agentService');
  *      link shows up in the panel.
  */
 
-// Days remaining at which we speak up. Crossing any of these sends one alert.
-const WARN_THRESHOLDS = [30, 14, 7, 3, 1];
+/**
+ * Renewal cadence.
+ *
+ * A certificate expiring is a slow, standing condition — not an event — so the
+ * old behaviour (one alert per crossed threshold, state held only in memory)
+ * re-announced every certificate on every controller restart and produced a
+ * message every few hours. What operators actually need is a reminder they can
+ * act on, at a rhythm that matches how urgent it is:
+ *
+ *   - Nothing at all until 15 days remain.
+ *   - Then one reminder a week, so it stays on the radar without becoming noise.
+ *   - Inside the last 3 days, one reminder a day, because now it needs doing.
+ *   - Once expired, one a day until somebody renews it.
+ *
+ * State is persisted, so a restart never restarts the cadence.
+ */
+const WARN_START_DAYS = 15;        // silent above this
+const URGENT_DAYS = 3;             // at or below this, remind daily
+const WEEKLY_RENOTIFY_MS = 7 * 24 * 60 * 60 * 1000;
+const DAILY_RENOTIFY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * 'unknown' means the agent has not completed a TLS handshake with the
@@ -40,7 +59,6 @@ function isDegradedMode(mode) {
   return !!mode && mode !== 'ok' && mode !== 'unknown';
 }
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;   // 4x/day is plenty for a daily-granularity signal
-const EXPIRED_RENOTIFY_MS = 24 * 60 * 60 * 1000; // keep nagging daily once actually expired
 
 class CertificateMonitorService {
   constructor() {
@@ -49,8 +67,11 @@ class CertificateMonitorService {
     this.targets = [];
     this.results = [];
     this.lastCheckedAt = null;
-    // target key -> { lastThreshold, lastExpiredAlertAt }
+    // target key -> { lastWarnAlertAt, lastWarnDays, lastExpiredAlertAt, ... }
+    // Persisted, so a controller restart does not re-announce every
+    // certificate that is merely approaching expiry.
     this.alertState = new Map();
+    this.stateFile = path.join(config.dataDir, 'certificate-alert-state.json');
     this.agentTlsReports = new Map(); // backupHostId/port -> tls state from the agent
   }
 
@@ -58,9 +79,33 @@ class CertificateMonitorService {
     this.io = io;
   }
 
+  async loadAlertState() {
+    try {
+      const stored = await readJSON(this.stateFile);
+      if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+        this.alertState = new Map(Object.entries(stored));
+      }
+    } catch (_) { /* first run, or unreadable — start clean */ }
+  }
+
+  async saveAlertState() {
+    try {
+      await writeJSON(this.stateFile, Object.fromEntries(this.alertState));
+    } catch (err) {
+      // Losing the file only costs us a duplicate reminder later; never let it
+      // break the check loop.
+      console.error('[CertMonitor] Could not persist alert state:', err.message);
+    }
+  }
+
   initialize(io) {
     if (io) this.io = io;
     this.targets = this.resolveTargets();
+    this.loadAlertState().then(() => {
+      if (this.alertState.size > 0) {
+        console.log(`  Alert state restored for ${this.alertState.size} target(s)`);
+      }
+    });
 
     console.log('✓ Certificate monitor initialized');
     if (this.targets.length === 0) {
@@ -325,13 +370,17 @@ class CertificateMonitorService {
    */
   async maybeAlert(result) {
     if (result.status === 'ok') {
-      this.alertState.delete(result.key);
+      if (this.alertState.delete(result.key)) this.saveAlertState();
       return;
     }
 
-    const allowed = await notificationPolicy.shouldNotify(null, 'certificateExpiry');
-    if (!allowed) return;
-
+    // No per-schedule gate here. A TLS certificate belongs to the platform, not
+    // to any backup schedule — asking "is certificateExpiry enabled on this
+    // schedule?" for a controller-wide certificate was meaningless, and it put
+    // a TLS switch in the schedule form where nobody would look for it. The
+    // only switches that apply are the global ones in
+    // Settings -> Notifications (certificateExpiring / certificateExpired),
+    // which rocketChatService checks in its own templates.
     const previous = this.alertState.get(result.key) || {};
 
     if (result.status === 'error') {
@@ -340,12 +389,13 @@ class CertificateMonitorService {
       // is a standing condition, not an event, and the same message every few
       // minutes buries the alerts that actually changed.
       const lastAt = previous.lastErrorAlertAt ? new Date(previous.lastErrorAlertAt).getTime() : 0;
-      if (previous.lastError === result.error && Date.now() - lastAt < EXPIRED_RENOTIFY_MS) return;
+      if (previous.lastError === result.error && Date.now() - lastAt < DAILY_RENOTIFY_MS) return;
       this.alertState.set(result.key, {
         ...previous,
         lastError: result.error,
         lastErrorAlertAt: new Date().toISOString(),
       });
+      this.saveAlertState();
       rocketChatService.notifyCriticalError(
         'TLS Certificate',
         `Cannot inspect certificate for ${result.label}`,
@@ -356,30 +406,50 @@ class CertificateMonitorService {
 
     if (result.status === 'expired') {
       const last = previous.lastExpiredAlertAt ? new Date(previous.lastExpiredAlertAt).getTime() : 0;
-      if (Date.now() - last < EXPIRED_RENOTIFY_MS) return;
+      if (Date.now() - last < DAILY_RENOTIFY_MS) return;
       this.alertState.set(result.key, { ...previous, lastExpiredAlertAt: new Date().toISOString() });
+      this.saveAlertState();
       notificationPolicy.getCertificateMentions('certificateExpired')
         .then(m => rocketChatService.notifyCertificateExpired(result, m))
         .catch(() => rocketChatService.notifyCertificateExpired(result, []));
       return;
     }
 
-    // Warning / critical: fire once per threshold band.
-    const band = WARN_THRESHOLDS.find(t => result.daysRemaining <= t);
-    if (band === undefined) return;
-    if (previous.lastThreshold !== undefined && previous.lastThreshold <= band) return;
+    // Still valid: remind on a cadence, not on every check.
+    if (typeof result.daysRemaining !== 'number') return;
+    if (result.daysRemaining > WARN_START_DAYS) return;
 
-    this.alertState.set(result.key, { ...previous, lastThreshold: band });
+    const urgent = result.daysRemaining <= URGENT_DAYS;
+    const interval = urgent ? DAILY_RENOTIFY_MS : WEEKLY_RENOTIFY_MS;
+    const lastAt = previous.lastWarnAlertAt ? new Date(previous.lastWarnAlertAt).getTime() : 0;
+    const elapsed = Date.now() - lastAt;
+
+    // Speak up when: never warned about this certificate before, enough time
+    // has passed for the current cadence, or the certificate has just crossed
+    // into the urgent band (so the step up from weekly to daily is not held
+    // back by a reminder sent six days ago).
+    const crossedIntoUrgent =
+      urgent && (previous.lastWarnDays === undefined || previous.lastWarnDays > URGENT_DAYS);
+
+    if (lastAt !== 0 && !crossedIntoUrgent && elapsed < interval) return;
+
+    this.alertState.set(result.key, {
+      ...previous,
+      lastWarnAlertAt: new Date().toISOString(),
+      lastWarnDays: result.daysRemaining,
+    });
+    this.saveAlertState();
+
     notificationPolicy.getCertificateMentions('certificateExpiring')
       .then(m => rocketChatService.notifyCertificateExpiring(result, m))
       .catch(() => rocketChatService.notifyCertificateExpiring(result, []));
   }
 
   /**
-   * A degraded agent link belongs to a backup host, so the schedules running on
-   * that host get a say — see notificationPolicyService.shouldNotifyForBackupHost.
-   * The panel banner is deliberately NOT gated on that: muting chat messages for
-   * a host should not hide the platform's TLS state from whoever opens the UI.
+   * A degraded agent link is infrastructure, so no schedule gets a vote on it:
+   * the global `agentTlsDegraded` switch in Settings -> Notifications decides
+   * whether it is sent. The panel banner is never gated at all — muting chat
+   * messages must not hide the platform's TLS state from whoever opens the UI.
    */
   announceAgentDegradation(backupHostId, agentLabel, tlsState) {
     const key = `agent:${agentLabel}`;
@@ -387,12 +457,12 @@ class CertificateMonitorService {
     if (previous.lastMode === tlsState.mode) return;
     this.alertState.set(key, { ...previous, lastMode: tlsState.mode });
 
-    notificationPolicy.shouldNotifyForBackupHost(backupHostId, 'certificateExpiry').then((allowed) => {
-      if (!allowed) return;
-      notificationPolicy.getCertificateMentions('agentTlsDegraded')
-        .then(m => rocketChatService.notifyAgentTlsDegraded(agentLabel, tlsState, m))
-        .catch(() => rocketChatService.notifyAgentTlsDegraded(agentLabel, tlsState, []));
-    }).catch(() => { /* alerting must never throw into the check loop */ });
+    // Also ungated by schedule policy: the agent link is infrastructure. The
+    // global `agentTlsDegraded` switch in Settings -> Notifications is the one
+    // that decides whether this is sent at all.
+    notificationPolicy.getCertificateMentions('agentTlsDegraded')
+      .then(m => rocketChatService.notifyAgentTlsDegraded(agentLabel, tlsState, m))
+      .catch(() => rocketChatService.notifyAgentTlsDegraded(agentLabel, tlsState, []));
 
     if (this.io) {
       this.io.emit('agent-tls-status', { agent: agentLabel, backupHostId, ...tlsState });

@@ -1,7 +1,10 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useEffect } from 'react'
 import { offsiteHostsApi } from '@/services/api'
 import { toast } from 'sonner'
+import socketService from '@/services/socket'
 import type { OffsiteHost } from '@/types'
+import { getErrorMessage } from '@/lib/errors'
 
 export function useOffsiteHosts() {
   return useQuery({
@@ -15,7 +18,8 @@ export function useOffsiteHosts() {
 }
 
 export function useOffsiteHostsByBackupHost(backupHostId: string) {
-  return useQuery({
+  const queryClient = useQueryClient()
+  const query = useQuery({
     queryKey: ['offsite-hosts', 'backup-host', backupHostId],
     queryFn: async () => {
       const response = await offsiteHostsApi.getByBackupHost(backupHostId)
@@ -24,6 +28,20 @@ export function useOffsiteHostsByBackupHost(backupHostId: string) {
     enabled: !!backupHostId,
     refetchInterval: 30000, // Refetch every 30 seconds to show updated health check status
   })
+
+  // See routes/offsiteHosts.js: the list is returned immediately, then each
+  // offsite host's live reachability is probed in the background and
+  // reported here as it resolves, rather than waiting on the next 30s poll.
+  useEffect(() => {
+    return socketService.on('offsite-host-status-updated', (data: { backupHostId: string; offsiteHostId: string; status: OffsiteHost['status']; lastError: string | null }) => {
+      if (data.backupHostId !== backupHostId) return
+      queryClient.setQueryData<OffsiteHost[]>(['offsite-hosts', 'backup-host', backupHostId], (old) =>
+        old?.map(h => h.id === data.offsiteHostId ? { ...h, status: data.status, checking: false } : h)
+      )
+    })
+  }, [queryClient, backupHostId])
+
+  return query
 }
 
 export function useCreateOffsiteHost() {
@@ -39,7 +57,7 @@ export function useCreateOffsiteHost() {
       toast.success('Offsite host added successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to add offsite host')
+      toast.error(getErrorMessage(error, 'Failed to add offsite host'))
     },
   })
 }
@@ -57,7 +75,7 @@ export function useDeleteOffsiteHost() {
       toast.success('Offsite host deleted successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to delete offsite host')
+      toast.error(getErrorMessage(error, 'Failed to delete offsite host'))
     },
   })
 }
@@ -75,7 +93,7 @@ export function useUpdateOffsiteHost() {
       toast.success('Offsite host updated successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to update offsite host')
+      toast.error(getErrorMessage(error, 'Failed to update offsite host'))
     },
   })
 }
@@ -93,7 +111,7 @@ export function useTestOffsiteHost() {
       toast.success('Connection test completed')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Connection test failed')
+      toast.error(getErrorMessage(error, 'Connection test failed'))
     },
   })
 }
@@ -125,7 +143,7 @@ export function useCreateOffsitePool() {
       toast.success('Storage pool added successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to add storage pool')
+      toast.error(getErrorMessage(error, 'Failed to add storage pool'))
     },
   })
 }
@@ -151,7 +169,7 @@ export function useUpdateOffsitePool() {
       toast.success('Storage pool updated successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to update storage pool')
+      toast.error(getErrorMessage(error, 'Failed to update storage pool'))
     },
   })
 }
@@ -170,7 +188,7 @@ export function useDeleteOffsitePool() {
     },
     onError: (error: any) => {
       // Surfaces the 409 message when a schedule still references the pool.
-      toast.error(error.response?.data?.error || 'Failed to delete storage pool')
+      toast.error(getErrorMessage(error, 'Failed to delete storage pool'))
     },
   })
 }
@@ -193,7 +211,7 @@ export function useValidateOffsitePool() {
       }
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to validate storage pool')
+      toast.error(getErrorMessage(error, 'Failed to validate storage pool'))
     },
   })
 }

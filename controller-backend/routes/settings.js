@@ -25,6 +25,17 @@ const DEFAULTS = {
   // file (<logDir>/<jobId>.log). 0 disables automatic deletion — logs are
   // kept until manually removed via the Cleanup page.
   jobLogRetentionDays: 90,
+  // How often the replication check compares every VM's backup directory
+  // against its offsite copies. Hours; 0 turns the check off.
+  //
+  // Daily by default. It walks every VM on every backup host and stats the
+  // whole tree at both ends, so it is a periodic audit rather than something to
+  // watch — the point is noticing replication that has quietly fallen behind,
+  // which is a state measured in days, not minutes.
+  replicationCheckIntervalHours: 24,
+  // Queue a sync automatically for each VM the check finds behind. On by
+  // default: finding the problem and not fixing it is rarely what anyone wants.
+  replicationCheckAutoSync: true,
 };
 
 async function loadSettings() {
@@ -62,6 +73,18 @@ function validate(payload) {
     // 0 = disabled (never auto-delete). Otherwise 1–3650 (~10 years).
     if (!Number.isFinite(n) || n < 0 || n > 3650) {
       errors.push('jobLogRetentionDays must be a number between 0 and 3650 (0 = disabled)');
+    }
+  }
+  if (payload.replicationCheckIntervalHours !== undefined) {
+    const n = Number(payload.replicationCheckIntervalHours);
+    // 0 = disabled. Otherwise 1–168 (a week).
+    if (!Number.isFinite(n) || n < 0 || n > 168) {
+      errors.push('replicationCheckIntervalHours must be a number between 0 and 168 (0 = disabled)');
+    }
+  }
+  if (payload.replicationCheckAutoSync !== undefined) {
+    if (typeof payload.replicationCheckAutoSync !== 'boolean') {
+      errors.push('replicationCheckAutoSync must be true or false');
     }
   }
   return errors;
@@ -118,9 +141,31 @@ router.put('/', requireAdmin, async (req, res, next) => {
     if (incoming.jobLogRetentionDays !== undefined) {
       merged.jobLogRetentionDays = Number(incoming.jobLogRetentionDays);
     }
+    if (incoming.replicationCheckIntervalHours !== undefined) {
+      merged.replicationCheckIntervalHours = Number(incoming.replicationCheckIntervalHours);
+    }
+    if (incoming.replicationCheckAutoSync !== undefined) {
+      merged.replicationCheckAutoSync = incoming.replicationCheckAutoSync === true;
+    }
     merged.updatedAt = new Date().toISOString();
 
     await writeJSON(SETTINGS_FILE, merged);
+
+    // Re-arm the replication check against the new cadence immediately.
+    // Its timer only re-read the interval when it next fired, so a change
+    // took up to a full interval to apply — and setting the interval to 0
+    // cleared the timer with nothing left to re-arm it, leaving the check
+    // permanently off until a controller restart even after turning it back on.
+    if (incoming.replicationCheckIntervalHours !== undefined) {
+      try {
+        const replicationCheckService = require('../services/replicationCheckService');
+        const armed = await replicationCheckService.reschedule();
+        console.log(`[Settings] Replication check re-armed: ${
+          armed.enabled ? `every ${merged.replicationCheckIntervalHours}h` : 'disabled'}`);
+      } catch (err) {
+        console.error(`[Settings] Could not re-arm the replication check: ${err.message}`);
+      }
+    }
 
     let propagated = null;
     if (incoming.applyConcurrencyToAllHosts === true) {

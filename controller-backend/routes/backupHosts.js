@@ -5,6 +5,53 @@ const { getBackupHosts, saveBackupHosts, getHypervisors, getVirtualMachines } = 
 const agentService = require('../services/agentService');
 const { validateBackupHost } = require('../utils/validator');
 
+// How long a single backup host is allowed to hold up the live-status sweep
+// below — see the matching constant/helper in routes/hypervisors.js for why
+// this is short and separate from the multi-minute agent request timeout.
+const BACKUP_HOST_STATUS_CHECK_TIMEOUT_MS = 10000;
+
+// Re-verify every backup host's reachability in the background and push
+// results out as they land, so the list itself never waits on it — the
+// stored `status`/`lastHealthCheck` (shown immediately) is refreshed
+// underneath the already-rendered list.
+function checkBackupHostStatusesInBackground(io, hosts) {
+  hosts.forEach((host) => {
+    agentService.healthCheck(host.url, BACKUP_HOST_STATUS_CHECK_TIMEOUT_MS)
+      .then(async (result) => {
+        const newStatus = result.success ? 'online' : 'offline';
+        const unchanged = host.status === newStatus;
+
+        if (!unchanged) {
+          const allHosts = await getBackupHosts();
+          const index = allHosts.findIndex(h => h.id === host.id);
+          if (index === -1) return; // deleted while the probe was in flight
+
+          allHosts[index] = {
+            ...allHosts[index],
+            status: newStatus,
+            lastHealthCheck: new Date().toISOString(),
+          };
+          await saveBackupHosts(allHosts);
+        }
+
+        // Always broadcast, even when nothing changed — see the matching
+        // fix/comment in routes/hypervisors.js. The frontend re-arms its
+        // "Checking..." state on every list poll and only clears it on this
+        // event, so skipping the emit for an already-healthy host left the
+        // card stuck on "Checking..." forever.
+        if (io) {
+          io.emit('backup-host-status-updated', {
+            backupHostId: host.id,
+            status: newStatus,
+          });
+        }
+      })
+      .catch((error) => {
+        console.error(`[BackupHosts] Background status check failed for ${host.id}: ${error.message}`);
+      });
+  });
+}
+
 // GET /api/backup-hosts - List all backup hosts
 router.get('/', async (req, res, next) => {
   try {
@@ -23,7 +70,18 @@ router.get('/', async (req, res, next) => {
       };
     });
 
-    res.json({ success: true, data: enrichedHosts });
+    // Respond immediately with the stored/enriched list — every host shows
+    // up as soon as this resolves. Re-verify reachability in the background;
+    // the frontend shows a "checking" badge until a `backup-host-status-updated`
+    // socket event (or its own timeout) resolves it.
+    if (hosts.length > 0) {
+      checkBackupHostStatusesInBackground(req.app.get('io'), hosts);
+    }
+
+    res.json({
+      success: true,
+      data: enrichedHosts.map(h => ({ ...h, checking: true })),
+    });
   } catch (error) {
     next(error);
   }

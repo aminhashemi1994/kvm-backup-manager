@@ -10,6 +10,7 @@ import { metricsApi, storagePoolsApi } from '@/services/api'
 import MetricsCard from '@/components/metrics/MetricsCard'
 import RemoteHostMetrics from '@/components/metrics/RemoteHostMetrics'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 export default function Resources() {
   const [selectedHostId, setSelectedHostId] = useState<string>('')
@@ -97,7 +98,7 @@ export default function Resources() {
       toast.success('Metrics refreshed successfully')
     } catch (error: any) {
       console.error('Failed to trigger collection:', error)
-      toast.error(error.response?.data?.error || 'Failed to refresh metrics')
+      toast.error(getErrorMessage(error, 'Failed to refresh metrics'))
     } finally {
       setIsCollecting(false)
     }

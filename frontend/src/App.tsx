@@ -17,6 +17,7 @@ import Resources from './pages/Resources'
 import BackupManagement from './pages/BackupManagement'
 import StoragePoolsPage from './pages/StoragePoolsPage'
 import CleanupPage from './pages/CleanupPage'
+import OffsiteSyncPage from './pages/OffsiteSyncPage'
 import SettingsPage from './pages/SettingsPage'
 import { useHealthCheckOnMount } from './hooks/useHealthCheck'
 
@@ -139,6 +140,16 @@ function AppRoutes() {
           <PrivateRoute>
             <Layout>
               <StoragePoolsPage />
+            </Layout>
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/offsite"
+        element={
+          <PrivateRoute>
+            <Layout>
+              <OffsiteSyncPage />
             </Layout>
           </PrivateRoute>
         }

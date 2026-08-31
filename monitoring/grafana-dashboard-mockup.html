@@ -1,0 +1,847 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backup Manager — Grafana dashboard mockup</title>
+<style>
+  :root {
+    --bg:        #111217;
+    --panel:     #181B1F;
+    --panel-2:   #1F2328;
+    --border:    #2C3235;
+    --border-2:  #3D444B;
+    --text:      #CCCCDC;
+    --text-2:    #9FA7B3;
+    --text-3:    #6E7681;
+    --green:     #73BF69;
+    --red:       #F2495C;
+    --orange:    #FF9830;
+    --blue:      #5794F2;
+    --purple:    #B877D9;
+    --yellow:    #FADE2A;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: "Roboto Mono", ui-monospace, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- Grafana chrome ---------- */
+  .topbar {
+    display: flex; align-items: center; gap: 14px;
+    padding: 0 16px; height: 44px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 20;
+  }
+  .brand { font-weight: 600; font-size: 14px; color: var(--text); }
+  .crumb { color: var(--text-3); }
+  .tabs { display: flex; gap: 2px; margin-left: 8px; }
+  .tab {
+    background: none; border: 0; border-bottom: 2px solid transparent;
+    color: var(--text-2); font-family: var(--font); font-size: 13px;
+    padding: 12px 12px 10px; cursor: pointer;
+  }
+  .tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--orange); }
+  .tab:hover { color: var(--text); }
+  .spacer { flex: 1; }
+  .timepick {
+    display: flex; align-items: center; gap: 7px;
+    border: 1px solid var(--border-2); border-radius: 2px;
+    padding: 4px 9px; color: var(--text-2); font-size: 12px;
+  }
+
+  .varbar {
+    display: flex; flex-wrap: wrap; gap: 16px;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .var { display: flex; align-items: center; }
+  .var .k {
+    background: var(--panel-2); border: 1px solid var(--border-2);
+    border-right: 0; border-radius: 2px 0 0 2px;
+    padding: 4px 9px; color: var(--text-2); font-size: 12px;
+  }
+  .var .v {
+    background: var(--panel); border: 1px solid var(--border-2);
+    border-radius: 0 2px 2px 0;
+    padding: 4px 9px; color: var(--text); font-size: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .var .v::after { content: "⌄"; color: var(--text-3); font-size: 13px; line-height: 0.6; }
+
+  /* ---------- Grid ---------- */
+  .board { padding: 12px; display: grid; grid-template-columns: repeat(12, 1fr); gap: 10px; }
+  .board[hidden] { display: none; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    display: flex; flex-direction: column;
+    min-width: 0;
+  }
+  .panel > header {
+    padding: 7px 10px 5px;
+    font-size: 12.5px; font-weight: 500; color: var(--text-2);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .panel > header .menu { margin-left: auto; color: var(--text-3); letter-spacing: 1px; }
+  .body { padding: 0 10px 10px; flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+  .c2 { grid-column: span 2; } .c3 { grid-column: span 3; }
+  .c4 { grid-column: span 4; } .c5 { grid-column: span 5; }
+  .c6 { grid-column: span 6; } .c7 { grid-column: span 7; }
+  .c12 { grid-column: span 12; }
+  /* adaptive state timeline — buckets scale so any range fits the width */
+  .tlbar { display: flex; gap: 6px; align-items: center; margin-bottom: 10px;
+           font-size: 11px; color: #8e9297; flex-wrap: wrap; }
+  .tlbtn { padding: 2px 9px; border: 1px solid #2c3235; border-radius: 3px; cursor: pointer;
+           color: #d8d9da; background: #181b1f; font-size: 11px; }
+  .tlbtn.on { background: #2c3235; border-color: #4d5257; color: #fff; }
+  .tlnote { color: #6e7681; }
+  .tllegend { margin-left: auto; display: flex; gap: 12px; align-items: center; }
+  .tlkey { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+           margin-right: 5px; vertical-align: -1px; }
+  .tl { display: flex; flex-direction: column; gap: 3px; }
+  .tlrow { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 10px; align-items: center; }
+  .tlrow .name { font-size: 11px; color: #d8d9da; white-space: nowrap; overflow: hidden;
+                 text-overflow: ellipsis; }
+  .tlcells { display: flex; gap: 1px; }
+  /* flex:1 with min-width:0 is what makes 30 cells and 3000 cells both fit */
+  .tlcell { flex: 1 1 0; min-width: 0; height: 16px; border-radius: 1px; background: #24262b; }
+  .tlticks { display: flex; justify-content: space-between; font-size: 10px;
+             color: #8e9297; padding-top: 4px; }
+
+  /* ---------- Stat panels ---------- */
+  .stat { align-items: center; justify-content: center; text-align: center; padding-bottom: 14px; }
+  .stat .big {
+    font-size: 38px; font-weight: 500; line-height: 1.05;
+    font-variant-numeric: tabular-nums; letter-spacing: -.02em;
+  }
+  .stat .sub { font-size: 11.5px; color: var(--text-3); margin-top: 3px; }
+  .stat.bg-red    { background: rgba(242, 73, 92, .16); }
+  .stat.bg-orange { background: rgba(255, 152, 48, .15); }
+  .stat.bg-green  { background: rgba(115, 191, 105, .13); }
+  .green { color: var(--green); } .red { color: var(--red); }
+  .orange { color: var(--orange); } .blue { color: var(--blue); }
+  .muted { color: var(--text-3); } .purple { color: var(--purple); }
+
+  .pair { display: flex; align-items: baseline; gap: 6px; justify-content: center; }
+  .pair .of { font-size: 20px; color: var(--text-3); font-weight: 400; }
+
+  /* ---------- Tables ---------- */
+  .tablewrap { overflow: auto; max-height: 340px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  thead th {
+    position: sticky; top: 0;
+    background: var(--panel-2); color: var(--text-2);
+    font-weight: 500; font-size: 11.5px;
+    text-align: left; padding: 6px 8px; white-space: nowrap;
+    border-bottom: 1px solid var(--border);
+  }
+  tbody td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tbody tr:hover td { background: rgba(255, 255, 255, .03); }
+  .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .vm {
+    font-family: var(--mono); font-size: 11.5px;
+    max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  .cellbg {
+    display: block; margin: -5px -8px; padding: 5px 8px;
+    font-weight: 500; white-space: nowrap;
+  }
+  .bg-completed { background: rgba(115, 191, 105, .22); color: #C8E6C2; }
+  .bg-failed    { background: rgba(242, 73, 92, .25);  color: #FBC3C8; }
+  .bg-running   { background: rgba(87, 148, 242, .22); color: #C0D8FB; }
+  .bg-partial   { background: rgba(255, 152, 48, .22); color: #FFD9AC; }
+  .bg-skipped   { background: rgba(250, 222, 42, .16); color: #F3E9A8; }
+  .bg-none      { background: rgba(110, 118, 129, .18); color: var(--text-2); }
+
+  /* ---------- Inline gauge cell ---------- */
+  .gaugecell { display: flex; align-items: center; gap: 7px; min-width: 130px; }
+  .track { flex: 1; height: 11px; background: var(--panel-2); border-radius: 2px; overflow: hidden; position: relative; }
+  .fill { height: 100%; border-radius: 2px; }
+  .track .mark { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--border-2); }
+  .gaugecell .val { font-family: var(--mono); font-size: 11px; width: 38px; text-align: right; }
+
+  /* ---------- Bar gauge panel ---------- */
+  .bars { display: flex; flex-direction: column; gap: 7px; padding-top: 2px; }
+  .bar { display: grid; grid-template-columns: minmax(0, 1fr) 52px; gap: 8px; align-items: center; }
+  .bar .label {
+    font-family: var(--mono); font-size: 11px; color: var(--text-2);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 2px;
+  }
+  .bar .num { font-family: var(--mono); font-size: 12px; text-align: right; }
+  .bartrack { height: 14px; background: var(--panel-2); border-radius: 2px; overflow: hidden; position: relative; }
+
+  /* ---------- Legend ---------- */
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; padding-top: 8px; font-size: 11.5px; color: var(--text-2); }
+  .legend i { width: 9px; height: 3px; border-radius: 2px; display: inline-block; margin-right: 5px; vertical-align: middle; }
+
+  /* ---------- Donut ---------- */
+  .donutwrap { display: flex; align-items: center; gap: 16px; justify-content: center; flex: 1; }
+  .donut-legend { display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+  .donut-legend div { display: flex; align-items: center; gap: 7px; }
+  .donut-legend i { width: 9px; height: 9px; border-radius: 2px; }
+  .donut-legend .n { font-family: var(--mono); color: var(--text); margin-left: auto; }
+
+  svg { display: block; width: 100%; overflow: visible; }
+  .axis { fill: var(--text-3); font-size: 9.5px; font-family: var(--font); }
+  .grid { stroke: var(--border); stroke-width: 1; }
+
+  @media (max-width: 1100px) {
+    .c2, .c3, .c4, .c5 { grid-column: span 6; }
+    .c6, .c7 { grid-column: span 12; }
+  }
+  @media (max-width: 620px) {
+    .c2, .c3, .c4, .c5, .c6, .c7 { grid-column: span 12; }
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="brand">Backup Manager</span>
+  <span class="crumb">/</span>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" aria-selected="true" data-board="vms">Virtual machines</button>
+    <button class="tab" role="tab" aria-selected="false" data-board="infra">Hosts &amp; hypervisors</button>
+  </div>
+  <span class="spacer"></span>
+  <span class="timepick">🕘 Last 24 hours &nbsp;·&nbsp; 30s</span>
+</div>
+
+<div class="varbar">
+  <span class="var"><span class="k">vm</span><span class="v">All</span></span>
+  <span class="var"><span class="k">hypervisor</span><span class="v">All</span></span>
+  <span class="var"><span class="k">backup_host</span><span class="v">All</span></span>
+</div>
+
+<!-- ========================= DASHBOARD A ========================= -->
+<div class="board" id="board-vms">
+
+  <div class="panel c2"><header>Protected VMs<span class="menu">⋮</span></header>
+    <div class="body stat"><div class="big pair"><span>37</span><span class="of">/ 42</span></div>
+      <div class="sub">with an enabled schedule</div></div></div>
+
+  <div class="panel c2"><header>Unprotected<span class="menu">⋮</span></header>
+    <div class="body stat bg-red"><div class="big red">5</div>
+      <div class="sub">no schedule at all</div></div></div>
+
+  <div class="panel c2"><header>Overdue<span class="menu">⋮</span></header>
+    <div class="body stat bg-orange"><div class="big orange">3</div>
+      <div class="sub">past their own RPO</div></div></div>
+
+  <div class="panel c2"><header>Never backed up<span class="menu">⋮</span></header>
+    <div class="body stat bg-red"><div class="big red">1</div>
+      <div class="sub">scheduled, never succeeded</div></div></div>
+
+  <div class="panel c2"><header>In progress<span class="menu">⋮</span></header>
+    <div class="body stat"><div class="big pair"><span class="blue">2</span><span class="of">/ 4</span></div>
+      <div class="sub">running / queued</div></div></div>
+
+  <div class="panel c2"><header>Offsite incomplete<span class="menu">⋮</span></header>
+    <div class="body stat bg-orange"><div class="big pair"><span class="orange">2</span><span class="of">/ 1</span></div>
+      <div class="sub">partial / failed</div></div></div>
+
+  <!-- VM inventory -->
+  <div class="panel c12" id="historypanel"><header>Job history — latest run per VM<span class="menu">⋮</span></header>
+    <div class="body"><div class="tablewrap"><table>
+      <thead><tr>
+        <th>Type</th><th>VM</th><th>Method</th><th>Status</th><th>Progress</th>
+        <th>Duration</th><th>Exit</th><th>Started</th><th>Offsite</th><th>Offsite OK</th><th>Synced</th>
+      </tr></thead>
+      <tbody id="inventory"></tbody>
+    </table></div></div></div>
+
+  <!-- Backup outcome over time -->
+  <div class="panel c12"><header>Backup outcome over time — per VM<span class="menu">⋮</span></header>
+    <div class="body">
+      <div class="tlbar" id="tlcontrols"></div>
+      <div class="tl" id="tlbackup"></div>
+      <div class="tlticks" id="tlticks"></div>
+    </div></div>
+
+  <!-- Offsite replication over time -->
+  <div class="panel c12"><header>Offsite replication over time — per VM<span class="menu">⋮</span></header>
+    <div class="body">
+      <div class="tl" id="tloffsite"></div>
+      <div class="tlticks" id="tlticks2"></div>
+    </div></div>
+
+  <!-- Failed runs per day -->
+  <div class="panel c5"><header>Failed runs per day<span class="menu">⋮</span></header>
+    <div class="body"><div class="bars" id="perday"></div></div></div>
+
+  <!-- Offsite replication matrix -->
+  <div class="panel c7"><header>Offsite replication — VM × destination<span class="menu">⋮</span></header>
+    <div class="body"><div class="tablewrap"><table id="offsitematrix"></table></div></div></div>
+
+  <!-- Outcomes -->
+  <div class="panel c5"><header>Outcomes, last 24h<span class="menu">⋮</span></header>
+    <div class="body"><div class="donutwrap">
+      <svg viewBox="0 0 120 120" style="width:130px;height:130px" aria-label="Outcome breakdown">
+        <circle cx="60" cy="60" r="46" fill="none" stroke="#73BF69" stroke-width="20"
+                stroke-dasharray="240.3 48.7" transform="rotate(-90 60 60)"></circle>
+        <circle cx="60" cy="60" r="46" fill="none" stroke="#F2495C" stroke-width="20"
+                stroke-dasharray="26.9 262.1" stroke-dashoffset="-240.3" transform="rotate(-90 60 60)"></circle>
+        <circle cx="60" cy="60" r="46" fill="none" stroke="#FADE2A" stroke-width="20"
+                stroke-dasharray="15.4 273.6" stroke-dashoffset="-267.2" transform="rotate(-90 60 60)"></circle>
+        <circle cx="60" cy="60" r="46" fill="none" stroke="#6E7681" stroke-width="20"
+                stroke-dasharray="6.4 282.6" stroke-dashoffset="-282.6" transform="rotate(-90 60 60)"></circle>
+        <text x="60" y="58" text-anchor="middle" fill="#CCCCDC" font-size="21" font-weight="500">47</text>
+        <text x="60" y="72" text-anchor="middle" fill="#6E7681" font-size="9">runs</text>
+      </svg>
+      <div class="donut-legend">
+        <div><i style="background:#73BF69"></i>completed<span class="n">39</span></div>
+        <div><i style="background:#F2495C"></i>failed<span class="n">4</span></div>
+        <div><i style="background:#FADE2A"></i>skipped<span class="n">3</span></div>
+        <div><i style="background:#6E7681"></i>rejected<span class="n">1</span></div>
+      </div>
+    </div></div></div>
+
+  <!-- In flight -->
+  <div class="panel c6"><header>In flight<span class="menu">⋮</span></header>
+    <div class="body"><div class="bars" id="inflight"></div></div></div>
+
+  <!-- Failing offsite -->
+  <div class="panel c6"><header>Offsite destinations not synced<span class="menu">⋮</span></header>
+    <div class="body"><div class="tablewrap"><table>
+      <thead><tr><th>VM</th><th>Destination</th><th>Result</th></tr></thead>
+      <tbody id="offsitefail"></tbody>
+    </table></div></div></div>
+
+  <!-- Duration trend -->
+  <div class="panel c12"><header>Backup duration<span class="menu">⋮</span></header>
+    <div class="body">
+      <svg viewBox="0 0 900 200" height="200" id="durchart" aria-label="Backup duration over time"></svg>
+      <div class="legend">
+        <span><i style="background:#5794F2"></i>office-core-1</span>
+        <span><i style="background:#73BF69"></i>office-database-1</span>
+        <span><i style="background:#B877D9"></i>farashenasamellat-core-1</span>
+      </div>
+    </div></div>
+</div>
+
+<!-- ========================= DASHBOARD B ========================= -->
+<div class="board" id="board-infra" hidden>
+
+  <div class="panel c3"><header>Backup hosts online<span class="menu">⋮</span></header>
+    <div class="body stat bg-red"><div class="big pair"><span class="red">2</span><span class="of">/ 3</span></div>
+      <div class="sub">reachable</div></div></div>
+
+  <div class="panel c3"><header>Hypervisors connected<span class="menu">⋮</span></header>
+    <div class="body stat bg-green"><div class="big pair"><span class="green">6</span><span class="of">/ 6</span></div>
+      <div class="sub">reachable</div></div></div>
+
+  <div class="panel c3"><header>Offsite hosts online<span class="menu">⋮</span></header>
+    <div class="body stat bg-green"><div class="big green">100%</div>
+      <div class="sub">2 of 2 destinations</div></div></div>
+
+  <div class="panel c3"><header>Metrics collection age<span class="menu">⋮</span></header>
+    <div class="body stat bg-green"><div class="big green">38 s</div>
+      <div class="sub">controller answering · 2,541 series</div></div></div>
+
+  <!-- Backup hosts -->
+  <div class="panel c6"><header>Backup hosts<span class="menu">⋮</span></header>
+    <div class="body"><div class="tablewrap"><table>
+      <thead><tr><th>Host</th><th>State</th><th>Last check</th><th>Running</th><th>Queued</th></tr></thead>
+      <tbody>
+        <tr><td class="vm">bh-site1-01</td><td><span class="cellbg bg-completed">Online</span></td>
+            <td class="num">42 s</td><td class="num">2</td><td class="num">4</td></tr>
+        <tr><td class="vm">bh-site2-01</td><td><span class="cellbg bg-completed">Online</span></td>
+            <td class="num">51 s</td><td class="num">0</td><td class="num">0</td></tr>
+        <tr><td class="vm">bh-site2-02</td><td><span class="cellbg bg-failed">Offline</span></td>
+            <td class="num orange">18 min</td><td class="num muted">—</td><td class="num muted">—</td></tr>
+      </tbody>
+    </table></div></div></div>
+
+  <!-- Hypervisors -->
+  <div class="panel c6"><header>Hypervisors<span class="menu">⋮</span></header>
+    <div class="body"><div class="tablewrap"><table>
+      <thead><tr><th>Hypervisor</th><th>State</th><th>Last test</th><th>VMs</th><th>Protected</th><th>Exposed</th></tr></thead>
+      <tbody>
+        <tr><td class="vm">kvm-office-01</td><td><span class="cellbg bg-completed">Up</span></td>
+            <td class="num">2 min</td><td class="num">14</td><td class="num">14</td><td class="num green">0</td></tr>
+        <tr><td class="vm">kvm-office-02</td><td><span class="cellbg bg-completed">Up</span></td>
+            <td class="num">2 min</td><td class="num">11</td><td class="num">9</td><td class="num orange">2</td></tr>
+        <tr><td class="vm">kvm-fsm-dev-01</td><td><span class="cellbg bg-completed">Up</span></td>
+            <td class="num">3 min</td><td class="num">9</td><td class="num">8</td><td class="num orange">1</td></tr>
+        <tr><td class="vm">kvm-fsm-test-01</td><td><span class="cellbg bg-completed">Up</span></td>
+            <td class="num">3 min</td><td class="num">6</td><td class="num">4</td><td class="num orange">2</td></tr>
+        <tr><td class="vm">kvm-ovn-01</td><td><span class="cellbg bg-completed">Up</span></td>
+            <td class="num">4 min</td><td class="num">2</td><td class="num">2</td><td class="num green">0</td></tr>
+      </tbody>
+    </table></div></div></div>
+
+  <!-- Storage pools -->
+  <div class="panel c7"><header>Storage pool usage<span class="menu">⋮</span></header>
+    <div class="body"><div class="bars" id="poolbars"></div></div></div>
+
+  <!-- Free space trend -->
+  <div class="panel c5"><header>Free space<span class="menu">⋮</span></header>
+    <div class="body">
+      <svg viewBox="0 0 460 190" height="190" id="freechart" aria-label="Free space over time"></svg>
+      <div class="legend">
+        <span><i style="background:#5794F2"></i>bh-site1-01 / hdd-1</span>
+        <span><i style="background:#73BF69"></i>bh-site2-01 / hdd-1</span>
+      </div>
+    </div></div>
+
+  <!-- Offsite capacity -->
+  <div class="panel c6"><header>Offsite capacity<span class="menu">⋮</span></header>
+    <div class="body"><div class="bars" id="offsitebars"></div></div></div>
+
+  <!-- Certificates & freshness -->
+  <div class="panel c6"><header>Certificates &amp; data freshness<span class="menu">⋮</span></header>
+    <div class="body"><div class="tablewrap"><table>
+      <thead><tr><th>Item</th><th>Value</th><th>State</th></tr></thead>
+      <tbody>
+        <tr><td class="vm">cando-backup.simorgh.partcorp.ir:443</td><td class="num">64 days</td>
+            <td><span class="cellbg bg-completed">OK</span></td></tr>
+        <tr><td class="vm">/etc/nginx/ssl/certificate.crt</td><td class="num orange">21 days</td>
+            <td><span class="cellbg bg-partial">Renew soon</span></td></tr>
+        <tr><td class="vm">Storage figures age</td><td class="num">4 min</td>
+            <td><span class="cellbg bg-completed">Fresh</span></td></tr>
+        <tr><td class="vm">Offsite figures age</td><td class="num">3 min</td>
+            <td><span class="cellbg bg-completed">Fresh</span></td></tr>
+        <tr><td class="vm">Controller scrape time</td><td class="num">0.08 s</td>
+            <td><span class="cellbg bg-completed">OK</span></td></tr>
+      </tbody>
+    </table></div></div></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var COLOR = { green: "#73BF69", red: "#F2495C", orange: "#FF9830", blue: "#5794F2",
+                purple: "#B877D9", yellow: "#FADE2A", grey: "#6E7681" };
+
+  // vm, method, status, progress, durationSeconds, exitCode, startedAgo, offsite,
+  // offsiteOk ([succeeded, total]), lastSyncedAgo, perDestination {name: 'success'|'skipped'|'failed'}
+  var VMS = [
+    ["20260218-154742916344821-188_office-core-1_net.part5.psg.network",            "daily", "failed",     0,   null, 1,    "2 days ago",  "failed",    [0, 2], "never",       { "Site3": "failed",  "Part3": "failed" }],
+    ["20251115-125929042475042-190_farashenasamellat-core-1-test.part5.psg.network","daily", "failed",     0,   null, 1,    "37 hrs ago",  "partial",   [1, 2], "37 hrs ago",  { "Site3": "success", "Part3": "failed" }],
+    ["20260513-124114941827602-18_ovn-C",                                           "once",  "skipped",    0,   null, null, "31 hrs ago",  "none",      [0, 0], "never",       {}],
+    ["20251229-153117896766887-95_office-service-1_net.part5.psg.network",          "inc",   "running",    68,  null, null, "42 min ago",  "running",   [0, 1], "2 days ago",  { "Site3": "skipped" }],
+    ["20251229-153547887023267-58_office-database-1_net.part5.psg.network",         "inc",   "completed",  100, 4320, 0,    "8 hrs ago",   "partial",   [1, 2], "31 hrs ago",  { "Site3": "success", "Part3": "failed" }],
+    ["20251229-153247501084355-55_office-gateway-1_net.part5.psg.network",          "inc",   "completed",  100, 1140, 0,    "8 hrs ago",   "completed", [2, 2], "8 hrs ago",   { "Site3": "success", "Part3": "success" }],
+    ["20251229-153417310120758-75_office-public-1_net.part5.psg.network",           "inc",   "completed",  100, 780,  0,    "8 hrs ago",   "completed", [2, 2], "8 hrs ago",   { "Site3": "success", "Part3": "success" }],
+    ["20250920-172954616438785-95_farashenasamellat-database-1-dev.part5.psg.network","full","completed",  100, 2640, 0,    "8 hrs ago",   "completed", [1, 1], "8 hrs ago",   { "Site3": "success" }],
+    ["20251115-121052074422735-62_farashenasamellat-gateway-1-test.part5.psg.network","inc", "completed",  100, 900,  0,    "8 hrs ago",   "completed", [2, 2], "8 hrs ago",   { "Site3": "success", "Part3": "success" }],
+    ["20250920-170534925114767-12_farashenasamellat-core-1-dev.part5.psg.network",  "full",  "completed",  100, 3180, 0,    "8 hrs ago",   "completed", [2, 2], "8 hrs ago",   { "Site3": "success", "Part3": "success" }],
+    ["20251115-122215713287806-99_farashenasamellat-public-1-test.part5.psg.network","inc",  "completed",  100, 660,  0,    "6 hrs ago",   "completed", [1, 1], "8 hrs ago",   { "Site3": "success" }],
+    ["20250920-164438595397558-15_farashenasamellat-service-1-dev.part5.psg.network","daily","queued",     0,   null, null, "—",           "none",      null]
+  ];
+
+  var STATUS_STYLE = {
+    completed: ["bg-completed", "Completed"], failed: ["bg-failed", "Failed"],
+    skipped:   ["bg-skipped",   "Skipped"],   running: ["bg-running", "Running"],
+    queued:    ["bg-none",      "Queued"],    partial: ["bg-partial", "Partial"],
+    none:      ["bg-none",      "—"]
+  };
+  var OFFSITE_STYLE = {
+    completed: ["bg-completed", "Replicated"], partial: ["bg-partial", "Partial"],
+    failed:    ["bg-failed",    "Failed"],     running: ["bg-running", "Running"],
+    none:      ["bg-none",      "—"]
+  };
+
+  function dur(s) {
+    if (s === null || s === undefined) return "—";
+    if (s < 60) return s + " s";
+    if (s < 3600) return Math.round(s / 60) + " min";
+    var h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+    return h + " hr" + (m ? " " + m + " min" : "");
+  }
+  function progColor(st) {
+    return st === "completed" ? COLOR.green : st === "running" ? COLOR.blue
+         : st === "failed" ? COLOR.red : COLOR.grey;
+  }
+  function el(tag, cls, txt) {
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (txt !== undefined) n.textContent = txt;
+    return n;
+  }
+  function cellState(kind, styles) {
+    var s = (styles || STATUS_STYLE)[kind] || STATUS_STYLE.none;
+    var td = el("td");
+    td.appendChild(el("span", "cellbg " + s[0], s[1]));
+    return td;
+  }
+
+  /* ---- Job history table — same columns as the panel's own history view ---- */
+  var tbody = document.getElementById("inventory");
+  VMS.forEach(function (v) {
+    var tr = el("tr");
+
+    // Type: every row is a backup. Restores are counted, not listed per VM.
+    var ty = el("td");
+    ty.appendChild(el("span", "cellbg bg-running", "BACKUP"));
+    tr.appendChild(ty);
+
+    var name = el("td", "vm", v[0]);
+    name.title = v[0];
+    tr.appendChild(name);
+
+    tr.appendChild(el("td", "num muted", v[1].toUpperCase()));
+    tr.appendChild(cellState(v[2]));
+
+    // Progress bar, mirroring the panel's own bar
+    var pg = el("td");
+    var pw = el("div", "gaugecell");
+    var ptrack = el("div", "track");
+    var pfill = el("div", "fill");
+    pfill.style.width = v[3] + "%";
+    pfill.style.background = progColor(v[2]);
+    ptrack.appendChild(pfill);
+    var pval = el("span", "val", v[3] + "%");
+    pval.style.color = progColor(v[2]);
+    pw.appendChild(ptrack); pw.appendChild(pval);
+    pg.appendChild(pw);
+    tr.appendChild(pg);
+
+    tr.appendChild(el("td", "num", dur(v[4])));
+
+    var ex = el("td", "num", v[5] === null ? "—" : String(v[5]));
+    if (v[5] === 0) ex.classList.add("green");
+    else if (v[5] !== null) ex.classList.add("red");
+    else ex.classList.add("muted");
+    tr.appendChild(ex);
+
+    tr.appendChild(el("td", "num muted", v[6]));
+    tr.appendChild(cellState(v[7], OFFSITE_STYLE));
+
+    var ok = el("td", "num");
+    if (!v[8] || v[8][1] === 0) { ok.className = "num muted"; ok.textContent = "—"; }
+    else {
+      ok.textContent = v[8][0] + " / " + v[8][1];
+      ok.style.color = v[8][0] === v[8][1] ? COLOR.green : v[8][0] === 0 ? COLOR.red : COLOR.orange;
+    }
+    tr.appendChild(ok);
+    var g = el("td", "num muted", v[9] || "never");
+    tr.appendChild(g);
+    tbody.appendChild(tr);
+  });
+
+  /* ---- Generic bar-gauge renderer ---- */
+  function bars(target, rows, fmt, max) {
+    var host = document.getElementById(target);
+    rows.forEach(function (r) {
+      var row = el("div", "bar");
+      var left = el("div");
+      var lab = el("div", "label", r.label);
+      lab.title = r.label;
+      var track = el("div", "bartrack");
+      var fill = el("div", "fill");
+      fill.style.width = Math.min(100, (r.value / max) * 100) + "%";
+      fill.style.background = r.color;
+      track.appendChild(fill);
+      left.appendChild(lab);
+      left.appendChild(track);
+      var num = el("div", "num", fmt(r.value));
+      num.style.color = r.color;
+      row.appendChild(left);
+      row.appendChild(num);
+      host.appendChild(row);
+    });
+  }
+
+  /* ---- Adaptive state timelines -------------------------------------
+     A fixed cell-per-day grid only works for a couple of weeks. Here the
+     range picker drives a bucket size chosen so the cell count stays under
+     MAX_CELLS, and each cell shows the WORST outcome inside its bucket —
+     so a single failed day stays visible even at a three-year zoom, and a
+     year renders in the same width as a month.                          */
+  (function () {
+    var MAX_CELLS = 130;
+    var RANGES = [
+      { label: "30d",  days: 30 },
+      { label: "90d",  days: 90 },
+      { label: "1y",   days: 365 },
+      { label: "3y",   days: 1095 },
+      { label: "10y",  days: 3650 }
+    ];
+    var active = 1;
+
+    var RANK = { good: 0, warn: 1, bad: 2 };
+    var TONE = [COLOR.green, COLOR.orange, COLOR.red];
+
+    function bucketDays(days) { return Math.max(1, Math.ceil(days / MAX_CELLS)); }
+    function bucketLabel(n) {
+      if (n === 1) return "1 day";
+      if (n < 7) return n + " days";
+      if (n < 30) return Math.round(n / 7) + " week" + (n >= 14 ? "s" : "");
+      if (n < 365) return Math.round(n / 30) + " month" + (n >= 60 ? "s" : "");
+      return (n / 365).toFixed(1) + " years";
+    }
+    function fmtDate(d) {
+      return d.getFullYear() + "-" + ("0" + (d.getMonth() + 1)).slice(-2) +
+             "-" + ("0" + d.getDate()).slice(-2);
+    }
+
+    /* Deterministic pseudo-history so the mockup looks like real data. */
+    function dailyRank(seed, i) {
+      var x = ((seed * 7919 + i * 104729) * 1103515245 + 12345) & 0x7fffffff;
+      var r = (x >>> 16) % 100;
+      return r < 82 ? 0 : r < 93 ? 1 : 2;
+    }
+
+    function buildRow(seed, days, bucket, todayRank) {
+      var cells = [], n = Math.ceil(days / bucket);
+      for (var b = 0; b < n; b++) {
+        var worst = -1;
+        for (var k = 0; k < bucket; k++) {
+          var dayIndex = b * bucket + k;
+          if (dayIndex >= days) break;
+          var r = dailyRank(seed, dayIndex);
+          if (r > worst) worst = r;
+        }
+        cells.push(worst);
+      }
+      if (cells.length) cells[cells.length - 1] = todayRank;   // today matches the table
+      return cells;
+    }
+
+    function ticks(host, days, bucket) {
+      if (!host) return;
+      host.innerHTML = "";
+      var n = Math.ceil(days / bucket), steps = 6;
+      for (var i = 0; i <= steps; i++) {
+        var b = Math.round((n - 1) * (i / steps));
+        var d = new Date(Date.now() - (days - 1 - b * bucket) * 86400000);
+        host.appendChild(el("span", "", fmtDate(d)));
+      }
+    }
+
+    function render(target, tickTarget, pick) {
+      var host = document.getElementById(target);
+      if (!host) return;
+      host.innerHTML = "";
+      var days = RANGES[active].days, bucket = bucketDays(days);
+
+      VMS.forEach(function (v, idx) {
+        var todayRank = pick(v);
+        if (todayRank === undefined) return;          // not applicable to this VM
+        var row = el("div", "tlrow");
+        var nm = el("div", "name", v[0].replace(/^\d+-\d+-\d+_/, ""));
+        nm.title = v[0];
+        row.appendChild(nm);
+        var cells = el("div", "tlcells");
+        buildRow(idx + 7, days, bucket, todayRank).forEach(function (r, b) {
+          var cell = el("div", "tlcell");
+          if (r >= 0) cell.style.background = TONE[r];
+          var d = new Date(Date.now() - (days - 1 - b * bucket) * 86400000);
+          cell.title = fmtDate(d) + (bucket > 1 ? " (+" + (bucket - 1) + "d)" : "") +
+                       " — " + ["OK", "Warning", "Failed"][Math.max(0, r)];
+          cells.appendChild(cell);
+        });
+        row.appendChild(cells);
+        host.appendChild(row);
+      });
+      ticks(document.getElementById(tickTarget), days, bucket);
+    }
+
+    var BACKUP_NOW  = { completed: 0, failed: 2, skipped: 1, running: 0, queued: 0 };
+    /* 'none' absent on purpose: a VM with no offsite destination is skipped
+       rather than drawn as an empty or invented row. */
+    var OFFSITE_NOW = { completed: 0, partial: 1, failed: 2, running: 0 };
+
+    function renderAll() {
+      render("tlbackup",  "tlticks",  function (v) { return BACKUP_NOW[v[2]]; });
+      render("tloffsite", "tlticks2", function (v) { return OFFSITE_NOW[v[7]]; });
+      var bar = document.getElementById("tlcontrols");
+      if (!bar) return;
+      bar.innerHTML = "";
+      RANGES.forEach(function (r, i) {
+        var b = el("div", "tlbtn" + (i === active ? " on" : ""), r.label);
+        b.onclick = function () { active = i; renderAll(); };
+        bar.appendChild(b);
+      });
+      var bucket = bucketDays(RANGES[active].days);
+      bar.appendChild(el("span", "tlnote",
+        "each cell = " + bucketLabel(bucket) + " · worst outcome in the cell"));
+      var lg = el("div", "tllegend");
+      [["OK", COLOR.green], ["Warning", COLOR.orange], ["Failed", COLOR.red],
+       ["No data", "#24262b"]].forEach(function (p) {
+        var w = el("span");
+        var k = el("span", "tlkey");
+        k.style.background = p[1];
+        w.appendChild(k);
+        w.appendChild(document.createTextNode(p[0]));
+        lg.appendChild(w);
+      });
+      bar.appendChild(lg);
+    }
+    renderAll();
+
+    /* ---- Failed runs per day ---- */
+    var rows = [];
+    for (var i = 0; i < 7; i++) {
+      var d = new Date(Date.now() - (6 - i) * 86400000);
+      var seed = (d.getDate() * 37) % 11;
+      rows.push({ label: (d.getMonth() + 1) + "/" + d.getDate(), value: seed,
+                  color: seed >= 6 ? COLOR.red : seed >= 3 ? COLOR.orange : COLOR.green });
+    }
+    bars("perday", rows, function (n) { return String(n); }, 10);
+  })();
+
+  /* ---- Offsite VM x destination matrix ---- */
+  (function () {
+    var CELL = { success: [COLOR.green, "OK"], skipped: [COLOR.orange, "Skipped"], failed: [COLOR.red, "Failed"] };
+    var hosts = [];
+    VMS.forEach(function (v) {
+      Object.keys(v[10] || {}).forEach(function (h) { if (hosts.indexOf(h) < 0) hosts.push(h); });
+    });
+    hosts.sort();
+    var tbl = document.getElementById("offsitematrix");
+    if (!tbl) return;
+    var thead = el("thead"), hr = el("tr");
+    hr.appendChild(el("th", "", "VM"));
+    hosts.forEach(function (h) { hr.appendChild(el("th", "", h)); });
+    thead.appendChild(hr); tbl.appendChild(thead);
+    var tb = el("tbody");
+    VMS.filter(function (v) { return Object.keys(v[10] || {}).length; }).forEach(function (v) {
+      var tr = el("tr");
+      var name = el("td", "vmname", v[0].replace(/^\d+-\d+-\d+_/, ""));
+      name.title = v[0];
+      tr.appendChild(name);
+      hosts.forEach(function (h) {
+        var st = (v[10] || {})[h];
+        var td = el("td", "num");
+        if (!st) { td.className = "num muted"; td.textContent = "—"; }
+        else {
+          td.textContent = CELL[st][1];
+          td.style.background = CELL[st][0] + "22";
+          td.style.color = CELL[st][0];
+        }
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);
+  })();
+
+  bars("inflight", [
+    { label: "office-service-1-net.part5.psg.network", value: 68, color: COLOR.blue },
+    { label: "office-core-1-net.part5.psg.network", value: 12, color: COLOR.red }
+  ], function (n) { return n + "%"; }, 100);
+
+  bars("poolbars", [
+    { label: "bh-site1-01 / hdd-1  ·  /opt/kvm_pool/local/hdd/1/backup", value: 0.92, color: COLOR.red },
+    { label: "bh-site1-01 / ssd-1  ·  /opt/kvm_pool/local/ssd/1/backup", value: 0.61, color: COLOR.green },
+    { label: "bh-site2-01 / hdd-1  ·  /opt/kvm_pool/local/hdd/1/backup", value: 0.84, color: COLOR.orange },
+    { label: "bh-site2-02 / hdd-1  ·  /opt/kvm_pool/local/hdd/1/backup", value: 0.47, color: COLOR.green }
+  ], function (n) { return Math.round(n * 100) + "%"; }, 1);
+
+  bars("offsitebars", [
+    { label: "offsite-site3 / remote-pool  ·  /mnt/backup", value: 0.75, color: COLOR.green },
+    { label: "offsite-dr / remote-pool  ·  /mnt/backup", value: 0.88, color: COLOR.orange }
+  ], function (n) { return Math.round(n * 100) + "%"; }, 1);
+
+  /* ---- Time series ---- */
+  function series(svgId, opts) {
+    var svg = document.getElementById(svgId);
+    var W = opts.width, H = opts.height, L = 44, R = 8, T = 8, B = 20;
+    var pw = W - L - R, ph = H - T - B;
+    var ns = "http://www.w3.org/2000/svg";
+    function add(tag, attrs, text) {
+      var n = document.createElementNS(ns, tag);
+      for (var k in attrs) { n.setAttribute(k, attrs[k]); }
+      if (text !== undefined) n.textContent = text;
+      svg.appendChild(n);
+      return n;
+    }
+    var ticks = 4;
+    for (var i = 0; i <= ticks; i++) {
+      var y = T + (ph / ticks) * i;
+      add("line", { x1: L, y1: y, x2: L + pw, y2: y, class: "grid" });
+      add("text", { x: L - 7, y: y + 3, class: "axis", "text-anchor": "end" },
+          opts.fmt(opts.max - (opts.max / ticks) * i));
+    }
+    opts.xLabels.forEach(function (lb, i) {
+      var x = L + (pw / (opts.xLabels.length - 1)) * i;
+      add("text", { x: x, y: H - 5, class: "axis", "text-anchor": "middle" }, lb);
+    });
+    opts.lines.forEach(function (ln) {
+      var pts = ln.data.map(function (v, i) {
+        var x = L + (pw / (ln.data.length - 1)) * i;
+        var y = T + ph - (v / opts.max) * ph;
+        return x.toFixed(1) + "," + y.toFixed(1);
+      });
+      add("polygon", {
+        points: L + "," + (T + ph) + " " + pts.join(" ") + " " + (L + pw) + "," + (T + ph),
+        fill: ln.color, "fill-opacity": ".10", stroke: "none"
+      });
+      add("polyline", {
+        points: pts.join(" "), fill: "none", stroke: ln.color,
+        "stroke-width": "1.8", "stroke-linejoin": "round", "stroke-linecap": "round"
+      });
+      var last = pts[pts.length - 1].split(",");
+      add("circle", { cx: last[0], cy: last[1], r: "2.6", fill: ln.color });
+    });
+  }
+
+  series("durchart", {
+    width: 900, height: 200, max: 5400,
+    fmt: function (v) { return Math.round(v / 60) + "m"; },
+    xLabels: ["00:00", "04:00", "08:00", "12:00", "16:00", "20:00", "now"],
+    lines: [
+      { color: COLOR.blue,   data: [2760, 2820, 2700, 2880, 2940, 3060, 3120, 3180, 3240] },
+      { color: COLOR.green,  data: [4080, 4140, 4200, 4260, 4320, 4260, 4380, 4320, 4320] },
+      { color: COLOR.purple, data: [3060, 3000, 3120, 3180, 3120, 3240, 3180, 3120, 3180] }
+    ]
+  });
+
+  series("freechart", {
+    width: 460, height: 190, max: 2000,
+    fmt: function (v) { return Math.round(v) + "G"; },
+    xLabels: ["7d", "5d", "3d", "1d", "now"],
+    lines: [
+      { color: COLOR.blue,  data: [340, 322, 300, 281, 266, 250, 231, 214, 188] },
+      { color: COLOR.green, data: [1210, 1204, 1190, 1188, 1174, 1160, 1152, 1141, 1130] }
+    ]
+  });
+
+  /* ---- Offsite failures table ---- */
+  var offsite = [
+    ["office-core-1-net.part5.psg.network", "offsite-dr", "failed"],
+    ["office-core-1-net.part5.psg.network", "offsite-site3", "failed"],
+    ["farashenasamellat-core-1-test.part5.psg.network", "offsite-dr", "failed"],
+    ["office-database-1-net.part5.psg.network", "offsite-dr", "skipped"]
+  ];
+  var ofb = document.getElementById("offsitefail");
+  offsite.forEach(function (r) {
+    var tr = el("tr");
+    var n = el("td", "vm", r[0]); n.title = r[0];
+    tr.appendChild(n);
+    tr.appendChild(el("td", "vm", r[1]));
+    tr.appendChild(cellState(r[2] === "failed" ? "failed" : "skipped"));
+    ofb.appendChild(tr);
+  });
+
+  /* ---- Tabs ---- */
+  document.querySelectorAll(".tab").forEach(function (t) {
+    t.addEventListener("click", function () {
+      document.querySelectorAll(".tab").forEach(function (x) {
+        x.setAttribute("aria-selected", String(x === t));
+      });
+      document.getElementById("board-vms").hidden = t.dataset.board !== "vms";
+      document.getElementById("board-infra").hidden = t.dataset.board !== "infra";
+    });
+  });
+})();
+</script>
+</body>
+</html>

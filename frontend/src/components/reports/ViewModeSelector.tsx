@@ -1,8 +1,8 @@
-import { LayoutGrid, Table, BarChart3, List } from 'lucide-react'
+import { LayoutGrid, Table, BarChart3, List, CalendarCheck } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
-export type ViewMode = 'card' | 'table' | 'chart' | 'compact'
+export type ViewMode = 'overview' | 'card' | 'table' | 'chart' | 'compact'
 
 interface ViewModeSelectorProps {
   currentMode: ViewMode
@@ -10,6 +10,12 @@ interface ViewModeSelectorProps {
 }
 
 const modes: { id: ViewMode; label: string; icon: React.ComponentType<{ className?: string }>; description: string }[] = [
+  {
+    id: 'overview',
+    label: 'Overview',
+    icon: CalendarCheck,
+    description: 'Backup freshness: date, method and status per schedule',
+  },
   {
     id: 'card',
     label: 'Cards',

@@ -1,6 +1,6 @@
 {
   "name": "kvm-backup-agent",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "KVM Backup Manager - Agent Backend (runs on backup hosts)",
   "main": "server.js",
   "scripts": {

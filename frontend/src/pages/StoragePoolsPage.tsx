@@ -11,6 +11,7 @@ import AddStoragePoolDialog from '@/components/storage-pools/AddStoragePoolDialo
 import AddRestoreStoragePoolDialog from '@/components/storage-pools/AddRestoreStoragePoolDialog'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
+import { getErrorMessage } from '@/lib/errors'
 
 export default function StoragePoolsPage() {
   const [showAddBackupDialog, setShowAddBackupDialog] = useState(false)
@@ -32,7 +33,7 @@ export default function StoragePoolsPage() {
       toast.success(`Storage pools synced successfully for ${hostName}`)
     } catch (error: any) {
       console.error('Failed to sync storage pools:', error)
-      toast.error(error.response?.data?.error || 'Failed to sync storage pools')
+      toast.error(getErrorMessage(error, 'Failed to sync storage pools'))
     } finally {
       setSyncingHosts(prev => {
         const next = new Set(prev)

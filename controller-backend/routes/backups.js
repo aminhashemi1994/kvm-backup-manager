@@ -11,10 +11,10 @@ const {
   getHypervisors, 
   getVirtualMachines,
   getBackupSchedules,
-  saveBackupSchedules,
-  getOffsiteHosts,
   getRestoreJobs,
   saveRestoreJobs,
+  getOffsiteJobs,
+  saveOffsiteJobs,
   appendLog, 
   readLog 
 } = require('../services/fileStorage');
@@ -24,6 +24,9 @@ const rocketChatService = require('../services/rocketChatService');
 const notificationPolicy = require('../services/notificationPolicyService');
 const auditService = require('../services/auditService');
 const schedulerService = require('../services/schedulerService');
+const offsiteJobService = require('../services/offsiteJobService');
+const { ingestOffsiteSyncResults } = require('../services/offsiteWarningService');
+const prometheusMetricsService = require('../services/prometheusMetricsService');
 const { validateBackupTrigger } = require('../utils/validator');
 const { requireUser, requireAdmin } = require('../middleware/rbac');
 
@@ -480,214 +483,6 @@ function resolveRetryStoragePool({ originalJob, host, pools, schedules, jobs }) 
   return { pool: null, source: 'none', schedule: ownSchedule };
 }
 
-/**
- * Ingest per-offsite sync outcomes reported by the agent for a finished job and
- * record schedule-level warnings + notifications when an offsite host/pool was
- * skipped or failed while the primary backup itself succeeded (Req 6.2–6.4).
- *
- * ── Assumed payload shape (from the agent job-update body) ──────────────────
- * The agent may include an `offsiteResults` array on the terminal
- * `/api/backups/jobs/:id/update` call. Each entry describes one offsite target:
- *
- *   offsiteResults: [
- *     {
- *       ip,        // offsite host IP the agent synced to (e.g. "10.0.0.5")
- *       host,      // optional hostname/label, used as a secondary match key
- *       poolPath,  // destination path on the offsite host (e.g. "/mnt/pool1")
- *       status,    // "success" | "skipped" | "failed"
- *       reason,    // human-readable reason for a skip/failure (optional)
- *     }, ...
- *   ]
- *
- * This mirrors the agent script's per-host offsite tracking (Backup_Manager.sh
- * emits `offsite_host_fail` / `offsite_complete` events carrying `offsite_ip`).
- * The controller maps each result back to the job's persisted `offsiteTargets`
- * (which carry `{ offsiteHostId, offsitePoolId, ip, path }`) by matching on
- * `ip` first, then `host`/`poolPath`, so a warning can name the exact host+pool.
- *
- * This handler processes the full `offsiteResults` array in a single pass
- * (task 9.2): skipped/failed outcomes APPEND (or refresh) a warning, while a
- * later SUCCESS to the same target CLEARS the matching warning so offsite sync
- * auto-resumes without operator intervention (Req 6.7). The schedule is never
- * disabled for a transient offsite failure — offsite issues only add/remove
- * warnings and the schedule keeps running (Req 6.5). Append and clear share the
- * same dedup key (`offsiteHostId + offsitePoolId`) so the two paths mirror each
- * other exactly.
- *
- * @param {object} job      The finished backup job (must have `scheduleId`).
- * @param {Array}  offsiteResults  Per-offsite outcome entries from the agent.
- * @returns {Promise<boolean>} true when the schedule was modified & saved.
- */
-async function ingestOffsiteSyncResults(job, offsiteResults) {
-  // Only schedule-triggered jobs carry a schedule to annotate (Req 6.3).
-  if (!job || !job.scheduleId) return false;
-  if (!Array.isArray(offsiteResults) || offsiteResults.length === 0) return false;
-
-  // Classify every result: successes clear warnings (Req 6.7), skips/failures
-  // append/refresh them (Req 6.3). The primary backup outcome is unaffected —
-  // we never disable the schedule here (Req 6.5).
-  const classify = (r) => {
-    const s = (r && typeof r.status === 'string') ? r.status.toLowerCase() : '';
-    if (s === 'success' || s === 'succeeded' || s === 'ok') return 'success';
-    if (s === 'skipped' || s === 'failed' || s === 'error') return 'problem';
-    return 'ignore';
-  };
-  const hasActionable = offsiteResults.some(r => classify(r) !== 'ignore');
-  if (!hasActionable) return false;
-
-  const schedules = await getBackupSchedules();
-  const schedule = schedules.find(s => s.id === job.scheduleId);
-  if (!schedule) return false;
-
-  // The job persists its resolved offsite targets (Req 9.4) — use them to map
-  // an incoming result's ip/host back to offsiteHostId/offsitePoolId. Fall back
-  // to the offsite host records when the job predates persisted targets.
-  const jobTargets = Array.isArray(job.offsiteTargets) ? job.offsiteTargets : [];
-  let offsiteHosts = [];
-  try {
-    offsiteHosts = await getOffsiteHosts();
-  } catch (_) {
-    offsiteHosts = [];
-  }
-
-  // Resolve a single offsite result to { offsiteHostId, offsitePoolId } plus
-  // display names, matching by ip or host/path as available.
-  const resolveTarget = (result) => {
-    const ip = result && result.ip ? String(result.ip).trim() : '';
-    const host = result && result.host ? String(result.host).trim() : '';
-    const poolPath = result && result.poolPath ? String(result.poolPath).trim() : '';
-
-    // 1) Prefer the job's persisted targets (authoritative host+pool mapping).
-    let target = jobTargets.find(t => t && ip && t.ip === ip);
-    if (!target && poolPath) {
-      target = jobTargets.find(t => t && ip && t.ip === ip && t.path === poolPath)
-        || jobTargets.find(t => t && t.path === poolPath);
-    }
-    if (!target && host) {
-      // host may be an IP-or-name; try matching against target ip as a fallback.
-      target = jobTargets.find(t => t && t.ip === host);
-    }
-
-    let offsiteHostId = target ? target.offsiteHostId : null;
-    let offsitePoolId = target ? target.offsitePoolId : null;
-
-    // 2) Enrich with names (and back-fill ids) from the offsite host records.
-    const hostRec = offsiteHosts.find(h =>
-      (offsiteHostId && h.id === offsiteHostId) ||
-      (ip && h.ip === ip) ||
-      (host && (h.ip === host || h.name === host))
-    );
-    if (hostRec && !offsiteHostId) offsiteHostId = hostRec.id;
-
-    let hostName = hostRec ? (hostRec.name || hostRec.ip) : (host || ip || 'unknown host');
-    let poolName = null;
-    if (hostRec && Array.isArray(hostRec.storagePools)) {
-      const poolRec = hostRec.storagePools.find(p =>
-        (offsitePoolId && p.id === offsitePoolId) ||
-        (poolPath && p.path === poolPath)
-      );
-      if (poolRec) {
-        if (!offsitePoolId) offsitePoolId = poolRec.id;
-        poolName = poolRec.name || poolRec.path;
-      }
-    }
-    if (!poolName) poolName = poolPath || (offsitePoolId || 'default pool');
-
-    return { offsiteHostId, offsitePoolId, hostName, poolName };
-  };
-
-  if (!Array.isArray(schedule.offsiteWarnings)) schedule.offsiteWarnings = [];
-  const now = new Date().toISOString();
-  const notifications = [];
-  let changed = false;
-  let cleared = 0;
-
-  // Match an existing warning by the shared dedup key (offsiteHostId +
-  // offsitePoolId). Mirrors the keying used by the append path (task 9.1).
-  const sameTarget = (w, offsiteHostId, offsitePoolId) =>
-    w && w.offsiteHostId === offsiteHostId && w.offsitePoolId === offsitePoolId;
-
-  // Single pass over every reported outcome (task 9.2): success clears a
-  // matching warning; skip/fail appends or refreshes one.
-  for (const result of offsiteResults) {
-    const kind = classify(result);
-    if (kind === 'ignore') continue;
-
-    const { offsiteHostId, offsitePoolId, hostName, poolName } = resolveTarget(result);
-
-    if (kind === 'success') {
-      // A later successful sync to this target clears its warning and lets
-      // offsite sync auto-resume without operator intervention (Req 6.7, 6.5).
-      const before = schedule.offsiteWarnings.length;
-      schedule.offsiteWarnings = schedule.offsiteWarnings.filter(
-        w => !sameTarget(w, offsiteHostId, offsitePoolId)
-      );
-      const removed = before - schedule.offsiteWarnings.length;
-      if (removed > 0) {
-        cleared += removed;
-        changed = true;
-        console.log(`[Backups] Cleared offsite warning for ${hostName} / pool ${poolName} on schedule ${schedule.id} after successful sync`);
-      }
-      continue;
-    }
-
-    // kind === 'problem': append/refresh the warning (Req 6.3).
-    const reason = (result && result.reason)
-      ? String(result.reason)
-      : `Offsite sync ${((result && result.status) || 'failed')}`;
-
-    // Dedupe by offsiteHostId + offsitePoolId: update the existing warning's
-    // reason/timestamp instead of pushing a duplicate (task requirement).
-    const existing = schedule.offsiteWarnings.find(
-      w => sameTarget(w, offsiteHostId, offsitePoolId)
-    );
-    if (existing) {
-      existing.reason = reason;
-      existing.at = now;
-    } else {
-      schedule.offsiteWarnings.push({ offsiteHostId, offsitePoolId, reason, at: now });
-    }
-    changed = true;
-
-    notifications.push({ hostName, poolName, reason });
-  }
-
-  if (changed) {
-    await saveBackupSchedules(schedules);
-
-    // Notify RocketChat, naming the schedule, offsite host, pool, and reason
-    // (Req 6.4). notifyOffsiteSyncFailed(name, offsiteHost, error) is reused;
-    // we pass a descriptive destination string including schedule + pool.
-    const scheduleLabel = schedule.name || schedule.vmName || `schedule ${schedule.id}`;
-    // A run where SOME destinations succeeded is a partial sync, which is a
-    // separate (and separately mutable) event from a total offsite failure.
-    const anySuccess = Array.isArray(offsiteResults)
-      && offsiteResults.some(r => classify(r) === 'success');
-    const offsiteEvent = anySuccess ? 'offsitePartial' : 'offsiteFailure';
-    const sendOffsite = await notificationPolicy.shouldNotify(schedule, offsiteEvent);
-
-    if (sendOffsite) {
-      for (const n of notifications) {
-        try {
-          rocketChatService.notifyOffsiteSyncFailed(
-            // The VM alone: the schedule label repeated the VM name verbatim,
-            // which doubled the length of every offsite message for no gain.
-            job.vmName || scheduleLabel,
-            `${n.hostName} / pool ${n.poolName}`,
-            n.reason,
-            schedule.id
-          );
-        } catch (err) {
-          console.error(`[Backups] Failed to send offsite sync failure notification: ${err.message}`);
-        }
-      }
-    }
-
-    console.log(`[Backups] Offsite sync results for job ${job.id} on schedule ${schedule.id}: recorded ${notifications.length} warning(s), cleared ${cleared} warning(s)`);
-  }
-
-  return changed;
-}
 
 /**
  * One full reconcile pass against the agents, shared by /active and /history.
@@ -843,10 +638,28 @@ router.get('/history', async (req, res, next) => {
       console.log('[History] No restore jobs found:', error.message);
     }
     
+    // Resolve each job's cadence for the history table's Method column.
+    // Jobs created before scheduleType was persisted have none, so fall back to
+    // the schedule they came from; a job with no schedule at all was triggered
+    // by hand, which is its own answer rather than a missing one.
+    let scheduleTypeById = new Map();
+    try {
+      const allSchedules = await getBackupSchedules();
+      scheduleTypeById = new Map(
+        (allSchedules || []).filter(s => s && s.id).map(s => [s.id, s.scheduleType])
+      );
+    } catch (err) {
+      console.error('[History] Could not load schedules for method labels:', err.message);
+    }
+
     // Add jobType to backup jobs
     backupJobs = backupJobs.map(job => ({
       ...job,
       jobType: 'backup',
+      scheduleType: job.scheduleType
+        || (job.scheduleId ? scheduleTypeById.get(job.scheduleId) : null)
+        || (job.scheduled === false ? 'manual' : null)
+        || undefined,
       // Calculate countdown for retrying jobs
       ...(job.status === 'retrying' && job.retryAt ? {
         retryCountdownSeconds: Math.max(0, Math.floor((new Date(job.retryAt) - new Date()) / 1000))
@@ -1110,6 +923,7 @@ router.post('/trigger', requireUser, async (req, res, next) => {
       offsiteTargets = [],
       offsiteRetryAttempts = 3,
       offsiteRetryBackoffSeconds = 15,
+      offsiteRsyncTimeoutSeconds = 1800,
       verbose = false
     } = req.body;
 
@@ -1307,6 +1121,7 @@ router.post('/trigger', requireUser, async (req, res, next) => {
         keepArchive,
         offsiteRetryAttempts,
         offsiteRetryBackoffSeconds,
+        offsiteRsyncTimeoutSeconds,
         compression: compression || 2,
         noCompression: noCompression || false,
         noVerify: noVerify || false,
@@ -1482,9 +1297,16 @@ router.post('/jobs/:id/update', async (req, res, next) => {
     // reconciler had just adopted from a live tmux session).
     let job = null;
     let offsiteRetryFinished = false;
+    // Status before the agent's report is applied, so the Prometheus counters
+    // below can fire on the TRANSITION into a terminal state. The agent posts
+    // an update per second while a job runs and repeats its verdict at script
+    // exit; counting on "is terminal" rather than "became terminal" would
+    // inflate every run into dozens.
+    let priorStatus = null;
     await updateBackupJobs((jobs) => {
       job = jobs.find(j => j.id === req.params.id);
       if (!job) return false; // nothing to write
+      priorStatus = job.status;
 
       // ── Offsite-only resync in flight ────────────────────────────────
       // The controller re-triggered this SAME job id with offsiteOnly=true to
@@ -1700,6 +1522,41 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       await appendLog(req.params.id, logLine);
     }
 
+    // ── Prometheus counters ────────────────────────────────────────────────
+    // Fire-and-forget bookkeeping: never let a metrics failure affect the
+    // agent's status report, which is why this is wrapped rather than awaited.
+    try {
+      const TERMINAL_STATES = ['completed', 'failed', 'cancelled', 'skipped', 'rejected'];
+      const becameTerminal =
+        TERMINAL_STATES.includes(job.status) && !TERMINAL_STATES.includes(priorStatus);
+
+      // An offsite-only resync re-uses the original job id and reports normal
+      // backup statuses, but no backup ran — counting it would double every
+      // VM whose replication needed a retry.
+      const isOffsiteOnlyRun = job.offsiteRetryInFlight || offsiteRetryFinished;
+
+      if (becameTerminal && !isOffsiteOnlyRun) {
+        prometheusMetricsService.recordBackupFinished(job);
+      }
+
+      if ((becameTerminal || offsiteRetryFinished) &&
+          ['completed', 'partial', 'failed'].includes(job.offsiteSyncStatus)) {
+        prometheusMetricsService.recordOffsiteRunFinished({
+          vmName: job.vmName,
+          status: job.offsiteSyncStatus,
+        });
+        for (const result of (Array.isArray(job.offsiteResults) ? job.offsiteResults : [])) {
+          prometheusMetricsService.recordOffsiteResult({
+            vmName: job.vmName,
+            offsiteHost: result.host || result.ip,
+            result: result.status,
+          });
+        }
+      }
+    } catch (metricsErr) {
+      console.error('[Metrics] Failed to record job counters:', metricsErr.message);
+    }
+
     const io = req.app.get('io');
 
     // Offsite-only resync: this run says nothing about the backup itself, so
@@ -1769,11 +1626,10 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       
       // Include retry information in notification
       const retryInfo = job.wasRetried ? ` (succeeded on attempt ${job.succeededOnAttempt})` : '';
-      notificationPolicy.shouldNotify(job.scheduleId || null, 'backupSuccess').then(send => {
-        if (send) rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration + retryInfo, job.scheduleId || null);
-      }).catch(() => {
-        rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration + retryInfo, job.scheduleId || null);
-      });
+      // Whether this is announced at all is decided by the backupCompleted
+      // type toggle inside notifyBackupCompleted; it still runs regardless so
+      // the aggregator can clear an open incident and fire a recovery ping.
+      rocketChatService.notifyBackupCompleted(job.vmName, job.method || 'unknown', duration + retryInfo, job.scheduleId || null);
 
       // Primary backup succeeded — check whether any offsite host/pool sync was
       // skipped or failed and record a resilience warning + notification on the
@@ -1789,16 +1645,12 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       // Only emit backup-error if truly failed (not retrying)
       io.emit('backup-error', job);
 
-      // Notify RocketChat. A backup that failed only at the offsite stage is
-      // announced as an offsite problem, not a failed backup — different
-      // event, and separately mutable.
+      // Notify RocketChat — always, via the daily incident board. A backup
+      // that failed only at the offsite stage is announced as an offsite
+      // problem, not a failed backup, but that distinction is carried by
+      // job.failureStage elsewhere; this path is the primary-backup failure.
       const retryInfo = job.retriesExhausted ? ' (all retries exhausted)' : '';
-      const failEvent = job.failureStage === 'offsite' ? 'offsiteFailure' : 'backupFailure';
-      notificationPolicy.shouldNotify(job.scheduleId || null, failEvent).then(send => {
-        if (send) rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', (job.error || 'Unknown error') + retryInfo, job.scheduleId || null);
-      }).catch(() => {
-        rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', (job.error || 'Unknown error') + retryInfo, job.scheduleId || null);
-      });
+      rocketChatService.notifyBackupFailed(job.vmName, job.method || 'unknown', (job.error || 'Unknown error') + retryInfo, job.scheduleId || null, job.backupHostId || null);
 
       // The offsite sync runs even when the backup fails (it replicates the
       // VM's existing chain). Record its per-host outcomes on the schedule
@@ -1823,14 +1675,34 @@ router.post('/jobs/:id/update', async (req, res, next) => {
       });
     }
 
-    // The offsite sync failed (or only partly succeeded) while the run itself
-    // reached a terminal state. Schedule an offsite-only resync so the backup
-    // still lands offsite without waiting for the next scheduled run — offsite
-    // replication is the whole point of having a DR copy.
-    if ((job.status === 'completed' || job.status === 'failed') &&
-        (job.offsiteSyncStatus === 'failed' || job.offsiteSyncStatus === 'partial')) {
-      schedulerService.handleOffsiteSyncFailure(job).catch(err => {
-        console.error('[Backups] Failed to schedule offsite resync:', err.message);
+    // ── Hand the data to replication ─────────────────────────────────────
+    //
+    // The backup is finished and is reported finished. Getting its data to the
+    // offsite hosts is a separate job from here on: it runs in its own tmux
+    // session with its own lock and its own progress, and this backup does not
+    // wait for it. That is the whole point of the split — a transfer that takes
+    // six hours no longer makes a twenty-minute backup look like a six-hour one,
+    // and a transfer that fails can be retried without redoing the backup.
+    //
+    // Requested on failure too, not just success. The transfer covers the VM's
+    // whole directory, so even a run that produced nothing new still has older
+    // backups worth getting offsite — and a run that failed is exactly when the
+    // existing copies matter most.
+    //
+    // requestSync coalesces: if a sync for this VM is already queued or running
+    // it covers whatever has landed since, and no second job is created.
+    if (job.status === 'completed' || job.status === 'failed') {
+      offsiteJobService.requestSync({
+        vmId: job.vmId,
+        scheduleId: job.scheduleId || null,
+        trigger: 'backup',
+        triggeredByJobId: job.id,
+      }).then(result => {
+        if (result.created) {
+          console.log(`[Backups] Offsite sync queued for ${job.vmName} after job ${job.id}`);
+        }
+      }).catch(err => {
+        console.error(`[Backups] Could not queue an offsite sync for ${job.vmName}: ${err.message}`);
       });
     }
 
@@ -1856,25 +1728,50 @@ router.get('/stats', async (req, res, next) => {
   try {
     const jobs = await getBackupJobs();
     
-    const stats = {
-      total: jobs.length,
-      completed: jobs.filter(j => j.status === 'completed').length,
-      failed: jobs.filter(j => j.status === 'failed').length,
-      // Declined because the VM was already backing up — counted separately so
-      // it never inflates the failure count.
-      rejected: jobs.filter(j => j.status === 'rejected').length,
-      running: jobs.filter(j => j.status === 'running').length,
-      queued: jobs.filter(j => j.status === 'queued').length,
+    // Count every status that exists, not only completed/failed. The dashboard
+    // reads these directly, and a job that was skipped, cancelled or rejected
+    // used to be counted in `total` while appearing in neither breakdown — so
+    // the cards never added up to the number above them.
+    const countOf = (list, status) => list.filter(j => j.status === status).length;
+    const KNOWN_STATUSES = [
+      'completed', 'failed', 'running', 'queued', 'retrying',
+      'skipped', 'cancelled', 'rejected',
+    ];
+    const buildBreakdown = (list) => {
+      const out = { total: list.length };
+      for (const status of KNOWN_STATUSES) out[status] = countOf(list, status);
+      // Anything with a status this build doesn't know about still has to land
+      // somewhere, or the parts stop summing to the total.
+      out.other = list.filter(j => !KNOWN_STATUSES.includes(j.status)).length;
+      return out;
     };
 
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const recentJobs = jobs.filter(j => new Date(j.startTime) > oneDayAgo);
-    
-    stats.last24h = {
-      total: recentJobs.length,
-      completed: recentJobs.filter(j => j.status === 'completed').length,
-      failed: recentJobs.filter(j => j.status === 'failed').length,
-    };
+    const stats = buildBreakdown(jobs);
+    // Attempts that failed but were later retried successfully for the same VM
+    // are still failures in `failed`; this is the count of jobs that failed and
+    // were never superseded by a retry, which is what an operator reads as
+    // "how many backups are actually broken".
+    const lastAttemptByVm = new Map();
+    for (const job of jobs) {
+      const key = job.vmId || job.vmName;
+      if (!key) continue;
+      const at = new Date(job.startTime).getTime();
+      if (!Number.isFinite(at)) continue;
+      const prev = lastAttemptByVm.get(key);
+      if (!prev || at > prev.at) lastAttemptByVm.set(key, { at, status: job.status });
+    }
+    stats.vmsFailingNow = [...lastAttemptByVm.values()].filter(v => v.status === 'failed').length;
+    stats.vmsWithJobs = lastAttemptByVm.size;
+
+    const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const recentJobs = jobs.filter(j => {
+      // Fall back to endTime so a job whose startTime never got persisted is
+      // not silently dropped from the 24h window.
+      const at = new Date(j.startTime || j.endTime).getTime();
+      return Number.isFinite(at) && at > oneDayAgo;
+    });
+
+    stats.last24h = buildBreakdown(recentJobs);
 
     res.json({ success: true, data: stats });
   } catch (error) {
@@ -2215,6 +2112,7 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
       keepArchive: schedule?.keepArchive ?? originalJob.keepArchive ?? 2,
       offsiteRetryAttempts: schedule?.offsiteRetryAttempts ?? originalJob.offsiteRetryAttempts ?? 3,
       offsiteRetryBackoffSeconds: schedule?.offsiteRetryBackoffSeconds ?? originalJob.offsiteRetryBackoffSeconds ?? 15,
+      offsiteRsyncTimeoutSeconds: schedule?.offsiteRsyncTimeoutSeconds ?? originalJob.offsiteRsyncTimeoutSeconds ?? 1800,
       compression: schedule?.compression ?? originalJob.compression ?? 2,
       noCompression: originalJob.noCompression || false,
       noVerify: originalJob.noVerify || false,
@@ -2325,6 +2223,7 @@ router.post('/jobs/:jobId/retry', async (req, res, next) => {
         keepArchive: retryJob.keepArchive,
         offsiteRetryAttempts: retryJob.offsiteRetryAttempts,
         offsiteRetryBackoffSeconds: retryJob.offsiteRetryBackoffSeconds,
+        offsiteRsyncTimeoutSeconds: retryJob.offsiteRsyncTimeoutSeconds,
         compression: retryJob.compression,
         noCompression: retryJob.noCompression,
         noVerify: retryJob.noVerify,
@@ -2490,8 +2389,51 @@ router.delete('/jobs/:jobId/force', requireAdmin, async (req, res, next) => {
       });
     }
 
-    // Neither store has it — treat as already deleted (idempotent)
-    console.log(`Job ${jobId} not found in backup or restore stores - considering it already deleted`);
+    // Still not found — check replication jobs. They live in their own store,
+    // but Remove/Force-remove is deliberately ONE shared action across backups,
+    // restores and replications: an operator clearing failed jobs out of the
+    // history should not have to know which of three stores a row came from,
+    // and a per-type button would leave rows the shared button silently
+    // skipped.
+    const offsiteJobs = await getOffsiteJobs();
+    const offsiteIndex = offsiteJobs.findIndex(j => j.id === jobId);
+
+    if (offsiteIndex !== -1) {
+      const offsiteJob = offsiteJobs[offsiteIndex];
+
+      // Stop it on the agent first if it is still live. Cancelling a transfer
+      // is safe: what already reached the destination stays, and nothing
+      // offsite is deleted — so removing a running one cannot lose data.
+      if (offsiteJob.status === 'running' || offsiteJob.status === 'queued') {
+        try {
+          await offsiteJobService.cancel(jobId);
+          console.log(`Cancelled offsite job ${jobId} before removing it`);
+        } catch (error) {
+          console.log(`Could not cancel offsite job on agent: ${error.message}`);
+          // Continue with removal even if the cancel fails.
+        }
+      }
+
+      // Re-read: cancel() writes to the same store, so the array captured
+      // above is stale and splicing it would resurrect the cancelled state.
+      const fresh = await getOffsiteJobs();
+      await saveOffsiteJobs(fresh.filter(j => j.id !== jobId));
+
+      await appendLog(jobId, 'Replication job force removed from history');
+
+      const io = req.app.get('io');
+      io.emit('job-removed', { jobId });
+      io.emit('offsite-job-removed', { jobId });
+
+      return res.json({
+        success: true,
+        message: 'Replication job removed from history',
+        data: { id: jobId, jobType: 'replication' }
+      });
+    }
+
+    // No store has it — treat as already deleted (idempotent)
+    console.log(`Job ${jobId} not found in backup, restore or replication stores - considering it already deleted`);
     const io = req.app.get('io');
     io.emit('job-removed', { jobId });
 
