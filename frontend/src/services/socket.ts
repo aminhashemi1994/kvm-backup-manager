@@ -133,6 +133,55 @@ class SocketService {
     this.socket.on('agents-status-update', (data) => {
       this.emit('agents-status-update', data)
     })
+
+    // Offsite replication. These are a separate stream from the backup
+    // events above on purpose — a replication job runs independently of the
+    // backup that asked for it, so it reports its own lifecycle.
+    this.socket.on('offsite-job-created', (data) => {
+      this.emit('offsite-job-created', data)
+    })
+
+    this.socket.on('offsite-job-updated', (data) => {
+      this.emit('offsite-job-updated', data)
+    })
+
+    this.socket.on('offsite-job-finished', (data) => {
+      this.emit('offsite-job-finished', data)
+    })
+
+    // An agent too old to run an independent rsync. Surfaced as a banner so
+    // the operator knows replication is not happening for that host at all,
+    // rather than silently discovering it later.
+    this.socket.on('offsite-agent-unsupported', (data) => {
+      this.emit('offsite-agent-unsupported', data)
+    })
+
+    // A replication check finished; carries the full per-VM summary.
+    this.socket.on('offsite-check-complete', (data) => {
+      this.emit('offsite-check-complete', data)
+    })
+
+    // A finished offsite sync reconciled one VM's check entry on the server
+    // (e.g. all targets confirmed by the agent). Carries the same shape as
+    // offsite-check-complete so consumers don't need a second code path.
+    this.socket.on('offsite-check-updated', (data) => {
+      this.emit('offsite-check-updated', data)
+    })
+
+    // Live-status sweeps for the backup hosts tab: each host/hypervisor is
+    // shown immediately from cached data, then these events resolve its
+    // "checking" spinner to a real status as each background probe completes.
+    this.socket.on('backup-host-status-updated', (data) => {
+      this.emit('backup-host-status-updated', data)
+    })
+
+    this.socket.on('hypervisor-status-updated', (data) => {
+      this.emit('hypervisor-status-updated', data)
+    })
+
+    this.socket.on('offsite-host-status-updated', (data) => {
+      this.emit('offsite-host-status-updated', data)
+    })
   }
 
   disconnect() {

@@ -18,12 +18,16 @@ const vmsRoutes = require('./routes/vms');
 const schedulesRoutes = require('./routes/schedules');
 const backupsRoutes = require('./routes/backups');
 const offsiteHostsRoutes = require('./routes/offsiteHosts');
+const offsiteJobsRoutes = require('./routes/offsiteJobs');
+const offsiteJobService = require('./services/offsiteJobService');
+const replicationCheckService = require('./services/replicationCheckService');
 const backupCycleRoutes = require('./routes/backupCycle');
 const initRoutes = require('./routes/init');
 const reportsRoutes = require('./routes/reports');
 const reportDownloadRoutes = require('./routes/reportDownload');
 const missedBackupsRoutes = require('./routes/missedBackups');
 const metricsRoutes = require('./routes/metrics');
+const prometheusRoutes = require('./routes/prometheus');
 const fixBackupRoutes = require('./routes/fixBackup');
 const cleanupBackupRoutes = require('./routes/cleanupBackup');
 const backupStatusRoutes = require('./routes/backupStatus');
@@ -46,6 +50,7 @@ const remoteMetricsService = require('./services/remoteMetricsService');
 const healthCheckService = require('./services/healthCheckService');
 const certificateMonitorService = require('./services/certificateMonitorService');
 const notificationAggregator = require('./services/notificationAggregator');
+const dailyIncidentBoardService = require('./services/dailyIncidentBoardService');
 const storagePoolRefreshService = require('./services/storagePoolRefreshService');
 const restoreStoragePoolRefreshService = require('./services/restoreStoragePoolRefreshService');
 const startupRecoveryService = require('./services/startupRecoveryService');
@@ -141,6 +146,20 @@ loadNotificationSettings().then((settings) => {
 // Routes
 app.use('/api/auth', authRoutes); // Authentication routes (no auth required)
 
+// Prometheus scrape endpoint for Grafana. Mounted before authenticateUser
+// because a scraper cannot hold a user session; it carries its own token.
+// Exposed at both /metrics (the convention every Prometheus config assumes)
+// and /api/metrics/prometheus (for deployments where only /api is proxied).
+app.use('/metrics', prometheusRoutes);
+app.use('/api/metrics/prometheus', prometheusRoutes);
+if (!process.env.METRICS_TOKEN) {
+  console.warn('⚠ /metrics is unauthenticated (METRICS_TOKEN is not set).');
+  console.warn('  The exposition names every VM, host, schedule and pool — ');
+  console.warn('  set METRICS_TOKEN and give it to the monitoring team.');
+} else {
+  console.log('✓ /metrics enabled (token required)');
+}
+
 // Apply authentication middleware to protected routes
 const { authenticateUser } = require('./middleware/auth');
 app.use('/api/backup-hosts', authenticateUser, backupHostsRoutes);
@@ -149,6 +168,9 @@ app.use('/api/vms', authenticateUser, vmsRoutes);
 app.use('/api/schedules', authenticateUser, schedulesRoutes);
 app.use('/api/backups', authenticateUser, backupsRoutes);
 app.use('/api/offsite-hosts', authenticateUser, offsiteHostsRoutes);
+// Replication jobs. authenticateUser covers agents too — the agent posts its
+// status updates here with its own token, exactly as it does for backups.
+app.use('/api/offsite-jobs', authenticateUser, offsiteJobsRoutes);
 app.use('/api/backup-cycle', authenticateUser, backupCycleRoutes);
 app.use('/api/init', authenticateUser, initRoutes);
 app.use('/api/reports', authenticateUser, reportsRoutes);
@@ -169,6 +191,9 @@ app.use('/api/audit', authenticateUser, auditRoutes);
 app.use('/api/cleanup', authenticateUser, require('./routes/cleanup'));
 app.use('/api/notifications', authenticateUser, notificationsRoutes);
 app.use('/api/settings', authenticateUser, settingsRoutes);
+// The panel's own version. Authenticated like everything else — the only
+// things that display it are already behind the login.
+app.use('/api/version', authenticateUser, require('./routes/version'));
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -237,6 +262,31 @@ let bootSnapshot = null;
 // Initialize missed-run service
 missedRunService.initialize(io, schedulerService);
 
+// Offsite replication jobs. drain() picks up anything left queued by a previous
+// controller process — a transfer that was waiting for a slot when the process
+// went down would otherwise sit queued forever, since nothing else starts one.
+offsiteJobService.init(io);
+// An agent updated while the controller was down leaves jobs marked
+// "unsupported" that describe a state which is no longer true — and VMs whose
+// data never reached the offsite hosts. Revive them before draining.
+offsiteJobService.rearmUnsupportedJobs()
+  .then(r => {
+    if (r && r.requeued > 0) {
+      console.log(`✓ Re-queued ${r.requeued} offsite sync(s) refused by a since-updated agent`);
+    }
+  })
+  .catch(err => console.error('[OffsiteJobs] Could not re-arm refused syncs:', err.message));
+offsiteJobService.drain().catch(err => {
+  console.error('[OffsiteJobs] Startup drain failed:', err.message);
+});
+
+// The replication check. Backups and transfers are independent now, so a
+// transfer that failed, was cancelled, or was never started leaves no trace in
+// the backup history — this is what notices, and it queues the syncs to fix it.
+replicationCheckService.init(io, { runOnStart: true }).catch(err => {
+  console.error('[ReplicationCheck] Failed to start:', err.message);
+});
+
 // Initialize agent sync service (Item 2)
 agentSyncService.initialize(io);
 
@@ -261,6 +311,7 @@ auditService.initialize().catch(err => {
 notificationAggregator.initialize().catch(err => {
   console.error('[NotifAgg] Failed to initialize:', err.message);
 });
+dailyIncidentBoardService.initialize();
 
 // Start monitoring service
 monitoringService.initialize();

@@ -269,7 +269,17 @@ _run_dump() {
     : >"$sf" 2>/dev/null
 
     local raw="" ec=0
-    raw=$(virtnbdrestore -i "$dir" -o dump 2>"$sf") || ec=$?
+    # virtnbdrestore's dump output can carry NUL bytes (they come through from
+    # the qcow2 metadata it echoes back). Bash cannot hold a NUL in a variable,
+    # so a bare command substitution drops them AND prints
+    #   "warning: command substitution: ignored null byte in input"
+    # to stderr — which the agent then reports as a failed report generation
+    # even though the JSON that follows is perfectly usable.
+    #
+    # Strip them deliberately instead. `exit ${PIPESTATUS[0]}` keeps
+    # virtnbdrestore's own exit code rather than tr's, which is always 0 and
+    # would mask a genuine failure.
+    raw=$(virtnbdrestore -i "$dir" -o dump 2>"$sf" | tr -d '\0'; exit "${PIPESTATUS[0]}") || ec=$?
 
     local se=""
     [[ -f "$sf" ]] && { se=$(tail -5 "$sf" 2>/dev/null | tr '\n' '|' | sed 's/|$//') || se=""; rm -f "$sf" 2>/dev/null; }

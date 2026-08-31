@@ -1,11 +1,15 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useEffect } from 'react'
 import { backupHostsApi, hypervisorsApi, vmsApi } from '@/services/api'
 import { toast } from 'sonner'
+import socketService from '@/services/socket'
 import type { BackupHost, Hypervisor, VirtualMachine } from '@/types'
+import { getErrorMessage } from '@/lib/errors'
 
 // Backup Hosts
 export function useBackupHosts() {
-  return useQuery({
+  const queryClient = useQueryClient()
+  const query = useQuery({
     queryKey: ['backup-hosts'],
     queryFn: async () => {
       const response = await backupHostsApi.getAll()
@@ -13,6 +17,21 @@ export function useBackupHosts() {
     },
     refetchInterval: 30000, // Refetch every 30 seconds to show updated health check status
   })
+
+  // The list request kicks off a background reachability sweep and responds
+  // before it finishes (see routes/backupHosts.js), so each host's real
+  // status lands later as a `backup-host-status-updated` socket event.
+  // Patch it straight into the cache instead of waiting up to 30s for the
+  // next poll.
+  useEffect(() => {
+    return socketService.on('backup-host-status-updated', (data: { backupHostId: string; status: BackupHost['status'] }) => {
+      queryClient.setQueryData<BackupHost[]>(['backup-hosts'], (old) =>
+        old?.map(h => h.id === data.backupHostId ? { ...h, status: data.status, checking: false } : h)
+      )
+    })
+  }, [queryClient])
+
+  return query
 }
 
 export function useBackupHost(id: string) {
@@ -43,7 +62,7 @@ export function useCreateBackupHost() {
       }
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to add backup host')
+      toast.error(getErrorMessage(error, 'Failed to add backup host'))
     },
   })
 }
@@ -61,7 +80,7 @@ export function useDeleteBackupHost() {
       toast.success('Backup host deleted successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to delete backup host')
+      toast.error(getErrorMessage(error, 'Failed to delete backup host'))
     },
   })
 }
@@ -79,7 +98,7 @@ export function useUpdateBackupHost() {
       toast.success('Backup host updated successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to update backup host')
+      toast.error(getErrorMessage(error, 'Failed to update backup host'))
     },
   })
 }
@@ -97,14 +116,29 @@ export function useHealthCheckBackupHost() {
       toast.success('Health check completed')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Health check failed')
+      toast.error(getErrorMessage(error, 'Health check failed'))
     },
   })
 }
 
 // Hypervisors
-export function useHypervisorsByBackupHost(backupHostId: string) {
+/**
+ * Every hypervisor, across all backup hosts. Used to tell live VMs from rows
+ * left behind by a hypervisor that no longer exists.
+ */
+export function useHypervisors() {
   return useQuery({
+    queryKey: ['hypervisors', 'all'],
+    queryFn: async () => {
+      const response = await hypervisorsApi.getAll()
+      return response.data.data as Hypervisor[]
+    },
+  })
+}
+
+export function useHypervisorsByBackupHost(backupHostId: string) {
+  const queryClient = useQueryClient()
+  const query = useQuery({
     queryKey: ['hypervisors', 'backup-host', backupHostId],
     queryFn: async () => {
       const response = await hypervisorsApi.getByBackupHost(backupHostId)
@@ -113,6 +147,20 @@ export function useHypervisorsByBackupHost(backupHostId: string) {
     enabled: !!backupHostId,
     refetchInterval: 30000, // Refetch every 30 seconds to show updated health check status
   })
+
+  // See routes/hypervisors.js: the list is returned immediately, then each
+  // hypervisor's live status is probed in the background and reported here
+  // as it resolves, rather than waiting on the next 30s poll.
+  useEffect(() => {
+    return socketService.on('hypervisor-status-updated', (data: { backupHostId: string; hypervisorId: string; status: Hypervisor['status']; lastError: string | null }) => {
+      if (data.backupHostId !== backupHostId) return
+      queryClient.setQueryData<Hypervisor[]>(['hypervisors', 'backup-host', backupHostId], (old) =>
+        old?.map(h => h.id === data.hypervisorId ? { ...h, status: data.status, lastError: data.lastError ?? undefined, checking: false } : h)
+      )
+    })
+  }, [queryClient, backupHostId])
+
+  return query
 }
 
 export function useCreateHypervisor() {
@@ -135,7 +183,7 @@ export function useCreateHypervisor() {
       }
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to add hypervisor')
+      toast.error(getErrorMessage(error, 'Failed to add hypervisor'))
     },
   })
 }
@@ -155,7 +203,7 @@ export function useDeleteHypervisor() {
       toast.success('Hypervisor deleted successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to delete hypervisor')
+      toast.error(getErrorMessage(error, 'Failed to delete hypervisor'))
     },
   })
 }
@@ -174,7 +222,7 @@ export function useUpdateHypervisor() {
       toast.success('Hypervisor updated successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to update hypervisor')
+      toast.error(getErrorMessage(error, 'Failed to update hypervisor'))
     },
   })
 }
@@ -193,7 +241,7 @@ export function useRefreshVMs() {
       toast.success(`VMs refreshed - ${data.data?.length || 0} VMs found`)
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to refresh VMs')
+      toast.error(getErrorMessage(error, 'Failed to refresh VMs'))
     },
   })
 }
@@ -222,7 +270,7 @@ export function useUpdateVM() {
       queryClient.invalidateQueries({ queryKey: ['vms'] })
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to update VM')
+      toast.error(getErrorMessage(error, 'Failed to update VM'))
     },
   })
 }
@@ -271,7 +319,7 @@ export function useSelectMultipleVMs() {
       toast.success('VM selection updated')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to update VM selection')
+      toast.error(getErrorMessage(error, 'Failed to update VM selection'))
     },
   })
 }

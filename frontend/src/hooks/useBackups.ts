@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { backupsApi, schedulesApi } from '@/services/api'
 import { toast } from 'sonner'
 import type { BackupJob, BackupSchedule, BackupStats } from '@/types'
+import { getErrorMessage } from '@/lib/errors'
 
 // Backup Jobs
 export function useActiveBackups() {
@@ -73,7 +74,7 @@ export function useTriggerBackup() {
       toast.success('Backup triggered successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to trigger backup')
+      toast.error(getErrorMessage(error, 'Failed to trigger backup'))
     },
   })
 }
@@ -91,7 +92,7 @@ export function useKillBackupJob() {
       toast.success('Backup job cancelled')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to cancel backup job')
+      toast.error(getErrorMessage(error, 'Failed to cancel backup job'))
     },
   })
 }
@@ -144,7 +145,7 @@ export function useForceRemoveJob() {
       }
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to remove job')
+      toast.error(getErrorMessage(error, 'Failed to remove job'))
     },
   })
 }
@@ -185,7 +186,7 @@ export function useBulkForceRemoveJobs() {
             jobId: job.id,
             vmName: job.vmName,
             result: 'error',
-            message: error.response?.data?.error || error.message || 'Remove failed',
+            message: getErrorMessage(error, 'Remove failed'),
           })
         }
       }
@@ -237,7 +238,7 @@ export function useRetryBackup() {
       toast.success(data?.message || 'Backup retry initiated')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to retry backup')
+      toast.error(getErrorMessage(error, 'Failed to retry backup'))
     },
   })
 }
@@ -284,7 +285,7 @@ export function useBulkRetryBackups() {
             // 429 = host at its concurrent limit. Not a failure: the backup is
             // simply waiting for a slot, so it is called out separately.
             result: status === 429 ? 'limited' : 'error',
-            message: error.response?.data?.error || error.message || 'Retry failed',
+            message: getErrorMessage(error, 'Retry failed'),
           })
         }
       }
@@ -361,10 +362,14 @@ export function useCreateSchedule() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schedules'] })
+      // Which VMs replicate offsite is derived from the schedules, and the
+      // Offsite page renders that list — so ticking or unticking offsite here
+      // must show up there without waiting for its own refetch interval.
+      queryClient.invalidateQueries({ queryKey: ['offsite-check'] })
       toast.success('Schedule created successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to create schedule')
+      toast.error(getErrorMessage(error, 'Failed to create schedule'))
     },
   })
 }
@@ -379,10 +384,14 @@ export function useUpdateSchedule() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schedules'] })
+      // Which VMs replicate offsite is derived from the schedules, and the
+      // Offsite page renders that list — so ticking or unticking offsite here
+      // must show up there without waiting for its own refetch interval.
+      queryClient.invalidateQueries({ queryKey: ['offsite-check'] })
       toast.success('Schedule updated successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to update schedule')
+      toast.error(getErrorMessage(error, 'Failed to update schedule'))
     },
   })
 }
@@ -397,10 +406,14 @@ export function useDeleteSchedule() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schedules'] })
+      // Which VMs replicate offsite is derived from the schedules, and the
+      // Offsite page renders that list — so ticking or unticking offsite here
+      // must show up there without waiting for its own refetch interval.
+      queryClient.invalidateQueries({ queryKey: ['offsite-check'] })
       toast.success('Schedule deleted successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to delete schedule')
+      toast.error(getErrorMessage(error, 'Failed to delete schedule'))
     },
   })
 }
@@ -415,10 +428,14 @@ export function useToggleSchedule() {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['schedules'] })
+      // Which VMs replicate offsite is derived from the schedules, and the
+      // Offsite page renders that list — so ticking or unticking offsite here
+      // must show up there without waiting for its own refetch interval.
+      queryClient.invalidateQueries({ queryKey: ['offsite-check'] })
       toast.success('Schedule toggled successfully')
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to toggle schedule')
+      toast.error(getErrorMessage(error, 'Failed to toggle schedule'))
     },
   })
 }
@@ -441,7 +458,7 @@ export function useRunScheduleNow() {
       toast.success(`${name} triggered`)
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to trigger schedule')
+      toast.error(getErrorMessage(error, 'Failed to trigger schedule'))
     },
   })
 }

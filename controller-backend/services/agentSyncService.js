@@ -30,6 +30,13 @@ const writeRestoreJobs = saveRestoreJobs;
  * Does NOT mark jobs as failed unilaterally — the agent's live-status is
  * the source of truth. Only updates fields the agent gives us.
  */
+// How long a replication job may sit at "running" without the agent knowing
+// about it before the controller concludes it was interrupted. Generous on
+// purpose: the agent registers a sync a moment after the controller marks it
+// running, and an agent mid-restart needs time to re-adopt its tmux sessions
+// before it can answer honestly.
+const OFFSITE_RECONCILE_GRACE_MS = 3 * 60 * 1000;
+
 class AgentSyncService {
   constructor() {
     this.io = null;
@@ -147,6 +154,18 @@ class AgentSyncService {
       await writeRestoreJobs(restoreJobs);
     }
 
+    // Replication jobs live in their own store and were never reconciled here,
+    // so a transfer the agent lost (killed process, host rebooted mid-sync) sat
+    // at "running" in the panel forever with nothing to correct it.
+    try {
+      const offsite = await this._reconcileOffsiteJobs(host);
+      synced += offsite.synced;
+      finalized += offsite.finalized;
+    } catch (e) {
+      errors++;
+      console.error(`[AgentSync] Offsite reconcile error for ${host.name}: ${e.message}`);
+    }
+
     console.log(`[AgentSync] ${host.name}: synced=${synced}, finalized=${finalized}, errors=${errors}`);
 
     if (this.io) {
@@ -158,6 +177,80 @@ class AgentSyncService {
       });
     }
     return { synced, finalized, errors };
+  }
+
+  /**
+   * Bring replication jobs back in line with what the agent is actually doing.
+   *
+   * Only `running` jobs are considered. A `queued` replication is waiting for a
+   * slot on the CONTROLLER and was never sent to the agent, so the agent
+   * legitimately knows nothing about it — finalizing those would kill work that
+   * has not started yet.
+   *
+   * Two deliberate refusals to act:
+   *  - if the agent could not be asked at all, nothing is changed. "We could not
+   *    reach it" is not evidence that a transfer stopped, and treating it as
+   *    such would fail live syncs on every brief network blip.
+   *  - a job that started within the grace window is left alone, because the
+   *    agent registers a sync a moment after the controller marks it running.
+   */
+  async _reconcileOffsiteJobs(host) {
+    const { getOffsiteJobs } = require('./fileStorage');
+    const offsiteJobService = require('./offsiteJobService');
+
+    const jobs = await getOffsiteJobs();
+    const running = jobs.filter(j => j.backupHostId === host.id && j.status === 'running');
+    if (running.length === 0) return { synced: 0, finalized: 0 };
+
+    const live = await agentService.getActiveOffsiteSyncs(host.url);
+    if (!live.success) {
+      console.warn(`[AgentSync] Could not fetch offsite syncs from ${host.name}: ${live.error}`);
+      return { synced: 0, finalized: 0 };
+    }
+
+    const liveById = new Map(live.data.map(d => [d.jobId, d]));
+    let synced = 0;
+    let finalized = 0;
+
+    for (const job of running) {
+      const alive = liveById.get(job.id);
+
+      if (alive) {
+        // Still going. Take the agent's numbers — after an agent restart the
+        // controller's are from before the gap.
+        const patch = {};
+        if (typeof alive.progress === 'number' && alive.progress !== job.progress) {
+          patch.progress = alive.progress;
+        }
+        if (alive.progressText && alive.progressText !== job.progressText) {
+          patch.progressText = alive.progressText;
+        }
+        if (Object.keys(patch).length > 0) {
+          await offsiteJobService._patch(job.id, patch);
+          synced++;
+        }
+        continue;
+      }
+
+      const startedAt = new Date(job.startTime || job.createdAt).getTime();
+      if (!Number.isFinite(startedAt) || Date.now() - startedAt < OFFSITE_RECONCILE_GRACE_MS) {
+        continue;
+      }
+
+      // The agent has no such transfer and has had long enough to register it.
+      // Whatever reached the destination stays — rsync deletes nothing on the
+      // way in — so this is safe to retry, and the message says so.
+      console.log(`[AgentSync] Offsite job ${job.id} (${job.vmName}) is not running on ${host.name}; finalizing`);
+      await offsiteJobService.handleAgentUpdate(job.id, {
+        status: 'failed',
+        error: `The agent on ${host.name} is no longer running this sync — it was interrupted `
+          + '(agent restarted or the host rebooted). Data already transferred is kept, so a retry '
+          + 'sends only what is missing.',
+      });
+      finalized++;
+    }
+
+    return { synced, finalized };
   }
 
   /**
@@ -224,7 +317,7 @@ class AgentSyncService {
         job.endTime = job.endTime || new Date().toISOString();
         job.error = job.error || 'Backup orphaned: lock file present without active process';
         changed = true;
-        try { rocketChatService.notifyBackupFailed(job.vmName, job.method, job.error); } catch {}
+        try { rocketChatService.notifyBackupFailed(job.vmName, job.method, job.error, job.scheduleId || null, job.backupHostId || null); } catch {}
       }
     } else if (live.status === 'completed') {
       if (job.status !== 'completed') {

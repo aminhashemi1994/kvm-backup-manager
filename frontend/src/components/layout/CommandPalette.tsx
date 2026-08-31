@@ -34,6 +34,7 @@ export default function CommandPalette() {
     { id: 'schedules', label: 'Schedules', icon: <Calendar className="h-4 w-4" />, action: () => navigate('/schedules'), keywords: ['cron', 'automated', 'timer'] },
     { id: 'active-jobs', label: 'Active Jobs', icon: <Activity className="h-4 w-4" />, action: () => navigate('/backups/active'), keywords: ['running', 'progress', 'live'] },
     { id: 'history', label: 'Job History', icon: <History className="h-4 w-4" />, action: () => navigate('/backups/history'), keywords: ['past', 'completed', 'failed'] },
+    { id: 'offsite', label: 'Offsite Replication', icon: <ArrowRightLeft className="h-4 w-4" />, action: () => navigate('/offsite'), keywords: ['rsync', 'sync', 'replication', 'dr', 'remote', 'offsite'] },
     { id: 'reports', label: 'Reports', icon: <FileText className="h-4 w-4" />, action: () => navigate('/reports'), keywords: ['analytics', 'download', 'pdf'] },
     { id: 'resources', label: 'Resources', icon: <Cpu className="h-4 w-4" />, action: () => navigate('/resources'), keywords: ['metrics', 'cpu', 'memory', 'disk'] },
     { id: 'backup-mgmt', label: 'Backup Management', icon: <Database className="h-4 w-4" />, action: () => navigate('/backup-management'), keywords: ['trigger', 'manual', 'restore'] },

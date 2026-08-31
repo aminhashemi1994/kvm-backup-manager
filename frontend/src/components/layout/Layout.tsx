@@ -3,6 +3,7 @@ import Sidebar from './Sidebar'
 import Header from './Header'
 import CommandPalette from './CommandPalette'
 import CertificateAlertBanner from '@/components/common/CertificateAlertBanner'
+import OffsiteAgentBanner from '@/components/offsite/OffsiteAgentBanner'
 import { useSocket, useSocketEvent } from '@/hooks/useSocket'
 import { debouncedInvalidate } from '@/lib/debouncedInvalidate'
 import { useQueryClient } from '@tanstack/react-query'
@@ -69,6 +70,14 @@ export default function Layout({ children }: LayoutProps) {
     debouncedInvalidate(queryClient, ['backups'])
   })
 
+  // A replication job finishing is what the offsite badge on Active jobs and
+  // History reflects. Handled here rather than only on the offsite page, so
+  // those views stay honest wherever the user happens to be standing.
+  useSocketEvent('offsite-job-finished', () => {
+    debouncedInvalidate(queryClient, ['backups'])
+    debouncedInvalidate(queryClient, ['offsite-jobs'])
+  })
+
   useEffect(() => {
     // Socket is initialized in useSocket hook
   }, [])
@@ -83,6 +92,11 @@ export default function Layout({ children }: LayoutProps) {
         {/* Sits above the content on every page: a certificate problem is
             invisible everywhere else, because backups keep running through it. */}
         <CertificateAlertBanner />
+
+        {/* Same reasoning as the certificate banner: an agent too old to
+            replicate keeps backing up happily, so nothing else in the UI
+            looks wrong while nothing reaches the offsite hosts. */}
+        <OffsiteAgentBanner />
 
         <main className="flex-1 overflow-y-auto overflow-x-auto p-4 sm:p-6">
           <div className="page-enter page-enter-active min-w-0">

@@ -25,11 +25,13 @@ import {
   Search,
   XCircle,
   Calendar,
-  CheckSquare
+  CheckSquare,
+  Loader2
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { Hypervisor, VirtualMachine } from '@/types'
 import { useVMsByHypervisor, useRefreshVMs, useDeleteHypervisor } from '@/hooks/useBackupHosts'
+import { useLiveCheckStatus } from '@/hooks/useLiveCheckStatus'
 import TriggerBackupDialog from '../backups/TriggerBackupDialog'
 import FixBackupDialog from '../backups/FixBackupDialog'
 import CleanupBackupDialog from '../backups/CleanupBackupDialog'
@@ -194,6 +196,7 @@ export default function HypervisorCard({ hypervisor, backupHostId }: HypervisorC
   const [showBulkScheduleDialog, setShowBulkScheduleDialog] = useState(false)
   
   const { data: vms, isLoading, refetch } = useVMsByHypervisor(hypervisor.id)
+  const isCheckingStatus = useLiveCheckStatus(hypervisor.id, hypervisor.checking, 'hypervisor-status-updated')
   const refreshVMs = useRefreshVMs()
   const deleteHypervisor = useDeleteHypervisor()
   const confirm = useConfirm()
@@ -288,15 +291,22 @@ export default function HypervisorCard({ hypervisor, backupHostId }: HypervisorC
               <div>
                 <div className="flex items-center space-x-2">
                   <h4 className="font-medium">{hypervisor.name}</h4>
-                  <Badge 
-                    className={hypervisor.status === 'connected' 
-                      ? 'bg-green-100 text-green-800' 
-                      : 'bg-red-100 text-red-800'
-                    } 
-                    variant="outline"
-                  >
-                    {hypervisor.status}
-                  </Badge>
+                  {isCheckingStatus ? (
+                    <Badge className="bg-blue-100 text-blue-800" variant="outline">
+                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                      Connecting...
+                    </Badge>
+                  ) : (
+                    <Badge
+                      className={hypervisor.status === 'connected'
+                        ? 'bg-green-100 text-green-800'
+                        : 'bg-red-100 text-red-800'
+                      }
+                      variant="outline"
+                    >
+                      {hypervisor.status === 'error' ? 'Unavailable' : hypervisor.status}
+                    </Badge>
+                  )}
                 </div>
                 <p className="text-sm text-gray-500 font-mono">
                   {hypervisor.ip}:{hypervisor.port}

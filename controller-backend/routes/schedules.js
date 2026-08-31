@@ -1,11 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
-const { getBackupSchedules, saveBackupSchedules, getVirtualMachines } = require('../services/fileStorage');
+const { getBackupSchedules, saveBackupSchedules, getVirtualMachines, mutateJSON } = require('../services/fileStorage');
+const config = require('../config/config');
 const schedulerService = require('../services/schedulerService');
 const auditService = require('../services/auditService');
 const { validateSchedule } = require('../utils/validator');
-const { sanitizeScheduleNotifications, sanitizeMentions } = require('../services/notificationPolicyService');
 const { generateCronExpression, parseCronToHuman } = require('../utils/helpers');
 const { requireUser } = require('../middleware/rbac');
 
@@ -426,8 +426,6 @@ router.post('/', requireUser, async (req, res, next) => {
       });
     }
 
-    const schedules = await getBackupSchedules();
-    
     const newSchedule = {
       id: uuidv4(),
       vmId: req.body.vmId,
@@ -438,6 +436,12 @@ router.post('/', requireUser, async (req, res, next) => {
       // Common fields
       enabled: req.body.enabled !== false,
       noCompression: req.body.noCompression || false,
+      // The compression LEVEL (0-9), not just the on/off flag. It was never
+      // persisted on either path, so schedulerService's `schedule.compression
+      // || 2` fallback always won and the panel's level control did nothing
+      // whatever the operator picked. 0 is a real option in that control
+      // ("no compression"), so `typeof number` rather than `||`.
+      compression: typeof req.body.compression === 'number' ? req.body.compression : 2,
       noVerify: req.body.noVerify || false,
       
       // Missed-run policy (Item 1)
@@ -461,22 +465,22 @@ router.post('/', requireUser, async (req, res, next) => {
       offsiteRetryAttempts: typeof req.body.offsiteRetryAttempts === 'number' ? req.body.offsiteRetryAttempts : 3,
       offsiteRetryBackoffSeconds: typeof req.body.offsiteRetryBackoffSeconds === 'number' ? req.body.offsiteRetryBackoffSeconds : 15,
 
+      // rsync I/O-inactivity timeout for this schedule's offsite transfers.
+      // This is NOT a cap on how long a transfer may run — a transfer that
+      // keeps moving bytes is never cut off. It is how long a completely
+      // silent connection is tolerated before the attempt is abandoned and
+      // retried. Raise it on links that go quiet for long stretches.
+      offsiteRsyncTimeoutSeconds: typeof req.body.offsiteRsyncTimeoutSeconds === 'number'
+        ? req.body.offsiteRsyncTimeoutSeconds
+        : 1800,
+
       // Controller-level offsite-only resync: once the agent has exhausted its
       // in-place rsync attempts, the controller re-runs JUST the replication
       // (never the VM backup) on this slower cadence. null means "inherit the
       // backup retry settings", which is how every schedule created before
       // these fields existed behaves — see schedulerService.handleOffsiteSyncFailure.
-      // RocketChat usernames to @-mention when this schedule's backups fail.
-      // Empty = fall back to the global default list.
-      notifyMentions: sanitizeMentions(req.body.notifyMentions) || [],
-
       offsiteResyncAttempts: typeof req.body.offsiteResyncAttempts === 'number' ? req.body.offsiteResyncAttempts : null,
       offsiteResyncDelayMinutes: typeof req.body.offsiteResyncDelayMinutes === 'number' ? req.body.offsiteResyncDelayMinutes : null,
-
-      // Per-event notification toggles. Only explicit booleans are stored; an
-      // absent key means "inherit the global setting", which is what every
-      // existing schedule has.
-      notifications: sanitizeScheduleNotifications(req.body.notifications),
 
       // Retention / archive settings for chain backups (daily/weekly/interval/
       // cron). Stored for all types for simplicity; copy-based types
@@ -490,6 +494,11 @@ router.post('/', requireUser, async (req, res, next) => {
       // selected offsite host. offsiteHostIds is mirrored from the targets.
       offsiteTargets: offsiteSelection.offsiteTargets,
       offsiteHostIds: offsiteSelection.offsiteHostIds,
+      // Stored on create as well, so a schedule's declared intent is present
+      // from the start rather than being inferred until its first edit.
+      syncToOffsite: req.body.syncToOffsite !== undefined
+        ? req.body.syncToOffsite === true
+        : offsiteSelection.offsiteTargets.length > 0,
 
       // Type-specific fields
       ...(req.body.scheduleType === 'daily' && {
@@ -536,8 +545,15 @@ router.post('/', requireUser, async (req, res, next) => {
       updatedAt: new Date().toISOString(),
     };
 
-    schedules.push(newSchedule);
-    await saveBackupSchedules(schedules);
+    // Concurrent creates (e.g. the bulk-schedule dialog firing one request
+    // per selected VM) must not race a plain read-modify-write: two requests
+    // reading the file before either has saved would each push onto their
+    // own stale copy, and whichever write lands last would silently discard
+    // every schedule created by the writes before it. mutateJSON serializes
+    // the whole read+push+save per file, so no write is lost.
+    await mutateJSON(config.backupSchedulesFile, (schedules) => {
+      schedules.push(newSchedule);
+    });
 
     // Add to scheduler
     await schedulerService.addSchedule(newSchedule);
@@ -642,14 +658,28 @@ router.put('/:id', requireUser, async (req, res, next) => {
     // Only re-validate when the request carries offsite fields; otherwise the
     // existing selection is preserved unchanged. When present, the same
     // required-selection rule as create applies (exactly one pool per host).
+    //
+    // `syncToOffsite: false` counts as providing them. A client that turns
+    // offsite off is making a statement about the offsite selection, even if it
+    // sends no arrays — and without this, that statement was indistinguishable
+    // from a partial update that simply does not mention offsite, which the
+    // `else` branch below deliberately leaves untouched. That collision is what
+    // made unticking the box do nothing.
+    const offsiteDisabledExplicitly = req.body.syncToOffsite === false;
     const offsiteFieldsProvided =
       Object.prototype.hasOwnProperty.call(req.body, 'offsiteTargets') ||
       Object.prototype.hasOwnProperty.call(req.body, 'offsiteHostIds') ||
-      Object.prototype.hasOwnProperty.call(req.body, 'offsiteHostId');
+      Object.prototype.hasOwnProperty.call(req.body, 'offsiteHostId') ||
+      offsiteDisabledExplicitly;
 
     let offsiteTargetsToPersist;
     let offsiteHostIdsToPersist;
-    if (offsiteFieldsProvided) {
+    if (offsiteDisabledExplicitly) {
+      // Turning it off clears the selection outright. Nothing to validate:
+      // there are no targets left to check pools for.
+      offsiteTargetsToPersist = [];
+      offsiteHostIdsToPersist = [];
+    } else if (offsiteFieldsProvided) {
       const { getOffsiteHosts } = require('../services/fileStorage');
       const offsiteHosts = await getOffsiteHosts();
       const offsiteSelection = await validateOffsiteSelection(req.body, offsiteHosts);
@@ -674,7 +704,9 @@ router.put('/:id', requireUser, async (req, res, next) => {
         type: scheduleType,
         time: req.body.time || existingSchedule.time,
         daysOfWeek: req.body.daysOfWeek || existingSchedule.daysOfWeek,
-        intervalValue: req.body.intervalValue || existingSchedule.intervalValue,
+        intervalValue: typeof req.body.intervalValue === 'number'
+          ? req.body.intervalValue
+          : existingSchedule.intervalValue,
         intervalUnit: req.body.intervalUnit || existingSchedule.intervalUnit,
         cronExpression: req.body.cronExpression || existingSchedule.cronExpression,
       });
@@ -686,6 +718,9 @@ router.put('/:id', requireUser, async (req, res, next) => {
       scheduleType,
       enabled: req.body.enabled !== undefined ? req.body.enabled : existingSchedule.enabled,
       noCompression: req.body.noCompression !== undefined ? req.body.noCompression : existingSchedule.noCompression,
+      compression: typeof req.body.compression === 'number'
+        ? req.body.compression
+        : (existingSchedule.compression ?? 2),
       noVerify: req.body.noVerify !== undefined ? req.body.noVerify : existingSchedule.noVerify,
       
       // Missed-run policy (Item 1)
@@ -711,26 +746,20 @@ router.put('/:id', requireUser, async (req, res, next) => {
       offsiteRetryBackoffSeconds: typeof req.body.offsiteRetryBackoffSeconds === 'number'
         ? req.body.offsiteRetryBackoffSeconds
         : (existingSchedule.offsiteRetryBackoffSeconds ?? 15),
+      offsiteRsyncTimeoutSeconds: typeof req.body.offsiteRsyncTimeoutSeconds === 'number'
+        ? req.body.offsiteRsyncTimeoutSeconds
+        : (existingSchedule.offsiteRsyncTimeoutSeconds ?? 1800),
 
       // Controller-level offsite-only resync. null is meaningful here — it
       // means "inherit the backup retry settings" — so an explicit null in the
       // request body must be able to clear an override, which `typeof number`
       // alone would not allow.
-      notifyMentions: req.body.notifyMentions !== undefined
-        ? (sanitizeMentions(req.body.notifyMentions) || [])
-        : (existingSchedule.notifyMentions || []),
-
       offsiteResyncAttempts: req.body.offsiteResyncAttempts !== undefined
         ? (typeof req.body.offsiteResyncAttempts === 'number' ? req.body.offsiteResyncAttempts : null)
         : (existingSchedule.offsiteResyncAttempts ?? null),
       offsiteResyncDelayMinutes: req.body.offsiteResyncDelayMinutes !== undefined
         ? (typeof req.body.offsiteResyncDelayMinutes === 'number' ? req.body.offsiteResyncDelayMinutes : null)
         : (existingSchedule.offsiteResyncDelayMinutes ?? null),
-
-      // Per-event notification toggles (absent key = inherit global).
-      notifications: req.body.notifications !== undefined
-        ? sanitizeScheduleNotifications(req.body.notifications)
-        : existingSchedule.notifications,
 
       // Retention / archive settings (updatable for chain backups). Without
       // these the bulk/edit changes were silently dropped and the agent
@@ -746,6 +775,13 @@ router.put('/:id', requireUser, async (req, res, next) => {
       // selected offsite host. offsiteHostIds is mirrored from the targets.
       offsiteTargets: offsiteTargetsToPersist,
       offsiteHostIds: offsiteHostIdsToPersist,
+      // The operator's declared intent, stored alongside the targets rather
+      // than inferred from their length. Length alone cannot tell "switched
+      // off" apart from "on, but the hosts were removed elsewhere", and the
+      // form needs to render the tickbox from something it can trust.
+      syncToOffsite: req.body.syncToOffsite !== undefined
+        ? req.body.syncToOffsite === true
+        : offsiteTargetsToPersist.length > 0,
 
       // Clear the migration/validation invalid flag (Req 8.4) when offsite
       // fields were provided and passed validateOffsiteSelection above (a
@@ -756,32 +792,44 @@ router.put('/:id', requireUser, async (req, res, next) => {
       // Type-specific updates
       ...(scheduleType === 'daily' && {
         time: req.body.time || existingSchedule.time,
-        incrementalCount: req.body.incrementalCount || existingSchedule.incrementalCount,
+        incrementalCount: typeof req.body.incrementalCount === 'number'
+          ? req.body.incrementalCount
+          : existingSchedule.incrementalCount,
         cronExpression,
       }),
       
       ...(scheduleType === 'weekly' && {
         time: req.body.time || existingSchedule.time,
         daysOfWeek: req.body.daysOfWeek || existingSchedule.daysOfWeek,
-        incrementalCount: req.body.incrementalCount || existingSchedule.incrementalCount,
+        incrementalCount: typeof req.body.incrementalCount === 'number'
+          ? req.body.incrementalCount
+          : existingSchedule.incrementalCount,
         cronExpression,
       }),
       
       ...(scheduleType === 'custom-days' && {
         customDates: req.body.customDates || existingSchedule.customDates,
-        retentionCount: req.body.retentionCount || existingSchedule.retentionCount,
+        retentionCount: typeof req.body.retentionCount === 'number'
+          ? req.body.retentionCount
+          : existingSchedule.retentionCount,
       }),
       
       ...(scheduleType === 'interval' && {
-        intervalValue: req.body.intervalValue || existingSchedule.intervalValue,
+        intervalValue: typeof req.body.intervalValue === 'number'
+          ? req.body.intervalValue
+          : existingSchedule.intervalValue,
         intervalUnit: req.body.intervalUnit || existingSchedule.intervalUnit,
-        incrementalCount: req.body.incrementalCount || existingSchedule.incrementalCount,
+        incrementalCount: typeof req.body.incrementalCount === 'number'
+          ? req.body.incrementalCount
+          : existingSchedule.incrementalCount,
         cronExpression,
       }),
       
       ...(scheduleType === 'cron' && {
         cronExpression: req.body.cronExpression || existingSchedule.cronExpression,
-        incrementalCount: req.body.incrementalCount || existingSchedule.incrementalCount,
+        incrementalCount: typeof req.body.incrementalCount === 'number'
+          ? req.body.incrementalCount
+          : existingSchedule.incrementalCount,
       }),
       
       ...(scheduleType === 'once' && {
@@ -811,15 +859,16 @@ router.put('/:id', requireUser, async (req, res, next) => {
 // DELETE /api/schedules/:id - Delete schedule
 router.delete('/:id', requireUser, async (req, res, next) => {
   try {
-    const schedules = await getBackupSchedules();
-    const index = schedules.findIndex(s => s.id === req.params.id);
-    
-    if (index === -1) {
+    let deleted = null;
+    await mutateJSON(config.backupSchedulesFile, (schedules) => {
+      const index = schedules.findIndex(s => s.id === req.params.id);
+      if (index === -1) return false; // not found — nothing to write
+      deleted = schedules.splice(index, 1)[0];
+    });
+
+    if (!deleted) {
       return res.status(404).json({ success: false, error: 'Schedule not found' });
     }
-
-    const deleted = schedules.splice(index, 1)[0];
-    await saveBackupSchedules(schedules);
 
     // Remove from scheduler
     await schedulerService.removeSchedule(deleted.id);
@@ -833,16 +882,17 @@ router.delete('/:id', requireUser, async (req, res, next) => {
 // POST /api/schedules/:id/toggle - Toggle schedule enabled/disabled
 router.post('/:id/toggle', requireUser, async (req, res, next) => {
   try {
-    const schedules = await getBackupSchedules();
-    const schedule = schedules.find(s => s.id === req.params.id);
-    
+    let schedule = null;
+    await mutateJSON(config.backupSchedulesFile, (schedules) => {
+      schedule = schedules.find(s => s.id === req.params.id);
+      if (!schedule) return false; // not found — nothing to write
+      schedule.enabled = !schedule.enabled;
+      schedule.updatedAt = new Date().toISOString();
+    });
+
     if (!schedule) {
       return res.status(404).json({ success: false, error: 'Schedule not found' });
     }
-
-    schedule.enabled = !schedule.enabled;
-    schedule.updatedAt = new Date().toISOString();
-    await saveBackupSchedules(schedules);
 
     // Update scheduler
     await schedulerService.updateSchedule(schedule);

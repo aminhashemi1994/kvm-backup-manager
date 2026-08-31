@@ -22,7 +22,7 @@ export default function VmNameCell({
   vmName,
   showFull = false,
   subtitle,
-  maxWidthClass = 'max-w-[280px]',
+  maxWidthClass = 'max-w-[380px]',
 }: VmNameCellProps) {
   const { uuid, title, full } = parseVmName(vmName)
 

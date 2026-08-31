@@ -246,15 +246,33 @@ router.post('/:id/test', async (req, res, next) => {
       ]);
 
       let success = false;
+      let exitCode = null;
+      let stderr = '';
+
+      // Capture stderr so a failure reports *why* SSH was refused (auth
+      // failure, timeout, "No space left on device" when the hypervisor's
+      // root filesystem is full) instead of a bare "Connection failed".
+      // This message is what reaches the operator's notification.
+      ssh.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      // Kill the SSH child if the controller aborts the request (e.g. its
+      // own 10s axios timeout fires) instead of leaving it running in the
+      // background for the full timer duration.
+      res.on('close', () => {
+        if (!ssh.killed) ssh.kill();
+      });
 
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           ssh.kill();
-          reject(new Error('Connection test timeout after 45 seconds'));
-        }, 45000);
+          reject(new Error('Connection test timeout after 10 seconds'));
+        }, 10000);
 
         ssh.on('close', (code) => {
           clearTimeout(timeout);
+          exitCode = code;
           success = code === 0;
           resolve();
         });
@@ -265,9 +283,21 @@ router.post('/:id/test', async (req, res, next) => {
         });
       });
 
+      // Collapse to a single line and cap the length - this string is
+      // rendered into a chat notification, where a multi-line SSH banner
+      // would break the message layout.
+      const detail = stderr
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0)
+        .join('; ')
+        .slice(0, 300);
+
       const result = {
         success,
-        message: success ? 'Connection successful' : 'Connection failed'
+        message: success
+          ? 'Connection successful'
+          : `SSH to ${hypervisor.username}@${hypervisor.ip} failed with code ${exitCode}${detail ? `: ${detail}` : ''}`
       };
 
       // Update status

@@ -12,7 +12,8 @@ import {
   HardDrive,
   Settings,
   Eye,
-  Edit
+  Edit,
+  Loader2
 } from 'lucide-react'
 import { cn, getStatusColor } from '@/lib/utils'
 import type { BackupHost } from '@/types'
@@ -25,9 +26,11 @@ import socketService from '@/services/socket'
 import { initApi } from '@/services/api'
 import { useHypervisorsByBackupHost, useDeleteBackupHost, useHealthCheckBackupHost } from '@/hooks/useBackupHosts'
 import { useInitBackupHost } from '@/hooks/useInit'
+import { useLiveCheckStatus } from '@/hooks/useLiveCheckStatus'
 import { toast } from 'sonner'
 import MetricsCard from '@/components/metrics/MetricsCard'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { getErrorMessage } from '@/lib/errors'
 
 interface BackupHostCardProps {
   backupHost: BackupHost
@@ -41,7 +44,8 @@ export default function BackupHostCard({ backupHost }: BackupHostCardProps) {
   const [showInitDialog, setShowInitDialog] = useState(false)
   const [isInitializing, setIsInitializing] = useState(false)
   const [isSyncing, setIsSyncing] = useState(false)
-  
+
+  const isCheckingStatus = useLiveCheckStatus(backupHost.id, backupHost.checking, 'backup-host-status-updated')
   const { data: hypervisors, isLoading } = useHypervisorsByBackupHost(backupHost.id)
   const deleteHost = useDeleteBackupHost()
   const healthCheck = useHealthCheckBackupHost()
@@ -70,7 +74,7 @@ export default function BackupHostCard({ backupHost }: BackupHostCardProps) {
       toast.success('Storage pools synced successfully')
     } catch (error: any) {
       console.error('Failed to sync storage pools:', error)
-      toast.error(error.response?.data?.error || 'Failed to sync storage pools')
+      toast.error(getErrorMessage(error, 'Failed to sync storage pools'))
     } finally {
       setIsSyncing(false)
     }
@@ -160,9 +164,16 @@ export default function BackupHostCard({ backupHost }: BackupHostCardProps) {
               <div>
                 <div className="flex items-center space-x-2">
                   <h3 className="text-lg font-semibold">{backupHost.name}</h3>
-                  <Badge className={getStatusColor(backupHost.status)}>
-                    {backupHost.status}
-                  </Badge>
+                  {isCheckingStatus ? (
+                    <Badge className="bg-blue-100 text-blue-800">
+                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                      Checking...
+                    </Badge>
+                  ) : (
+                    <Badge className={getStatusColor(backupHost.status)}>
+                      {backupHost.status === 'offline' ? 'Unavailable' : backupHost.status}
+                    </Badge>
+                  )}
                 </div>
                 <p className="text-sm text-gray-500 font-mono">{backupHost.url}</p>
                 <div className="flex items-center space-x-2 mt-1">

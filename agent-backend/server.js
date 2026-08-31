@@ -36,6 +36,7 @@ const liveStatusRoutes = require('./routes/liveStatus');
 
 // Import services
 const backupExecutor = require('./services/backupExecutor');
+const rsyncExecutor = require('./services/rsyncExecutor');
 const restoreExecutor = require('./services/restoreExecutor');
 const initHostService = require('./services/initHostService');
 const reportService = require('./services/reportService');
@@ -116,6 +117,15 @@ controllerTlsService.onStateChange((tlsState) => {
 
 // Initialize backup executor
 backupExecutor.initialize(io, config);
+
+// Initialize the offsite sync executor. recoverRunningJobs() reattaches to
+// transfers still alive in tmux from a previous agent process — an offsite sync
+// routinely outlives a restart, and without this it would keep running while
+// the panel showed nothing and no final result was ever reported.
+rsyncExecutor.init(io, config);
+rsyncExecutor.recoverRunningJobs().catch(err => {
+  console.error('[RsyncExecutor] Recovery failed:', err.message);
+});
 
 // Initialize restore executor. initialize() re-adopts restores still running in
 // tmux from a previous agent process — without it they stay invisible after a

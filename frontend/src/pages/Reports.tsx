@@ -17,6 +17,8 @@ import ViewModeSelector, { type ViewMode } from '@/components/reports/ViewModeSe
 import VMTableView from '@/components/reports/VMTableView'
 import VMChartView from '@/components/reports/VMChartView'
 import VMCompactView from '@/components/reports/VMCompactView'
+import VMOverviewView from '@/components/reports/VMOverviewView'
+import { getErrorMessage } from '@/lib/errors'
 
 export default function Reports() {
   const navigate = useNavigate()
@@ -26,7 +28,7 @@ export default function Reports() {
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
     // Persist view mode in localStorage
     const saved = localStorage.getItem('reports-view-mode')
-    return (saved as ViewMode) || 'card'
+    return (saved as ViewMode) || 'overview'
   })
   const [rateLimitInfo, setRateLimitInfo] = useState<{
     isLimited: boolean
@@ -199,7 +201,7 @@ export default function Reports() {
           })
         }, 1000)
       } else {
-        const errorMessage = error.response?.data?.error || error.response?.data?.message || error.message || 'Failed to generate report'
+        const errorMessage = getErrorMessage(error) || error.response?.data?.message || error.message || 'Failed to generate report'
         const displayMessage = typeof errorMessage === 'string' ? errorMessage : JSON.stringify(errorMessage)
         toast.error(displayMessage)
       }
@@ -413,7 +415,7 @@ export default function Reports() {
             <Card>
               <CardContent className="py-12">
                 <div className="text-center">
-                  {(error as any).response?.status === 404 || (error as any).response?.data?.error?.includes('not yet generated') ? (
+                  {(error as any).response?.status === 404 || getErrorMessage(error).includes('not yet generated') ? (
                     <>
                       <Clock className="h-12 w-12 text-orange-600 mx-auto mb-4" />
                       <p className="text-gray-900 font-medium mb-2">Report Not Yet Generated</p>
@@ -434,9 +436,7 @@ export default function Reports() {
                       <AlertCircle className="h-12 w-12 text-red-600 mx-auto mb-4" />
                       <p className="text-gray-600 mb-2">Failed to load report</p>
                       <p className="text-sm text-gray-500">
-                        {typeof (error as any).response?.data?.error === 'string' 
-                          ? (error as any).response?.data?.error 
-                          : (error as any).message || 'Unknown error'}
+                        {getErrorMessage(error, 'Unknown error')}
                       </p>
                       <Button
                         variant="outline"
@@ -631,6 +631,7 @@ export default function Reports() {
                     </div>
                   ) : (
                     <>
+                      {viewMode === 'overview' && <VMOverviewView vms={filteredVMs} />}
                       {viewMode === 'card' && (
                         <div className="space-y-4">
                           {filteredVMs.map((vm: any) => (

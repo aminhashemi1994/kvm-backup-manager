@@ -8,6 +8,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Loader2, AlertTriangle, HardDrive, Database, Calendar, Layers } from 'lucide-react'
 import { restoreApi } from '@/services/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 interface RestoreBackupDialogProps {
   vmName: string
@@ -95,7 +96,7 @@ export default function RestoreBackupDialog({
       }
     } catch (err: any) {
       console.error('Failed to load restore options:', err)
-      setError(err.response?.data?.error || 'Failed to load restore options')
+      setError(getErrorMessage(err, 'Failed to load restore options'))
     } finally {
       setLoading(false)
     }
@@ -146,7 +147,7 @@ export default function RestoreBackupDialog({
     } catch (err: any) {
       console.error('Failed to trigger restore:', err)
       toast.error('Restore Failed', {
-        description: err.response?.data?.error || 'Failed to start restore',
+        description: getErrorMessage(err, 'Failed to start restore'),
       })
     } finally {
       setTriggering(false)

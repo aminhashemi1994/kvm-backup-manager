@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { reportsApi } from '@/services/api'
 import { toast } from 'sonner'
 import * as XLSX from 'xlsx'
+import { getErrorMessage } from '@/lib/errors'
 
 type Format = 'txt' | 'md' | 'xlsx' | 'json' | 'csv'
 type Scope = 'global' | 'host' | 'vm' | 'hypervisor'
@@ -131,7 +132,7 @@ export default function ReportDownloadMenu({
           }
         }
       } catch (err: any) {
-        const msg = err.response?.data?.error || err.message || 'Regeneration failed'
+        const msg = getErrorMessage(err, 'Regeneration failed')
         toast.error(`Could not refresh reports: ${msg}. Downloading existing data instead.`)
       }
 
@@ -165,7 +166,7 @@ export default function ReportDownloadMenu({
 
       toast.success(`Report downloaded (${format.toUpperCase()})`)
     } catch (err: any) {
-      const msg = err.response?.data?.error || err.message || 'Download failed'
+      const msg = getErrorMessage(err, 'Download failed')
       toast.error(`Download failed: ${msg}`)
     } finally {
       setBusy(null)

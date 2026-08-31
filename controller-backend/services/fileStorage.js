@@ -46,6 +46,7 @@ class FileStorage {
         config.backupSchedulesFile,
         config.backupJobsFile,
         path.join(config.dataDir, 'offsite-hosts.json'),
+        path.join(config.dataDir, 'offsite-jobs.json'),
         path.join(config.dataDir, 'storage-pools.json'),
         path.join(config.dataDir, 'restore-storage-pools.json'),
       ];
@@ -263,6 +264,24 @@ class FileStorage {
   async saveBackupJobs(jobs) { await this.writeJSON(config.backupJobsFile, jobs); }
   async updateBackupJobs(mutator) { return await this.mutateJSON(config.backupJobsFile, mutator); }
 
+  // Offsite Jobs
+  //
+  // Kept in their own file rather than as a `type` field on backup jobs. Almost
+  // everything that reads backup-jobs.json — history, reports, prometheus
+  // metrics, the incident board, schedule adherence, missed-run detection,
+  // startup recovery — assumes every row is a backup, and a replication job is
+  // not one: it has no method, no hypervisor, no retention, and its failure
+  // means something different. A separate store leaves all of that untouched.
+  async getOffsiteJobs() {
+    return await this.readJSON(path.join(config.dataDir, 'offsite-jobs.json'));
+  }
+  async saveOffsiteJobs(jobs) {
+    await this.writeJSON(path.join(config.dataDir, 'offsite-jobs.json'), jobs);
+  }
+  async updateOffsiteJobs(mutator) {
+    return await this.mutateJSON(path.join(config.dataDir, 'offsite-jobs.json'), mutator);
+  }
+
   // Offsite Hosts
   async getOffsiteHosts() { 
     return await this.readJSON(path.join(config.dataDir, 'offsite-hosts.json')); 
@@ -321,6 +340,9 @@ module.exports = {
   getBackupJobs: () => fileStorage.getBackupJobs(),
   saveBackupJobs: (jobs) => fileStorage.saveBackupJobs(jobs),
   updateBackupJobs: (mutator) => fileStorage.updateBackupJobs(mutator),
+  getOffsiteJobs: () => fileStorage.getOffsiteJobs(),
+  saveOffsiteJobs: (jobs) => fileStorage.saveOffsiteJobs(jobs),
+  updateOffsiteJobs: (mutator) => fileStorage.updateOffsiteJobs(mutator),
   getOffsiteHosts: () => fileStorage.getOffsiteHosts(),
   saveOffsiteHosts: (hosts) => fileStorage.saveOffsiteHosts(hosts),
   getStoragePools: () => fileStorage.getStoragePools(),

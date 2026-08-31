@@ -44,14 +44,14 @@ function describeAxiosError(err) {
 const TYPE_DEFAULTS = Object.freeze({
   // Backup lifecycle
   backupCompleted: false,          // 15 messages a night saying things worked
-  backupFailed: true,
+  // backupFailed, offsiteSyncFailed, and backupSkipped have no switch: they
+  // always route to the daily incident board (dailyIncidentBoardService.js),
+  // unconditionally. Who gets @-mentioned is configured per backup host
+  // (notification-settings.json `hostMentions`), not per type.
   scheduledBackupFailed: true,
-  backupSkipped: true,
   backupRetry: false,              // the outcome is what matters, not the attempt
   multipleBackupFailures: true,
   backupStuck: true,
-  // Offsite
-  offsiteSyncFailed: true,
   // Restore — driven by a human who is already watching the panel
   restoreStarted: false,
   restoreCompleted: false,
@@ -109,12 +109,22 @@ class RocketChatService {
   applyConfig(rc) {
     this.enabled = !!rc.enabled;
     this.webhookUrl = rc.webhookUrl || '';
-    this.url = rc.url || '';
+    this.url = (rc.url || '').replace(/\/+$/, ''); // trailing slash would double up in the path
     this.authToken = rc.authToken || '';
     this.userId = rc.userId || '';
+    this.username = rc.username || '';
+    this.password = rc.password || '';
     this.channel = rc.channel || 'backup-notifications';
     this.entity = rc.entity || '';
     this.version = rc.version || '';
+
+    // A token obtained by logging in with username/password. Kept only in
+    // memory: it is a session credential, not configuration, and re-login is
+    // cheap. Dropped whenever the config it was derived from changes, so
+    // pointing at a different server or account can't keep using the old one.
+    this.sessionToken = null;
+    this.sessionUserId = null;
+    this._loginInFlight = null;
 
     // Mode preference: explicit > webhook URL > API
     this.useWebhook = rc.mode
@@ -206,7 +216,121 @@ class RocketChatService {
     if (this.useWebhook) {
       return this.enabled && this.webhookUrl;
     }
-    return this.enabled && this.url && this.authToken && this.userId;
+    // API mode authenticates either with a static personal access token or
+    // with a username/password we exchange for one at runtime.
+    const hasStaticToken = !!(this.authToken && this.userId);
+    const hasCredentials = !!(this.username && this.password);
+    return !!(this.enabled && this.url && (hasStaticToken || hasCredentials));
+  }
+
+  /**
+   * Exchange username/password for a session token via /api/v1/login.
+   *
+   * Concurrent callers share one in-flight request: a night's worth of
+   * notifications can land at once, and without this a expired token would
+   * trigger a dozen simultaneous logins (each invalidating the last on some
+   * RocketChat configurations).
+   */
+  async _login() {
+    if (this._loginInFlight) return this._loginInFlight;
+    if (!this.username || !this.password) {
+      return Promise.resolve({ success: false, error: 'No RocketChat username/password configured' });
+    }
+
+    this._loginInFlight = (async () => {
+      try {
+        const response = await axios.post(
+          `${this.url}/api/v1/login`,
+          { user: this.username, password: this.password },
+          {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 15000,
+            httpsAgent: insecureHttpsAgent,
+          }
+        );
+
+        const data = response.data && response.data.data;
+        if (response.data?.status === 'success' && data?.authToken && data?.userId) {
+          this.sessionToken = data.authToken;
+          this.sessionUserId = data.userId;
+          console.log(`[RocketChat] Logged in as ${this.username} (userId=${data.userId})`);
+          return { success: true };
+        }
+
+        const reason = response.data?.error || response.data?.message
+          || JSON.stringify(response.data).slice(0, 300);
+        console.error('[RocketChat] Login failed:', reason);
+        return { success: false, error: `RocketChat login failed: ${reason}` };
+      } catch (error) {
+        const detail = describeAxiosError(error);
+        console.error('[RocketChat] Login error:', detail);
+        return { success: false, error: `RocketChat login failed: ${detail}` };
+      } finally {
+        this._loginInFlight = null;
+      }
+    })();
+
+    return this._loginInFlight;
+  }
+
+  /** The credentials to sign the next API call with, logging in if needed. */
+  async _ensureAuth() {
+    if (this.sessionToken && this.sessionUserId) {
+      return { token: this.sessionToken, userId: this.sessionUserId };
+    }
+    if (this.authToken && this.userId) {
+      return { token: this.authToken, userId: this.userId };
+    }
+    const result = await this._login();
+    if (!result.success) return null;
+    return { token: this.sessionToken, userId: this.sessionUserId };
+  }
+
+  /**
+   * POST to the RocketChat REST API with auth attached.
+   *
+   * A session token expires (or is revoked when the bot logs in elsewhere),
+   * and the failure looks like a normal 401 — so on the first unauthorized
+   * response we drop the cached token, log in again, and retry once. Only
+   * once: if the retry is also rejected the credentials are genuinely wrong
+   * and looping would just lock the account out.
+   */
+  async _authedPost(apiPath, body, { retryOnAuthFailure = true } = {}) {
+    const auth = await this._ensureAuth();
+    if (!auth) {
+      return { success: false, error: 'RocketChat authentication failed — check the username and password' };
+    }
+
+    try {
+      const response = await axios.post(
+        `${this.url}${apiPath}`,
+        body,
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Auth-Token': auth.token,
+            'X-User-Id': auth.userId,
+          },
+          timeout: 10000,
+          httpsAgent: insecureHttpsAgent,
+        }
+      );
+      return { success: true, data: response.data };
+    } catch (error) {
+      const status = error.response && error.response.status;
+      const unauthorized = status === 401 || status === 403;
+
+      if (unauthorized && retryOnAuthFailure && this.username && this.password) {
+        console.log('[RocketChat] Token rejected — re-authenticating and retrying once');
+        this.sessionToken = null;
+        this.sessionUserId = null;
+        const relogin = await this._login();
+        if (!relogin.success) return { success: false, error: relogin.error };
+        return this._authedPost(apiPath, body, { retryOnAuthFailure: false });
+      }
+
+      return { success: false, error: describeAxiosError(error) };
+    }
   }
 
   async sendMessage(text) {
@@ -221,39 +345,53 @@ class RocketChatService {
     }
 
     // Use API method (allows message updates)
-    try {
-      const response = await axios.post(
-        `${this.url}/api/v1/chat.postMessage`,
-        {
-          channel: this.channel,
-          text,
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Auth-Token': this.authToken,
-            'X-User-Id': this.userId,
-          },
-          timeout: 10000,
-          httpsAgent: insecureHttpsAgent,
-        }
-      );
-
-      if (response.data.success) {
-        this.lastMessageId = response.data.message._id;
-        this.lastRoomId = response.data.message.rid;
-        console.log(`[RocketChat] Message sent - msg_id=${this.lastMessageId}`);
-        return { success: true, messageId: this.lastMessageId };
-      }
-
-      const reason = response.data?.error || JSON.stringify(response.data).slice(0, 300);
-      console.error('[RocketChat] postMessage returned success=false:', reason);
-      return { success: false, error: `RocketChat rejected message: ${reason}` };
-    } catch (error) {
-      const detail = describeAxiosError(error);
-      console.error('[RocketChat] Error sending message:', detail);
-      return { success: false, error: detail };
+    const result = await this._postMessageRaw(text);
+    if (result.success) {
+      this.lastMessageId = result.messageId;
+      this.lastRoomId = result.roomId;
     }
+    return result;
+  }
+
+  /**
+   * Like sendMessage(), but for a caller (the daily incident board) that
+   * tracks its own message/room id rather than sharing the single
+   * lastMessageId/lastRoomId slot used by sendMessage()/updateMessage().
+   * API mode only — the board requires editable messages, so it has no
+   * webhook fallback.
+   */
+  async postNewMessage(text) {
+    if (!this.isConfigured()) {
+      console.log('[RocketChat] Not configured, skipping message');
+      return { success: false, error: 'Not configured' };
+    }
+    if (this.useWebhook) {
+      return { success: false, error: 'Webhook mode does not support editable messages' };
+    }
+    return this._postMessageRaw(text);
+  }
+
+  async _postMessageRaw(text) {
+    const result = await this._authedPost('/api/v1/chat.postMessage', {
+      channel: this.channel,
+      text,
+    });
+
+    if (!result.success) {
+      console.error('[RocketChat] Error sending message:', result.error);
+      return result;
+    }
+
+    if (result.data.success) {
+      const messageId = result.data.message._id;
+      const roomId = result.data.message.rid;
+      console.log(`[RocketChat] Message sent - msg_id=${messageId}`);
+      return { success: true, messageId, roomId };
+    }
+
+    const reason = result.data?.error || JSON.stringify(result.data).slice(0, 300);
+    console.error('[RocketChat] postMessage returned success=false:', reason);
+    return { success: false, error: `RocketChat rejected message: ${reason}` };
   }
 
   async sendWebhookMessage(text) {
@@ -303,37 +441,46 @@ class RocketChatService {
       return await this.sendMessage(text);
     }
 
-    try {
-      const response = await axios.post(
-        `${this.url}/api/v1/chat.update`,
-        {
-          roomId: this.lastRoomId,
-          msgId: this.lastMessageId,
-          text,
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Auth-Token': this.authToken,
-            'X-User-Id': this.userId,
-          },
-          timeout: 10000,
-          httpsAgent: insecureHttpsAgent,
-        }
-      );
+    return this._updateMessageRaw(this.lastRoomId, this.lastMessageId, text);
+  }
 
-      if (response.data.success) {
-        console.log(`[RocketChat] Message updated - msg_id=${this.lastMessageId}`);
-        return { success: true, messageId: this.lastMessageId };
-      }
-
-      const reason = response.data?.error || JSON.stringify(response.data).slice(0, 300);
-      return { success: false, error: `RocketChat rejected update: ${reason}` };
-    } catch (error) {
-      const detail = describeAxiosError(error);
-      console.error('[RocketChat] Error updating message:', detail);
-      return { success: false, error: detail };
+  /**
+   * Like updateMessage(), but for a caller that tracks its own message/room
+   * id (see postNewMessage()) instead of the shared lastMessageId slot.
+   */
+  async updateMessageById(roomId, messageId, text) {
+    if (!this.isConfigured()) {
+      console.log('[RocketChat] Not configured, skipping update');
+      return { success: false, error: 'Not configured' };
     }
+    if (this.useWebhook) {
+      return { success: false, error: 'Webhook mode does not support editable messages' };
+    }
+    if (!roomId || !messageId) {
+      return { success: false, error: 'No message to update' };
+    }
+    return this._updateMessageRaw(roomId, messageId, text);
+  }
+
+  async _updateMessageRaw(roomId, messageId, text) {
+    const result = await this._authedPost('/api/v1/chat.update', {
+      roomId,
+      msgId: messageId,
+      text,
+    });
+
+    if (!result.success) {
+      console.error('[RocketChat] Error updating message:', result.error);
+      return result;
+    }
+
+    if (result.data.success) {
+      console.log(`[RocketChat] Message updated - msg_id=${messageId}`);
+      return { success: true, messageId };
+    }
+
+    const reason = result.data?.error || JSON.stringify(result.data).slice(0, 300);
+    return { success: false, error: `RocketChat rejected update: ${reason}` };
   }
 
   // ============================================================================
@@ -512,57 +659,109 @@ class RocketChatService {
     });
   }
 
-  notifyBackupFailed(vmName, method, error, scheduleId = null) {
-    if (!this.isTypeEnabled('backupFailed')) return this._muted('backupFailed');
-    return this._viaAggregator({
-      kind: 'backup-failed',
-      subject: vmName,
-      cause: error,
-      scheduleId,
-      sendSingle: async () => this.notify({
-        mentions: await this.resolveMentions('backupFailed', scheduleId),
-        entity: 'Backup',
-        state: (method || '').toUpperCase() || 'BACKUP',
-        status: 'Failed',
-        name: vmName,
-        details: `Error: ${error}`,
-      }),
+  /**
+   * Always routes to the daily incident board — no on/off switch, no legacy
+   * per-message path. See services/dailyIncidentBoardService.js. Who gets
+   * @-mentioned is decided there, from notification-settings.json's
+   * `hostMentions` (keyed by backupHostId), not from a per-type setting.
+   */
+  notifyBackupFailed(vmName, method, error, scheduleId = null, backupHostId = null) {
+    // Still feed the aggregator's incident bookkeeping (trackOnly: no
+    // message of its own) so notifyBackupCompleted's recovery detection
+    // keeps working even though the failure message itself lives on the
+    // board.
+    try {
+      require('./notificationAggregator').submit({
+        kind: 'backup-failed', subject: vmName, cause: error, scheduleId, trackOnly: true,
+      });
+    } catch (err) {
+      console.error('[RocketChat] Aggregator tracking failed:', err.message);
+    }
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: vmName, kind: 'backup-failed', detail: error, scheduleId, backupHostId,
     });
   }
 
-
-
-  notifyOffsiteSyncFailed(vmName, offsiteHost, error, scheduleId = null) {
-    if (!this.isTypeEnabled('offsiteSyncFailed')) return this._muted('offsiteSyncFailed');
-    // Grouped by destination as well as cause: "10 VMs failed to Offsite-2"
-    // is one incident, and one unreachable destination was responsible for
-    // roughly 60 messages in a single night before this.
-    return this._viaAggregator({
-      kind: 'offsite-failed',
-      subject: vmName,
-      cause: `${offsiteHost}: ${error}`,
-      context: `Destination: ${offsiteHost}`,
-      scheduleId,
-      sendSingle: async () => this.notify({
-        mentions: await this.resolveMentions('offsiteSyncFailed', scheduleId),
-        entity: 'Offsite Sync',
-        state: 'Transfer',
-        status: 'Failed',
-        name: vmName,
-        details: `Destination: ${offsiteHost}, Error: ${error}`,
-      }),
+  notifyOffsiteSyncFailed(vmName, offsiteHost, error, scheduleId = null, offsiteSuccessSeen = false, backupHostId = null) {
+    try {
+      require('./notificationAggregator').submit({
+        kind: 'offsite-failed', subject: vmName, cause: `${offsiteHost}: ${error}`, scheduleId, trackOnly: true,
+      });
+    } catch (err) {
+      console.error('[RocketChat] Aggregator tracking failed:', err.message);
+    }
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: vmName, kind: 'offsite', offsiteHost, scheduleId, backupHostId,
     });
   }
 
-  notifyBackupSkipped(vmName, backupHost, reason) {
-    if (!this.isTypeEnabled('backupSkipped')) return this._muted('backupSkipped');
-    return this.notify({
-        typeKey: 'backupSkipped',
-      entity: 'Backup',
-      state: 'Schedule',
-      status: 'Skipped',
-      name: vmName,
-      details: `Host: ${backupHost}, Reason: ${reason}`,
+  /**
+   * A whole replication job failed — not one destination out of several, but
+   * the job itself (could not start, refused, timed out, killed).
+   *
+   * Distinct from notifyOffsiteSyncFailed, which reports one target's outcome
+   * when the sync itself ran. Both land on the board as warnings; only the
+   * wording differs, because "Site3 failed" and "replication never ran" call
+   * for different responses.
+   */
+  notifyOffsiteJobFailed(vmName, reason, scheduleId = null, backupHostId = null) {
+    try {
+      require('./notificationAggregator').submit({
+        kind: 'offsite-failed', subject: vmName, cause: reason, scheduleId, trackOnly: true,
+      });
+    } catch (err) {
+      console.error('[RocketChat] Aggregator tracking failed:', err.message);
+    }
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: vmName, kind: 'offsite-failed', detail: reason, scheduleId, backupHostId,
+    });
+  }
+
+  /**
+   * The replication check found a VM's offsite copy out of date.
+   *
+   * Only reported when nothing is already being done about it — if the check
+   * queued a sync, that sync's own outcome is the thing worth saying, and
+   * announcing both would be two messages for one problem.
+   */
+  notifyOffsiteBehind(vmName, detail, scheduleId = null, backupHostId = null) {
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: vmName, kind: 'offsite-behind', detail, scheduleId, backupHostId,
+    });
+  }
+
+  /**
+   * An agent too old to run an independent replication job. Host-level: the
+   * board keys this per backup host, so it is one line however many VMs are
+   * affected.
+   */
+  notifyOffsiteUnsupported(backupHostName, detail, backupHostId = null) {
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: 'Offsite replication', kind: 'offsite-unsupported', detail, backupHostId,
+    });
+  }
+
+  /**
+   * The storage pool holding a host's backups is not mounted, or is not the
+   * filesystem it was.
+   *
+   * Critical rather than a warning, and deliberately not filed as an offsite
+   * problem: the LOCAL copy is the one that is missing. Replication is refused
+   * for those VMs on purpose — syncing from an empty mount point would delete
+   * the offsite copies, which may be all that is left. Host-level, so it is
+   * one line per host rather than one per affected VM.
+   */
+  notifySourceUnavailable(backupHostName, detail, backupHostId = null) {
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: 'Backup pool', kind: 'source-unavailable', detail, backupHostId,
+    });
+  }
+
+  notifyBackupSkipped(vmName, backupHost, reason, backupHostId = null) {
+    // backupHost is which zone this lands under on the board — already shown
+    // by the zone header, so it doesn't need repeating in the line itself.
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: vmName, kind: 'skipped', detail: reason, backupHostId,
     });
   }
 

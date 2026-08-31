@@ -348,13 +348,13 @@ export default function TriggerBackupDialog({
                               <Label htmlFor={`offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
                                 {host.name} ({host.ip})
                               </Label>
-                              {host.status === 'online' ? (
+                              {host.status === 'connected' ? (
                                 <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
                                   Connected
                                 </Badge>
                               ) : (
                                 <Badge variant="outline" className="text-xs bg-yellow-50 text-yellow-700 border-yellow-200">
-                                  {host.status === 'offline' ? 'Disconnected' : (host.status || 'Unknown')}
+                                  {host.status === 'error' || host.status === 'disconnected' ? 'Disconnected' : (host.status || 'Unknown')}
                                 </Badge>
                               )}
                             </div>

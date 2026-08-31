@@ -1,6 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { storagePoolsApi, restoreStoragePoolsApi } from '@/services/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 export interface StoragePool {
   id: string
@@ -70,7 +71,7 @@ export function useCreateStoragePool() {
       toast.success('Storage pool created successfully')
     },
     onError: (error: any) => {
-      const message = error.response?.data?.error || 'Failed to create storage pool'
+      const message = getErrorMessage(error, 'Failed to create storage pool')
       toast.error(message)
     },
   })
@@ -87,7 +88,7 @@ export function useUpdateStoragePool() {
       toast.success('Storage pool updated successfully')
     },
     onError: (error: any) => {
-      const message = error.response?.data?.error || 'Failed to update storage pool'
+      const message = getErrorMessage(error, 'Failed to update storage pool')
       toast.error(message)
     },
   })
@@ -103,7 +104,7 @@ export function useDeleteStoragePool() {
       toast.success('Storage pool deleted successfully')
     },
     onError: (error: any) => {
-      const message = error.response?.data?.error || 'Failed to delete storage pool'
+      const message = getErrorMessage(error, 'Failed to delete storage pool')
       toast.error(message)
     },
   })
@@ -119,7 +120,7 @@ export function useRefreshStoragePool() {
       toast.success('Storage pool refreshed successfully')
     },
     onError: (error: any) => {
-      const message = error.response?.data?.error || 'Failed to refresh storage pool'
+      const message = getErrorMessage(error, 'Failed to refresh storage pool')
       toast.error(message)
     },
   })
@@ -162,7 +163,7 @@ export function useCreateRestoreStoragePool() {
       toast.success('Restore storage pool created successfully')
     },
     onError: (error: any) => {
-      const message = error.response?.data?.error || 'Failed to create restore storage pool'
+      const message = getErrorMessage(error, 'Failed to create restore storage pool')
       toast.error(message)
     },
   })
@@ -179,7 +180,7 @@ export function useUpdateRestoreStoragePool() {
       toast.success('Restore storage pool updated successfully')
     },
     onError: (error: any) => {
-      const message = error.response?.data?.error || 'Failed to update restore storage pool'
+      const message = getErrorMessage(error, 'Failed to update restore storage pool')
       toast.error(message)
     },
   })
@@ -195,7 +196,7 @@ export function useDeleteRestoreStoragePool() {
       toast.success('Restore storage pool deleted successfully')
     },
     onError: (error: any) => {
-      const message = error.response?.data?.error || 'Failed to delete restore storage pool'
+      const message = getErrorMessage(error, 'Failed to delete restore storage pool')
       toast.error(message)
     },
   })
@@ -211,7 +212,7 @@ export function useRefreshRestoreStoragePool() {
       toast.success('Restore storage pool refreshed successfully')
     },
     onError: (error: any) => {
-      const message = error.response?.data?.error || 'Failed to refresh restore storage pool'
+      const message = getErrorMessage(error, 'Failed to refresh restore storage pool')
       toast.error(message)
     },
   })

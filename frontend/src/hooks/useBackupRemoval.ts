@@ -1,6 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { backupRemovalApi } from '@/services/api'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/lib/errors'
 
 // List all VMs (quick)
 export function useVMList(backupHostId: string) {
@@ -49,7 +50,7 @@ export function useRemoveScheduleBackup() {
       })
     },
     onError: (error: any, variables) => {
-      const message = error.response?.data?.error || error.message || 'Failed to remove backup'
+      const message = getErrorMessage(error, 'Failed to remove backup')
       toast.error(`Failed to remove ${variables.scheduleType} backup: ${message}`)
     },
   })
@@ -77,7 +78,7 @@ export function useRemoveVMBackup() {
       })
     },
     onError: (error: any, variables) => {
-      const message = error.response?.data?.error || error.message || 'Failed to remove VM backup'
+      const message = getErrorMessage(error, 'Failed to remove VM backup')
       toast.error(`Failed to remove VM backup: ${message}`)
     },
   })

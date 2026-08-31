@@ -1,6 +1,6 @@
 {
   "name": "kvm-backup-controller",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "KVM Backup Manager - Controller Backend",
   "main": "server.js",
   "scripts": {

@@ -1,0 +1,741 @@
+# Grafana alert rules for the Backup Manager metrics.
+#
+# Install:
+#   1. Replace every PROM_UID below with your Prometheus data source UID
+#      (Grafana -> Connections -> Data sources -> click it -> copy the UID
+#      from the browser address bar).
+#   2. Copy to /etc/grafana/provisioning/alerting/backup-manager.yaml
+#   3. systemctl restart grafana-server
+#
+# Or paste the expressions into the UI by hand: Alerting -> Alert rules -> New.
+#
+# Contact points and notification policies are NOT set here — route the
+# `team: backup` label wherever your team already receives alerts.
+
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: "backup-manager"
+    folder: "Backup Manager"
+    interval: "1m"
+    rules:
+      - uid: "bm-backup-failed"
+        title: "Backup failed"
+        condition: "C"
+        for: "10m"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "bm_vm_backup_last_status == 1"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "Backup failed: {{ $labels.vm }}"
+          description: "The most recent backup run for {{ $labels.vm }} ended in failure. Open the VM in the Backup Manager panel and read the job log."
+        labels:
+          severity: "critical"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-backup-repeat-failures"
+        title: "Backup failing repeatedly"
+        condition: "C"
+        for: "10m"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "bm_vm_backup_consecutive_failures >= 3"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "{{ $labels.vm }} has failed {{ $values.B }} times in a row"
+          description: "This VM has not produced a successful backup for at least three consecutive attempts. Treat as an open incident rather than a one-off failure."
+        labels:
+          severity: "critical"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-backup-overdue"
+        title: "Backup overdue (past its own RPO)"
+        condition: "C"
+        for: "15m"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "(time() - bm_vm_backup_last_success_timestamp_seconds)\n  > bm_vm_backup_expected_interval_seconds"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "No recent backup: {{ $labels.vm }}"
+          description: "This VM has gone longer than its own scheduled interval without a successful backup. Catches silent stoppages that never raise a failure: scheduler down, host offline, schedule disabled."
+        labels:
+          severity: "critical"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-backup-never"
+        title: "VM has never been backed up"
+        condition: "C"
+        for: "1h"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "bm_vm_protected == 1\n  unless on(vm) bm_vm_backup_last_success_timestamp_seconds"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "Never backed up: {{ $labels.vm }}"
+          description: "This VM has an enabled schedule but has never completed a backup. It is invisible to every age-based alert, because it has no last-success series at all."
+        labels:
+          severity: "critical"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-backup-stuck"
+        title: "Backup stuck"
+        condition: "C"
+        for: "30m"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "bm_vm_backup_stuck == 1"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "Backup stuck: {{ $labels.vm }}"
+          description: "A running backup has reported no progress for over an hour. Long backups that keep reporting are healthy and do not appear here."
+        labels:
+          severity: "warning"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-offsite-incomplete"
+        title: "Offsite replication incomplete"
+        condition: "C"
+        for: "1h"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "bm_vm_offsite_last_status == 1 or bm_vm_offsite_last_status == 2"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "Offsite copy incomplete: {{ $labels.vm }}"
+          description: "Replication for this VM finished as partial (some destinations have it, some do not) or failed outright. The primary backup may be fine \u2014 the offsite copy is not."
+        labels:
+          severity: "warning"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-offsite-target-failed"
+        title: "Offsite destination not receiving backups"
+        condition: "C"
+        for: "1h"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "bm_vm_offsite_target_status == 2"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "Offsite destination failing: {{ $labels.offsite_host }}"
+          description: "Destination {{ $labels.offsite_host }} did not receive the latest backup of {{ $labels.vm }}. Several VMs firing together usually means one broken destination, not many broken VMs."
+        labels:
+          severity: "warning"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-backup-host-down"
+        title: "Backup host offline"
+        condition: "C"
+        for: "10m"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "bm_backup_host_up == 0"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "Backup host offline: {{ $labels.backup_host }}"
+          description: "Every VM behind this host stops being backed up while it is down, and no per-VM failure is raised because no run is attempted."
+        labels:
+          severity: "critical"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-storage-critical"
+        title: "Backup storage nearly full"
+        condition: "C"
+        for: "30m"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "bm_storage_pool_usage_ratio > 0.90"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "Storage {{ $labels.pool }} on {{ $labels.backup_host }} is nearly full"
+          description: "Backups stop when a pool fills. Free space or extend the pool."
+        labels:
+          severity: "critical"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false
+      - uid: "bm-metrics-stale"
+        title: "Backup metrics not being collected"
+        condition: "C"
+        for: "10m"
+        data:
+          - refId: "A"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "PROM_UID"
+            model:
+              refId: "A"
+              expr: "time() - bm_scrape_timestamp_seconds > 600"
+              instant: true
+              range: false
+              editorMode: "code"
+              intervalMs: 60000
+              maxDataPoints: 43200
+              datasource:
+                type: "prometheus"
+                uid: "PROM_UID"
+          - refId: "B"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "B"
+              type: "reduce"
+              reducer: "last"
+              expression: "A"
+              settings:
+                mode: "dropNN"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+          - refId: "C"
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: "__expr__"
+            model:
+              refId: "C"
+              type: "threshold"
+              expression: "B"
+              conditions:
+                - evaluator:
+                    type: "gt"
+                    params:
+                      - 0
+                  operator:
+                    type: "and"
+                  query:
+                    params:
+                      - "C"
+                  reducer:
+                    type: "last"
+                    params: "[]"
+                  type: "query"
+              datasource:
+                type: "__expr__"
+                uid: "__expr__"
+        noDataState: "OK"
+        execErrState: "Error"
+        annotations:
+          summary: "Backup Manager metrics are stale"
+          description: "The controller's own clock stamp has stopped advancing, so Telegraf is no longer collecting from it. IMPORTANT: because Prometheus scrapes Telegraf rather than the controller, up{} cannot detect this \u2014 up stays 1 while the controller is dead. Every other backup alert is blind until this is fixed."
+        labels:
+          severity: "critical"
+          team: "backup"
+          service: "backup-manager"
+        isPaused: false

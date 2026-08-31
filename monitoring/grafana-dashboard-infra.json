@@ -1,0 +1,1175 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "title": "Backup Manager \u2014 Hosts & hypervisors",
+  "uid": "bm-infra",
+  "version": 1,
+  "weekStart": "",
+  "tags": [
+    "backup-manager"
+  ],
+  "timezone": "browser",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "DS",
+        "label": "Data source",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "refresh": 1
+      },
+      {
+        "type": "query",
+        "name": "backup_host",
+        "label": "backup_host",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS}"
+        },
+        "definition": "label_values(bm_backup_host_info, backup_host)",
+        "query": {
+          "qryType": 1,
+          "query": "label_values(bm_backup_host_info, backup_host)",
+          "refId": "backup_host"
+        },
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0,
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Backup hosts online",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(bm_backup_hosts_online_total)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "legendFormat": "online"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(bm_backup_hosts_total)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "legendFormat": "total"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Hypervisors connected",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(bm_hypervisors_connected_total)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "legendFormat": "connected"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(bm_hypervisors_total)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "legendFormat": "total"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Offsite hosts online",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(bm_offsite_host_up) / count(bm_offsite_host_up)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Metrics collection age",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - bm_scrape_timestamp_seconds",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 180
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Backup hosts",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "bm_backup_host_up",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "expr": "time() - bm_backup_host_last_health_check_timestamp_seconds",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "expr": "bm_backup_host_jobs_running",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "D",
+          "expr": "bm_backup_host_jobs_queued",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "backup_host",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true,
+              "Time 7": true,
+              "__name__": true,
+              "url": true,
+              "instance": true,
+              "job": true,
+              "Value #A": true,
+              "host_id": true,
+              "agent_url": true
+            },
+            "renameByName": {
+              "backup_host": "Host",
+              "Value #A": "State",
+              "Value #B": "Last check",
+              "Value #C": "Running",
+              "Value #D": "Queued"
+            },
+            "indexByName": {}
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "Online",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "Offline",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last check"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 600
+                    },
+                    {
+                      "color": "red",
+                      "value": 1800
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Hypervisors",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "bm_hypervisor_up",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "expr": "time() - bm_hypervisor_last_health_check_timestamp_seconds",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "expr": "bm_hypervisor_vms_total",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "D",
+          "expr": "bm_hypervisor_vms_protected",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "E",
+          "expr": "bm_hypervisor_vms_total - bm_hypervisor_vms_protected",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "hypervisor",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true,
+              "Time 7": true,
+              "__name__": true,
+              "url": true,
+              "instance": true,
+              "job": true,
+              "Value #A": true,
+              "hypervisor_id": true,
+              "ip": true,
+              "backup_host": true
+            },
+            "renameByName": {
+              "hypervisor": "Hypervisor",
+              "Value #A": "State",
+              "Value #B": "Last test",
+              "Value #C": "VMs",
+              "Value #D": "Protected",
+              "Value #E": "Exposed"
+            },
+            "indexByName": {}
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "Up",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "Down",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background",
+                  "mode": "gradient"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last test"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Exposed"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        },
+        "sortBy": [
+          {
+            "displayName": "Exposed",
+            "desc": true
+          }
+        ]
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Storage pool usage",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 14,
+        "x": 0,
+        "y": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "bm_storage_pool_usage_ratio{backup_host=~\"$backup_host\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "legendFormat": "{{backup_host}} / {{pool}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Free space",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 14,
+        "y": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "bm_storage_pool_available_bytes{backup_host=~\"$backup_host\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": false,
+          "range": true,
+          "editorMode": "code",
+          "legendFormat": "{{backup_host}} / {{pool}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "mappings": [],
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto",
+            "gradientMode": "opacity",
+            "lineInterpolation": "linear",
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Offsite capacity",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "bm_offsite_pool_usage_ratio",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "legendFormat": "{{offsite_host}} / {{pool}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.8
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "showUnfilled": true,
+        "valueMode": "color",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Certificates & data freshness",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(bm_certificate_expiry_timestamp_seconds - time()) / 86400",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "expr": "max(time() - bm_storage_pool_updated_timestamp_seconds)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "expr": "bm_scrape_duration_seconds",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "instant": true,
+          "range": false,
+          "editorMode": "code",
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "Time 2": true,
+              "Time 3": true,
+              "Time 4": true,
+              "Time 5": true,
+              "Time 6": true,
+              "Time 7": true,
+              "__name__": true,
+              "url": true,
+              "instance": true,
+              "job": true,
+              "Value #A": true,
+              "subject": true
+            },
+            "renameByName": {
+              "label": "Certificate",
+              "Value #A": "Days left",
+              "Value #B": "Storage data age (s)",
+              "Value #C": "Scrape time (s)"
+            },
+            "indexByName": {}
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false,
+            "filterable": true
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Days left"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "d"
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "orange",
+                      "value": 14
+                    },
+                    {
+                      "color": "green",
+                      "value": 30
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false,
+          "reducer": [
+            "sum"
+          ],
+          "countRows": false,
+          "fields": ""
+        }
+      }
+    }
+  ]
+}

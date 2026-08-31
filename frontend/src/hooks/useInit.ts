@@ -3,6 +3,7 @@ import { initApi, offsiteHostsApi } from '@/services/api'
 import { toast } from 'sonner'
 import { useState, useEffect } from 'react'
 import socketService from '@/services/socket'
+import { getErrorMessage } from '@/lib/errors'
 
 export function useInitBackupHost() {
   const queryClient = useQueryClient()
@@ -17,7 +18,7 @@ export function useInitBackupHost() {
       toast.success('Host initialization started')
     },
     onError: (error: any) => {
-      const errorMessage = error.response?.data?.error || error.message || 'Failed to start host initialization'
+      const errorMessage = getErrorMessage(error, 'Failed to start host initialization')
       toast.error(errorMessage)
     },
   })
@@ -49,7 +50,7 @@ export function useInitOffsiteHost() {
       toast.success('Offsite host initialization started')
     },
     onError: (error: any) => {
-      const errorMessage = error.response?.data?.error || error.message || 'Failed to start offsite host initialization'
+      const errorMessage = getErrorMessage(error, 'Failed to start offsite host initialization')
       toast.error(errorMessage)
     },
   })

@@ -6,7 +6,8 @@ export default function HistoryPage() {
       <div>
         <h1 className="text-3xl font-bold text-gray-900">Job History</h1>
         <p className="text-gray-600 mt-2">
-          View and analyze past backup and restore jobs
+          Backup, restore and rsync jobs — every backup that triggers a sync records that transfer
+          as its own row here, so the offsite half is not a derived view of the backup.
         </p>
       </div>
 

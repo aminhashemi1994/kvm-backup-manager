@@ -1,7 +1,13 @@
 #!/bin/bash
 
 ###############################################################################
-# backup_manager.sh — Remote VM backup manager with offsite sync
+# backup_manager.sh — Remote VM backup manager
+#
+# Offsite replication is NOT part of this script. It lives in Rsync_Manager.sh
+# and runs as its own job, so a transfer that takes hours no longer holds a
+# finished backup open, and a failed transfer can be retried without redoing the
+# backup. The one thing this script still does for it is record retention
+# rotations in .offsite_ops.jsonl — see RECORD OFFSITE ROTATIONS below.
 #
 # Usage:
 #   # Daily (auto-detects full/inc):
@@ -25,10 +31,6 @@
 #   # Custom:
 #   bash backup_manager.sh --domain vm1 --ip 10.0.0.1 --schedule custom \
 #        --retention 5 --keep-archive 3
-#
-#   # With offsite sync:
-#   bash backup_manager.sh --domain vm1 --ip 10.0.0.1 --schedule daily \
-#        --retention 7 --keep-archive 2 --offsite-ip 172.50.0.100,172.50.0.200
 #
 #   # With compression:
 #   bash backup_manager.sh --domain vm1 --ip 10.0.0.1 --schedule daily \
@@ -55,49 +57,15 @@ backup_compression="true"
 archives_to_keep=""
 compress_backup=""
 verbose="false"
+# Offsite flags are still accepted so an older controller does not fail
+# outright, but they no longer do anything here — see the argument parser.
 offsite_ips=""
+# Set when the caller passed an offsite flag this script no longer acts on.
+_offsite_flags_ignored="false"
 # Disk-usage guard rail (percent). A backup is refused when the target pool
 # — or an offsite destination — is already used above this level. Configurable
 # per storage pool from the controller; defaults to 80 when not supplied.
 disk_usage_threshold="80"
-# Maps an offsite IP → its custom destination base path (empty = mirror the
-# source pool path). Populated from the "ip:path" entries in --offsite-ip
-# (colon delimiter — IPv4-safe since IPv4 addresses contain no colons).
-declare -A OFFSITE_PATH_BY_IP=()
-# Maps an offsite IP → its per-pool disk-usage threshold (percent). Empty when
-# the controller didn't supply one; the global disk_usage_threshold is used then.
-declare -A OFFSITE_THRESHOLD_BY_IP=()
-# Per-host rsync retry: attempts before giving up on that offsite host for this
-# run, and the base delay (seconds) for the exponential backoff between
-# attempts (attempt N waits offsite_retry_backoff_base * 2^(N-1) seconds).
-# Configurable per-schedule from the controller; these are the script defaults
-# when it doesn't supply either.
-offsite_retry_attempts="3"
-offsite_retry_backoff_base="15"
-# Staging directory (relative, on the offsite side) for partially transferred
-# files, enabling a retry to RESUME instead of restarting. Kept relative on
-# purpose: rsync then stages the file inside the destination directory and
-# renames it into its real place once complete, so incomplete data never
-# appears under a real filename, and rsync removes the staging dir itself once
-# the partial has served its purpose.
-#
-# NOTE: the matching --exclude is NOT redundant. rsync auto-adds an exclude for
-# a relative partial-dir, but appends it AFTER any rules we supply, and the
-# manual warns that "the auto-added rule may be ineffective at the end of your
-# other rules". We pass several excludes, so we state our own — that is what
-# stops --delete from wiping the resume data between attempts.
-OFFSITE_PARTIAL_DIR=".rsync-partial"
-# rsync I/O-inactivity timeout (seconds) — NOT a cap on total duration. A
-# transfer that keeps moving bytes runs as long as it needs; a dead connection
-# gives up after this and hands off to the retry loop, which then resumes.
-offsite_rsync_timeout="600"
-# Age (days) after which an orphaned staging file is swept. Orphans only arise
-# when a source file is never transferred again (e.g. its chain was archived).
-offsite_partial_max_age_days="7"
-# When true, skip the VM backup phase entirely and only run offsite_sync
-# against the (already-existing) backup directory. Used by the controller to
-# retry a failed/partial offsite sync without re-running virtnbdbackup.
-offsite_only="false"
 backup_path=""
 events_file=""
 log_file_path=""
@@ -110,8 +78,8 @@ destination_ip=""
 hostName=""
 vm_base_dir=""
 archived_backup_dir=""
-offsite_lock_dir=""
 lock_dir=""
+offsite_ops_journal=""
 nbd_port=""
 vm_shutdown_status=""
 _archived_this_run=""
@@ -165,21 +133,33 @@ while [[ $# -gt 0 ]]; do
 		verbose="true"
 		shift
 		;;
+	# ── Offsite flags: accepted, ignored, and reported ───────────────
+	# Replication is a separate job now (Rsync_Manager.sh). A controller that
+	# has not been upgraded yet still sends these, and silently dropping them
+	# would mean backups keep succeeding while nothing is ever replicated —
+	# the worst kind of failure, because everything looks fine. So they are
+	# recorded and surfaced: _offsite_flags_ignored raises a warning and an
+	# event the panel turns into a visible alert that the agent and the
+	# controller are out of step.
 	--offsite-ip)
 		offsite_ips="$2"
+		_offsite_flags_ignored="true"
 		shift 2
 		;;
-	--offsite-retry-attempts)
-		offsite_retry_attempts="$2"
+	--offsite-retry-attempts | --offsite-rsync-timeout | --offsite-retry-backoff-base)
+		_offsite_flags_ignored="true"
 		shift 2
 		;;
-	--offsite-retry-backoff-base)
-		offsite_retry_backoff_base="$2"
-		shift 2
+	--no-offsite-verify)
+		_offsite_flags_ignored="true"
+		shift
 		;;
 	--offsite-only)
-		offsite_only="true"
-		shift
+		# Nothing left here to run. Failing loudly beats exiting 0 having
+		# replicated nothing.
+		echo "--offsite-only is no longer handled by this script." >&2
+		echo "Offsite replication runs as its own job now: use Rsync_Manager.sh." >&2
+		exit 64
 		;;
 	--backup-path)
 		backup_path="$2"
@@ -424,16 +404,25 @@ once_backup_dir="$vm_base_dir/once"
 custom_backup_dir="$vm_base_dir/custom"
 archived_backup_dir="$vm_base_dir/archived"
 lock_dir="$backup_path/in_progress_backups"
-offsite_lock_dir="$backup_path/offsite_locks"
 
 # Progress metadata file
 progress_metadata_dir="$backup_path/.progress"
 mkdir -p "$progress_metadata_dir" 2>/dev/null
 progress_file="$progress_metadata_dir/${vm_name}_${schedule}.progress"
+# Append-only journal of directory rotations (archive / prune) that each offsite
+# target replays as cheap remote renames. Written here, read by Rsync_Manager.sh.
+offsite_ops_journal="$vm_base_dir/.offsite_ops.jsonl"
+# Present only while a retention rotation is physically moving directories
+# around. A rotation is many renames, not one, so there is a window in which the
+# VM directory is neither the old layout nor the new one — half the chain under
+# daily/, half under archived/. A sync that built its file list from that window
+# would be working from a layout that never existed. Rsync_Manager.sh waits for
+# this to clear before it starts.
+rotation_marker="$vm_base_dir/.rotation-in-progress"
 
 for d in "$daily_backup_dir" "$weekly_backup_dir" "$monthly_backup_dir" \
 	"$once_backup_dir" "$custom_backup_dir" "$archived_backup_dir" \
-	"$lock_dir" "$offsite_lock_dir"; do
+	"$lock_dir"; do
 	mkdir -p "$d" 2>/dev/null
 done
 
@@ -767,13 +756,6 @@ create_backup_lock() {
 }
 
 remove_backup_lock() {
-	# An offsite-only resync never creates the backup lock (it runs no
-	# virtnbdbackup), so it must never delete one either: the lock it would
-	# find belongs to a real backup of the same VM/schedule, and removing it
-	# would make that backup look finished while it is still running.
-	if [[ "$offsite_only" == "true" ]]; then
-		return 0
-	fi
 	if [[ -n "$lock_file" && -f "$lock_file" ]]; then
 		rm -f "$lock_file"
 	fi
@@ -1126,6 +1108,7 @@ quarantine_broken_chain() {
 		return 1
 	fi
 
+	rotation_fence_up
 	local moved=0
 	for entry in "${items[@]}"; do
 		if mv "$entry" "$qdir/" 2>/dev/null; then
@@ -1135,8 +1118,23 @@ quarantine_broken_chain() {
 		fi
 	done
 
+	# Journalled like any other rotation, and for a sharper reason than cost.
+	#
+	# A quarantine empties the schedule directory. Left unrecorded, the next
+	# sync would see an empty source and --delete-after would remove the offsite
+	# copy of that chain — destroying the remote copy of exactly the data this
+	# function went out of its way not to delete locally, at the moment a local
+	# chain has just been found broken and the offsite copy may be the better
+	# one.
+	#
+	# Recording it makes the offsite side perform the same move: the data ends
+	# up under .broken/ there too, still present, still reviewable, and costing
+	# a rename instead of a delete.
+	record_offsite_op "archive" "${sched_name}_${stamp}" ".broken"
+
 	info "Quarantined $moved item(s) to $qdir"
 	info "Nothing was deleted — remove that directory once you have reviewed it."
+	rotation_fence_down
 	return 0
 }
 
@@ -1530,6 +1528,128 @@ validate_method_state() {
 # RETENTION / ARCHIVE / PRUNE
 ###############################################################################
 
+###############################################################################
+# OFFSITE OPERATION JOURNAL
+#
+# A retention rotation is a rename (archive a chain) or a delete (prune an old
+# archive) of a whole directory. Replaying that on the offsite side as the same
+# rename costs nothing. Letting rsync discover it costs a full re-transfer of
+# the chain over the WAN, because --delete removes the old path and the new one
+# looks brand new — the single most expensive mistake this sync can make.
+#
+# The backup and the sync are separate scripts and separate jobs now, so a
+# rotation cannot be handed over in a shell variable. It is appended here, and
+# Rsync_Manager.sh replays it: every offsite target keeps its own cursor
+# recording how far it has got, so a target that was unreachable for three days
+# replays all three days of rotations, in order, the next time it syncs.
+#
+# This is the only offsite concern left in this script, and it has to be here —
+# only the backup knows a rotation happened, and only at the moment it does it.
+#
+# The journal is an OPTIMISATION, not a correctness mechanism, and it is worth
+# being clear about which is which. Losing an entry costs a re-upload: rsync
+# still converges on its own, it just moves bytes it did not need to. What must
+# never happen is a replay that moves the wrong chain, and that is prevented on
+# the offsite side, at the moment of the move, rather than by trusting this
+# bookkeeping to be intact. See apply_offsite_ops in Rsync_Manager.sh.
+###############################################################################
+
+# Append one rotation to the journal. Serialized with flock because the daily
+# and the weekly chain of the same VM can rotate at the same moment, and two
+# appends interleaving would corrupt a line.
+# fd 8 on purpose — fd 9 belongs to the NBD port allocator.
+# ── The rotation fence ────────────────────────────────────────────────────
+#
+# Raised while the VM directory is being rearranged — a chain archived, an
+# archive pruned, a broken chain quarantined. Between the first rename and the
+# journal entry that records it, the directory is in a state that is neither the
+# old layout nor the new one, and an offsite sync that built its file list from
+# that window would be working from a tree that never existed.
+#
+# Depth-counted, because the operations nest: retention archives AND prunes, and
+# each raises the fence on its own behalf so that callers which do only one of
+# them are covered too. The fence comes down when the outermost one finishes.
+#
+# Deliberately per VM rather than per schedule. The transfer covers the whole VM
+# directory in one pass, so a weekly rotation disturbs a sync just as much as a
+# daily one does — there is nothing for a per-schedule fence to protect.
+#
+# The backup never waits for the sync. It is the sync that waits, and only for
+# the seconds a handful of renames take.
+_rotation_fence_depth=0
+
+rotation_fence_up() {
+	_rotation_fence_depth=$((_rotation_fence_depth + 1))
+	[[ "$_rotation_fence_depth" -eq 1 ]] || return 0
+	[[ -n "$rotation_marker" ]] || return 0
+	: >"$rotation_marker" 2>/dev/null || true
+	return 0
+}
+
+rotation_fence_down() {
+	[[ "$_rotation_fence_depth" -gt 0 ]] && _rotation_fence_depth=$((_rotation_fence_depth - 1))
+	[[ "$_rotation_fence_depth" -eq 0 ]] || return 0
+	[[ -n "$rotation_marker" ]] || return 0
+	rm -f "$rotation_marker" 2>/dev/null || true
+	return 0
+}
+
+record_offsite_op() {
+	local op="$1"
+	local name="$2"
+	# Where the chain was moved TO. "archived" for a retention rotation,
+	# ".broken" for a quarantine. Defaults to archived so journal entries
+	# written before this field existed still replay correctly.
+	local dest="${3:-archived}"
+	[[ -z "$offsite_ops_journal" || -z "$op" || -z "$name" ]] && return 0
+
+	local jlock="${offsite_ops_journal}.lock"
+	: >>"$jlock" 2>/dev/null || true
+	exec 8>>"$jlock" 2>/dev/null || true
+	flock -x 8 2>/dev/null || true
+
+	# The entry's id is the clock, in nanoseconds.
+	#
+	# It was a counter derived from the journal's own contents, and that was
+	# wrong in a way that took a test to find: the journal is trimmed once every
+	# target has replayed past an entry, so the count restarted from whatever
+	# was left. A reused id is silently skipped by every target already past it,
+	# and the rotation it described never replays.
+	#
+	# A clock reading cannot be reused, needs no state kept anywhere, and
+	# survives the journal being trimmed, wiped, or restored from an older copy
+	# — none of which a counter does. It is still a plain increasing integer, so
+	# existing cursors keep comparing correctly: every id minted from here on is
+	# far larger than any counter value a deployment already holds.
+	local seq=""
+	seq=$(date +%s%N 2>/dev/null)
+	# Fall back to whole seconds where %N is unavailable, padded so the two
+	# forms stay the same magnitude and remain comparable.
+	[[ "$seq" =~ ^[0-9]{19}$ ]] || seq="$(date +%s)000000000"
+
+	printf '{"seq":%d,"op":"%s","name":"%s","dest":"%s","schedule":"%s","ts":"%s"}\n' \
+		"$seq" "$op" "$name" "$dest" "$schedule" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+		>>"$offsite_ops_journal" 2>/dev/null || true
+
+	local jlines=0
+	jlines=$(wc -l <"$offsite_ops_journal" 2>/dev/null || echo 0)
+	if [[ "$jlines" -gt 1000 ]]; then
+		local jtmp="${offsite_ops_journal}.tmp.$$"
+		if tail -500 "$offsite_ops_journal" >"$jtmp" 2>/dev/null; then
+			mv -f "$jtmp" "$offsite_ops_journal" 2>/dev/null || rm -f "$jtmp" 2>/dev/null
+		else
+			rm -f "$jtmp" 2>/dev/null
+		fi
+	fi
+
+	flock -u 8 2>/dev/null || true
+	exec 8>&- 2>/dev/null || true
+
+	info "Recorded offsite rotation #${seq}: ${op} ${dest}/${name}"
+	return 0
+}
+
+
 archive_current_chain() {
 	local source_dir="$1"
 	local sched="$2"
@@ -1543,12 +1663,21 @@ archive_current_chain() {
 	fi
 
 	info "Archiving backup chain → $archive_target ..."
+	# Fenced here rather than at the call site: retention is not the only thing
+	# that archives a chain — promote_chain_to_full does it too, whenever an
+	# incremental turns out to be impossible, and that can happen on any
+	# schedule at any time.
+	rotation_fence_up
 	mkdir -p "$archive_target"
 	find "$source_dir" -mindepth 1 -maxdepth 1 ! -name 'logs' -exec mv {} "$archive_target/" \;
 	info "Archived successfully."
 
 	_archived_this_run="$archive_name"
+	# Hand the rotation to the offsite side as a rename it can replay, instead
+	# of letting rsync rediscover it as a brand-new directory to re-upload.
+	record_offsite_op "archive" "$archive_name" "archived"
 	emit_event "archive" "success" "Archived chain to $archive_name" "archive_name=$archive_name"
+	rotation_fence_down
 	return 0
 }
 
@@ -1586,6 +1715,10 @@ prune_archives() {
 	if [[ "$count" -gt "$keep" ]]; then
 		local to_remove=$((count - keep))
 		info "Pruning $to_remove old archive(s) (keeping $keep) ..."
+		# Same reasoning as archive_current_chain: a prune removes whole
+		# directories a running transfer may be reading, and every caller needs
+		# the fence, not just retention.
+		rotation_fence_up
 		local i=0
 		for ((i = 0; i < to_remove; i++)); do
 			local pruned_name=""
@@ -1593,8 +1726,10 @@ prune_archives() {
 			echo -e "  ${Dim}Removing: ${matching_archives[$i]}${NC}"
 			rm -rf "${matching_archives[$i]}"
 			_pruned_archives+=("$pruned_name")
+			record_offsite_op "prune" "$pruned_name" "archived"
 			emit_event "prune" "success" "Pruned $pruned_name" "pruned=$pruned_name"
 		done
+		rotation_fence_down
 	fi
 	return 0
 }
@@ -1612,9 +1747,15 @@ handle_retention() {
 
 	if [[ "$current_count" -ge "$retention" ]]; then
 		info "Retention ($retention) reached ($current_count backups). Archiving ..."
+
+		# The fence around these two lives inside archive_current_chain and
+		# prune_archives themselves, so every caller gets it — retention is not
+		# the only thing that rearranges this directory.
+		rotation_fence_up
 		archive_current_chain "$backup_dir" "$schedule"
 		prune_archives "$schedule" "$archives_to_keep"
 		mkdir -p "$backup_dir" "$log_dir" 2>/dev/null
+		rotation_fence_down
 
 		# After archiving, always start fresh with full
 		if [[ "$method" != "full" ]]; then
@@ -1713,13 +1854,8 @@ write_progress_metadata() {
 	fi
 }
 
+
 cleanup_progress_metadata() {
-	# Same reasoning as remove_backup_lock: the progress file is shared per
-	# VM+schedule, and an offsite-only resync must not wipe the progress of a
-	# real backup that may be running alongside it.
-	if [[ "$offsite_only" == "true" ]]; then
-		return 0
-	fi
 	if [[ -n "$progress_file" && -f "$progress_file" ]]; then
 		rm -f "$progress_file" 2>/dev/null
 	fi
@@ -1836,249 +1972,6 @@ bytes_to_human() {
 # RSYNC PROGRESS BAR  (aggregate style — matches virtnbdbackup bar exactly)
 ###############################################################################
 
-# parse_rsync_progress: sets _rsync_pct _rsync_speed _rsync_xferred _rsync_eta
-# Handles both --info=progress2 single-line format and classic rsync format.
-parse_rsync_progress() {
-	local line="$1"
-
-	# Reset variables
-	_rsync_pct=""
-	_rsync_speed=""
-	_rsync_xferred=""
-	_rsync_eta=""
-
-	# Try format 1: --info=progress2  →  "    1,234,567  42%  12.34MB/s    0:00:08"
-	if [[ "$line" =~ ([0-9,]+)[[:space:]]+([0-9]+)%[[:space:]]+([0-9.]+[KMGTP]?B/s)[[:space:]]+([0-9:]+) ]]; then
-		_rsync_xferred="${BASH_REMATCH[1]}"
-		_rsync_pct="${BASH_REMATCH[2]}"
-		_rsync_speed="${BASH_REMATCH[3]}"
-		_rsync_eta="${BASH_REMATCH[4]}"
-		return 0
-	fi
-
-	# Try format 2: without commas  →  "    1234567  42%  12.34MB/s    0:00:08"
-	if [[ "$line" =~ ([0-9]+)[[:space:]]+([0-9]+)%[[:space:]]+([0-9.]+[KMGTP]?B/s)[[:space:]]+([0-9:]+) ]]; then
-		_rsync_xferred="${BASH_REMATCH[1]}"
-		_rsync_pct="${BASH_REMATCH[2]}"
-		_rsync_speed="${BASH_REMATCH[3]}"
-		_rsync_eta="${BASH_REMATCH[4]}"
-		return 0
-	fi
-
-	# Try format 3: with units  →  "    1.23M  42%  12.34MB/s    0:00:08"
-	if [[ "$line" =~ ([0-9.]+[KMGTP]?)[[:space:]]+([0-9]+)%[[:space:]]+([0-9.]+[KMGTP]?B/s)[[:space:]]+([0-9:]+) ]]; then
-		_rsync_xferred="${BASH_REMATCH[1]}"
-		_rsync_pct="${BASH_REMATCH[2]}"
-		_rsync_speed="${BASH_REMATCH[3]}"
-		_rsync_eta="${BASH_REMATCH[4]}"
-		return 0
-	fi
-
-	# Try format 4: just percentage  →  "42%"
-	if [[ "$line" =~ ([0-9]+)% ]]; then
-		_rsync_pct="${BASH_REMATCH[1]}"
-		_rsync_xferred="0"
-		_rsync_speed=""
-		_rsync_eta=""
-		return 0
-	fi
-
-	return 1
-}
-
-# draw_rsync_progress_bar: identical visual style to draw_aggregate_progress_bar
-# Args: pct  speed  xferred  eta  label
-draw_rsync_progress_bar() {
-	local pct="$1"
-	local speed="$2"
-	local xferred="$3"
-	local eta="$4"
-	local label="$5"
-	local term_width=""
-	term_width=$(get_terminal_width)
-
-	if [[ "$pct" -lt 0 ]]; then pct=0; fi
-	if [[ "$pct" -gt 100 ]]; then pct=100; fi
-
-	# Throttle identically to draw_aggregate_progress_bar: re-render only on
-	# a percentage change, or at most every 5s — keeps job logs small.
-	local _now_ts
-	_now_ts=$(date +%s)
-	if [[ "$pct" == "${_RSYNC_LAST_PCT:-}" && $((_now_ts - ${_RSYNC_LAST_TS:-0})) -lt 5 && "$pct" -lt 100 ]]; then
-		return 0
-	fi
-	_RSYNC_LAST_PCT="$pct"
-	_RSYNC_LAST_TS="$_now_ts"
-
-	# Write progress metadata
-	write_progress_metadata "$pct" "Offsite sync: $xferred @ $speed" "rsync"
-
-	# Build suffix — same layout as aggregate bar: pct  xferred/speed  [label]
-	local suffix=""
-	suffix=$(printf " %3d%%  %s @ %s  ETA: %s  [%s]" "$pct" "$xferred" "$speed" "$eta" "$label")
-	local suffix_len=${#suffix}
-	local bar_prefix="  ▐"
-	local bar_suffix="▌"
-	local reserved=$((${#bar_prefix} + ${#bar_suffix} + suffix_len + 2))
-	local bar_width=$((term_width - reserved))
-	if [[ "$bar_width" -lt 10 ]]; then bar_width=10; fi
-	if [[ "$bar_width" -gt 60 ]]; then bar_width=60; fi
-
-	local filled=$((bar_width * pct / 100))
-	local empty=$((bar_width - filled))
-	local bar_filled="" bar_empty=""
-	local j=0
-	for ((j = 0; j < filled; j++)); do bar_filled+="█"; done
-	for ((j = 0; j < empty; j++)); do bar_empty+="░"; done
-
-	# Cyan while in progress, Green when done — same as aggregate bar
-	local bar_color="$Cyan"
-	if [[ "$pct" -ge 100 ]]; then bar_color="$Green"; fi
-
-	printf "\r${bar_color}${bar_prefix}%s%s${bar_suffix}${Bold}%s${NC}" \
-		"$bar_filled" "$bar_empty" "$suffix"
-}
-
-###############################################################################
-# run_rsync_with_progress
-#
-# Drop-in rsync runner that shows the aggregate-style progress bar.
-# Usage:
-#   run_rsync_with_progress  \
-#       <detail_log>         \   absolute path for the raw rsync output log
-#       <label>              \   short label shown inside […] on the bar
-#       <emit_prefix>        \   prefix for emit_event calls (e.g. "offsite_rsync")
-#       [rsync args …]           all remaining args are passed verbatim to rsync
-#
-# Returns: exit code of rsync (0 = success, non-zero = failure).
-# Side-effects: prints progress bar to stdout; appends raw output to detail_log.
-###############################################################################
-run_rsync_with_progress() {
-	local detail_log="$1"
-	local label="$2"
-	local emit_prefix="$3"
-	shift 3
-	# $@ now contains the full rsync command arguments
-
-	info "Starting rsync: $label"
-	if [[ "$verbose" == "true" ]]; then
-		echo -e "${Dim}  Command: rsync $*${NC}"
-	fi
-
-	emit_event "${emit_prefix}_start" "in_progress" "Starting rsync: $label" "label=$label"
-
-	if [[ "$verbose" == "true" ]]; then
-		# In verbose mode stream directly — no progress bar, full output visible
-		rsync "$@"
-		local rc=$?
-		if [[ $rc -eq 0 ]]; then
-			emit_event "${emit_prefix}_complete" "success" "rsync complete: $label"
-		else
-			emit_event "${emit_prefix}_fail" "error" "rsync failed: $label" "exit_code=$rc"
-		fi
-		return $rc
-	fi
-
-	# ── Non-verbose: pipe through fifo and draw progress bar ─────────────
-
-	local fifo=""
-	fifo="$BACKUP_TMP_FIFOS/.rsync_prog_fifo_$$"
-	mkfifo "$fifo"
-
-	local exit_code_file="$BACKUP_TMP_EXIT/.rsync_prog_exit_$$"
-	rm -f "$exit_code_file"
-
-	# Run rsync with --info=progress2 injected (idempotent if caller already set it)
-	(
-		rsync --info=progress2 "$@" >"$fifo" 2>&1
-		echo $? >"$exit_code_file"
-	) &
-	local bg_pid=$!
-
-	local _rsync_pct="" _rsync_speed="" _rsync_xferred="" _rsync_eta=""
-	local last_emit_pct=-1
-	local progress_shown=false
-	local char="" line_buf=""
-
-	# ── Read fifo character-by-character (handles \r progress rewrites) ──
-	while IFS= read -r -n1 -d '' char || {
-		# Flush remaining buffer on EOF
-		if [[ -n "$line_buf" ]]; then
-			echo "$line_buf" >>"$detail_log"
-			if parse_rsync_progress "$line_buf"; then
-				draw_rsync_progress_bar \
-					"$_rsync_pct" "$_rsync_speed" "$_rsync_xferred" "$_rsync_eta" "$label"
-				progress_shown=true
-				if [[ $((_rsync_pct - last_emit_pct)) -ge 5 ]]; then
-					last_emit_pct=$_rsync_pct
-					emit_event "${emit_prefix}_progress" "in_progress" \
-						"rsync ${_rsync_pct}% — $label" \
-						"percent=$_rsync_pct" "speed=$_rsync_speed" \
-						"transferred=$_rsync_xferred" "eta=$_rsync_eta"
-				fi
-			fi
-			line_buf=""
-		fi
-		false
-	}; do
-		case "$char" in
-		$'\r' | $'\n')
-			if [[ -n "$line_buf" ]]; then
-				echo "$line_buf" >>"$detail_log"
-				if parse_rsync_progress "$line_buf"; then
-					draw_rsync_progress_bar \
-						"$_rsync_pct" "$_rsync_speed" "$_rsync_xferred" "$_rsync_eta" "$label"
-					progress_shown=true
-					if [[ $((_rsync_pct - last_emit_pct)) -ge 5 ]]; then
-						last_emit_pct=$_rsync_pct
-						emit_event "${emit_prefix}_progress" "in_progress" \
-							"rsync ${_rsync_pct}% — $label" \
-							"percent=$_rsync_pct" "speed=$_rsync_speed" \
-							"transferred=$_rsync_xferred" "eta=$_rsync_eta"
-					fi
-				fi
-			fi
-			line_buf=""
-			;;
-		*)
-			line_buf+="$char"
-			;;
-		esac
-	done <"$fifo"
-
-	wait "$bg_pid" 2>/dev/null
-	rm -f "$fifo"
-
-	# Move to next line after the progress bar
-	if [[ "$progress_shown" == "true" ]]; then
-		echo ""
-	fi
-
-	local exit_code=1
-	if [[ -f "$exit_code_file" ]]; then
-		exit_code=$(cat "$exit_code_file")
-		rm -f "$exit_code_file"
-	fi
-
-	if [[ "$exit_code" -ne 0 ]]; then
-		echo -e "${Red}${CROSS} rsync failed (exit code: $exit_code) — $label${NC}"
-		echo -e "${Red}${CROSS} Detail log: $detail_log${NC}"
-		echo -e "${Dim}--- Last 20 lines ---${NC}"
-		tail -20 "$detail_log" 2>/dev/null | while IFS= read -r l; do
-			echo -e "  ${Dim}$l${NC}"
-		done
-		echo -e "${Dim}--- End ---${NC}"
-		emit_event "${emit_prefix}_fail" "error" "rsync failed: $label" "exit_code=$exit_code"
-		return 1
-	fi
-
-	# Ensure bar shows 100% green on completion
-	draw_rsync_progress_bar 100 "" "" "" "$label"
-	echo ""
-	info "rsync complete: $label"
-	emit_event "${emit_prefix}_complete" "success" "rsync complete: $label"
-	return 0
-}
 
 ###############################################################################
 # VIRTNBDBACKUP RUNNER
@@ -2326,840 +2219,6 @@ cleanup_old_logs() {
 	return 0
 }
 
-###############################################################################
-# OFFSITE SYNC
-###############################################################################
-
-offsite_sync() {
-	if [[ -z "$offsite_ips" ]]; then
-		return 0
-	fi
-
-	echo ""
-	echo -e "${Bold}╔══════════════════════════════════════════════════════════════╗${NC}"
-	echo -e "${Bold}║              OFFSITE SYNC                                    ║${NC}"
-	echo -e "${Bold}╚══════════════════════════════════════════════════════════════╝${NC}"
-	echo ""
-
-	emit_event "offsite_start" "in_progress" "Starting offsite sync"
-
-	local OFFSITE_HOSTS=()
-	IFS=',' read -ra OFFSITE_HOSTS <<<"$offsite_ips"
-
-	local offsite_pids=()
-	local offsite_logs=()
-	local offsite_status_files=()
-	local offsite_host_list=()
-	local offsite_skipped=()
-	local offsite_progress_files=()
-
-	local entry=""
-	for entry in "${OFFSITE_HOSTS[@]}"; do
-		entry=$(echo "$entry" | xargs)
-		[[ -z "$entry" ]] && continue
-		# Entry format: "ip", "ip:/custom/base/path", or
-		# "ip:/custom/base/path:threshold" (colon delimiter — safe because IPv4
-		# addresses and absolute paths contain no colons). The optional third
-		# field is a per-pool disk-usage threshold (percent).
-		local oip="" opath="" othresh=""
-		IFS=':' read -r oip opath othresh <<<"$entry"
-		oip=$(echo "$oip" | xargs)
-		opath=$(echo "$opath" | xargs)
-		othresh=$(echo "$othresh" | xargs)
-		if [[ -n "$oip" ]]; then
-			offsite_host_list+=("$oip")
-			OFFSITE_PATH_BY_IP["$oip"]="$opath"
-			# Only keep a valid integer 1–100; otherwise leave unset so the
-			# global threshold applies.
-			if [[ "$othresh" =~ ^[0-9]+$ ]] && [[ "$othresh" -ge 1 ]] && [[ "$othresh" -le 100 ]]; then
-				OFFSITE_THRESHOLD_BY_IP["$oip"]="$othresh"
-			fi
-		fi
-	done
-
-	if [[ ${#offsite_host_list[@]} -eq 0 ]]; then
-		warn "No valid offsite IPs provided."
-		return 0
-	fi
-
-	info "Syncing to ${#offsite_host_list[@]} offsite host(s): ${offsite_host_list[*]}"
-	echo ""
-
-	# ── Pre-flight SSH check (sequential) ────────────────────────────────
-	local valid_hosts=()
-	for oip in "${offsite_host_list[@]}"; do
-		echo -e "${Dim}  Checking SSH to $oip ...${NC}"
-		if check_ssh_connection "$oip"; then
-			valid_hosts+=("$oip")
-		else
-			echo -e "${Red}${CROSS} SSH to $oip — FAILED. Skipping.${NC}"
-			# Carry the resolved destination path + reason so the controller can
-			# map this skip back to the exact offsite host/pool (Req 6.3, 6.4).
-			local _skip_path="${OFFSITE_PATH_BY_IP[$oip]:-}"
-			[[ -z "$_skip_path" ]] && _skip_path="$backup_path"
-			emit_event "offsite_fail" "error" "SSH failed to $oip" \
-				"offsite_ip=$oip" "offsite_path=$_skip_path" "reason=SSH connection failed"
-			offsite_skipped+=("$oip")
-		fi
-	done
-
-	echo ""
-
-	if [[ ${#valid_hosts[@]} -eq 0 ]]; then
-		echo -e "${Red}${CROSS} All offsite hosts failed SSH. No sync performed.${NC}"
-		emit_event "offsite_complete" "error" "All offsite hosts unreachable" \
-			"offsite_ips=${offsite_host_list[*]}"
-		return 1
-	fi
-
-	if [[ ${#offsite_skipped[@]} -gt 0 ]]; then
-		warn "Skipped ${#offsite_skipped[@]} host(s): ${offsite_skipped[*]}"
-	fi
-
-	info "Launching parallel sync to ${#valid_hosts[@]} host(s) ..."
-	echo ""
-
-	# ── Create progress tracking dir ─────────────────────────────────────
-	local progress_dir="$BACKUP_TMP_PROGRESS/offsite_progress_$$"
-	mkdir -p "$progress_dir" 2>/dev/null
-
-	for oip in "${valid_hosts[@]}"; do
-		local offsite_log="$log_dir/${log_timestamp}_offsite_${oip}.log"
-		local offsite_event_log="$log_dir/${log_timestamp}_offsite_${oip}.events.jsonl"
-		local status_file="$BACKUP_TMP_PROGRESS/.offsite_status_${vm_name}_${oip}_$$"
-		local progress_file="$progress_dir/${oip}"
-		rm -f "$status_file"
-
-		echo "0||0B||checking" >"$progress_file"
-
-		offsite_logs+=("$offsite_log")
-		offsite_status_files+=("$status_file")
-		offsite_progress_files+=("$progress_file")
-
-		(
-			offsite_sync_single_host "$oip" "$offsite_log" "$offsite_event_log" "$status_file" "$progress_file"
-		) &
-		offsite_pids+=($!)
-	done
-
-	# ── Live progress monitor ────────────────────────────────────────────
-	monitor_offsite_progress valid_hosts offsite_pids offsite_progress_files offsite_status_files
-
-	# ── Collect results ──────────────────────────────────────────────────
-	echo ""
-	local all_success=true
-	local i=0
-	for i in "${!valid_hosts[@]}"; do
-		local oip="${valid_hosts[$i]}"
-		local status_file="${offsite_status_files[$i]}"
-		local offsite_log="${offsite_logs[$i]}"
-
-		local status="FAILED"
-		if [[ -f "$status_file" ]]; then
-			status=$(cat "$status_file")
-		fi
-		rm -f "$status_file"
-
-		# The per-host worker writes either "SUCCESS" or "FAILED|<reason>" so we
-		# can surface the specific cause (SSH/disk/rsync) to the controller,
-		# not just a generic failure. Also resolve this host's destination path
-		# (custom pool path or legacy mirror) so the controller can map the
-		# outcome back to the exact offsite host/pool (Req 6.3, 6.4).
-		local ostatus="${status%%|*}"
-		local oreason="offsite sync failed"
-		if [[ "$status" == *"|"* ]]; then
-			oreason="${status#*|}"
-		fi
-		local opath="${OFFSITE_PATH_BY_IP[$oip]:-}"
-		[[ -z "$opath" ]] && opath="$backup_path"
-
-		if [[ "$ostatus" == "SUCCESS" ]]; then
-			info "Offsite sync to $oip — ${Green}COMPLETED${NC}"
-			emit_event "offsite_host_complete" "success" "Sync to $oip completed" \
-				"offsite_ip=$oip" "offsite_path=$opath"
-		else
-			echo -e "${Red}${CROSS} Offsite sync to $oip — FAILED${NC}"
-			echo -e "${Dim}  Log: $offsite_log${NC}"
-			emit_event "offsite_host_fail" "error" "Sync to $oip failed: $oreason" \
-				"offsite_ip=$oip" "offsite_path=$opath" "reason=$oreason"
-			all_success=false
-		fi
-	done
-
-	rm -rf "$progress_dir" 2>/dev/null
-
-	if [[ ${#offsite_skipped[@]} -gt 0 ]]; then
-		all_success=false
-	fi
-
-	echo ""
-	if [[ "$all_success" == "true" ]]; then
-		info "All offsite syncs completed successfully."
-		emit_event "offsite_complete" "success" "All offsite syncs completed"
-		return 0
-	else
-		warn "Some offsite syncs failed or were skipped. Check logs."
-		emit_event "offsite_complete" "warning" "Some offsite syncs failed" \
-			"skipped=${#offsite_skipped[@]}" "total=${#offsite_host_list[@]}"
-		# Non-zero so --offsite-only callers can tell the resync wasn't fully
-		# successful. Existing callers (post-backup sync) never check this
-		# return value — one calls it bare, the other with `|| true` — so this
-		# is safe to change without touching the normal backup flow.
-		return 1
-	fi
-}
-
-###############################################################################
-# OFFSITE PROGRESS MONITOR
-###############################################################################
-
-monitor_offsite_progress() {
-	local -n _hosts=$1
-	local -n _pids=$2
-	local -n _progress_files=$3
-	local -n _status_files=$4
-
-	local host_count=${#_hosts[@]}
-	local display_lines=$((host_count + 2))
-
-	# Reserve display space
-	local init_i=0
-	for ((init_i = 0; init_i < display_lines; init_i++)); do
-		echo ""
-	done
-
-	local all_done=false
-	local _mon_last_sig=""
-	local _mon_last_ts=0
-
-	while [[ "$all_done" != "true" ]]; do
-		# Throttle: build a cheap per-host (pct|status) signature and skip the
-		# whole redraw when nothing visible changed — the block is re-rendered
-		# every second otherwise, and each render lands in the job log via
-		# tmux pipe-pane (the dominant source of log bloat on long syncs).
-		# Redraw at most every 10s regardless, to refresh speed/ETA.
-		local _sig=""
-		local _si=0
-		for _si in "${!_hosts[@]}"; do
-			local _spf="${_progress_files[$_si]}"
-			local _sline=""
-			[[ -f "$_spf" ]] && _sline=$(tail -1 "$_spf" 2>/dev/null)
-			local _spct="" _sstat=""
-			IFS='|' read -r _spct _ _ _ _sstat <<<"$_sline"
-			_sig+="${_spct}|${_sstat};"
-		done
-		local _mon_now
-		_mon_now=$(date +%s)
-		if [[ "$_sig" == "$_mon_last_sig" && $((_mon_now - _mon_last_ts)) -lt 10 ]]; then
-			all_done=true
-			for _si in "${!_pids[@]}"; do
-				if kill -0 "${_pids[$_si]}" 2>/dev/null; then
-					all_done=false
-					break
-				fi
-			done
-			if [[ "$all_done" != "true" ]]; then
-				sleep 1
-				continue
-			fi
-			# All workers just finished — fall through for one final render.
-		fi
-		_mon_last_sig="$_sig"
-		_mon_last_ts=$_mon_now
-
-		# Move cursor up
-		printf "\033[%dA" "$display_lines"
-
-		local total_pct_sum=0
-		local hosts_syncing=0
-		local hosts_done=0
-		local hosts_failed=0
-
-		local i=0
-		for i in "${!_hosts[@]}"; do
-			local oip="${_hosts[$i]}"
-			local pf="${_progress_files[$i]}"
-			local term_width=""
-			term_width=$(get_terminal_width)
-
-			local pct=0 speed="" xferred="0B" eta="" pstatus="checking"
-			if [[ -f "$pf" ]]; then
-				local pline=""
-				pline=$(tail -1 "$pf" 2>/dev/null)
-				if [[ -n "$pline" ]]; then
-					IFS='|' read -r pct speed xferred eta pstatus <<<"$pline"
-				fi
-			fi
-
-			# Sanitise
-			if [[ -z "$pct" ]] || ! [[ "$pct" =~ ^[0-9]+$ ]]; then pct=0; fi
-			if [[ "$pct" -gt 100 ]]; then pct=100; fi
-			if [[ -z "$speed" ]]; then speed=""; fi
-			if [[ -z "$xferred" ]]; then xferred="0B"; fi
-			if [[ -z "$eta" ]]; then eta=""; fi
-			if [[ -z "$pstatus" ]]; then pstatus="checking"; fi
-
-			local host_color="$Cyan"
-			local host_icon="◉"
-			case "$pstatus" in
-			success)
-				host_color="$Green"
-				host_icon="✓"
-				pct=100
-				hosts_done=$((hosts_done + 1))
-				;;
-			failed)
-				host_color="$Red"
-				host_icon="✗"
-				hosts_failed=$((hosts_failed + 1))
-				;;
-			waiting)
-				host_color="$Yellow"
-				host_icon="⏳"
-				;;
-			checking | archiving)
-				host_color="$Yellow"
-				host_icon="⟳"
-				;;
-			syncing)
-				host_color="$Cyan"
-				host_icon="◉"
-				hosts_syncing=$((hosts_syncing + 1))
-				;;
-			*)
-				host_color="$Dim"
-				host_icon="·"
-				;;
-			esac
-
-			total_pct_sum=$((total_pct_sum + pct))
-
-			local bar_label=""
-			if [[ "$pstatus" == "syncing" && -n "$speed" ]]; then
-				bar_label=$(printf "%s  %s  ETA: %s" "$xferred" "$speed" "$eta")
-			elif [[ "$pstatus" == "success" ]]; then
-				bar_label="done"
-			elif [[ "$pstatus" == "failed" ]]; then
-				bar_label="FAILED"
-			else
-				bar_label="$pstatus"
-			fi
-
-			local prefix=""
-			prefix=$(printf "  %s %-18s " "$host_icon" "$oip")
-			local prefix_len=${#prefix}
-			local suffix=""
-			suffix=$(printf " %3d%%  %s" "$pct" "$bar_label")
-			local suffix_len=${#suffix}
-			local bar_reserved=$((prefix_len + suffix_len + 4))
-			local bar_width=$((term_width - bar_reserved))
-			if [[ "$bar_width" -lt 5 ]]; then bar_width=5; fi
-			if [[ "$bar_width" -gt 40 ]]; then bar_width=40; fi
-
-			local filled=$((bar_width * pct / 100))
-			local empty=$((bar_width - filled))
-			local bar_filled="" bar_empty=""
-			local j=0
-			for ((j = 0; j < filled; j++)); do bar_filled+="█"; done
-			for ((j = 0; j < empty; j++)); do bar_empty+="░"; done
-
-			printf "\r\033[K${host_color}%s▐%s%s▌${Bold}%s${NC}\n" \
-				"$prefix" "$bar_filled" "$bar_empty" "$suffix"
-		done
-
-		# Blank separator
-		printf "\r\033[K\n"
-
-		# Aggregate bar
-		local overall_pct=0
-		if [[ "$host_count" -gt 0 ]]; then
-			overall_pct=$((total_pct_sum / host_count))
-		fi
-		if [[ "$overall_pct" -gt 100 ]]; then overall_pct=100; fi
-
-		local agg_term_width=""
-		agg_term_width=$(get_terminal_width)
-		local agg_status=""
-		agg_status=$(printf "%d syncing, %d done, %d failed" "$hosts_syncing" "$hosts_done" "$hosts_failed")
-		local agg_suffix=""
-		agg_suffix=$(printf " %3d%%  [%s]" "$overall_pct" "$agg_status")
-		local agg_suffix_len=${#agg_suffix}
-		local agg_prefix="  ▐"
-		local agg_reserved=$((${#agg_prefix} + 1 + agg_suffix_len + 2))
-		local agg_bar_width=$((agg_term_width - agg_reserved))
-		if [[ "$agg_bar_width" -lt 10 ]]; then agg_bar_width=10; fi
-		if [[ "$agg_bar_width" -gt 50 ]]; then agg_bar_width=50; fi
-
-		local agg_filled=$((agg_bar_width * overall_pct / 100))
-		local agg_empty=$((agg_bar_width - agg_filled))
-		local agg_bar_filled="" agg_bar_empty=""
-		local j=0
-		for ((j = 0; j < agg_filled; j++)); do agg_bar_filled+="█"; done
-		for ((j = 0; j < agg_empty; j++)); do agg_bar_empty+="░"; done
-
-		local agg_color="$Blue"
-		if [[ "$overall_pct" -ge 100 ]]; then agg_color="$Green"; fi
-
-		printf "\r\033[K${agg_color}${agg_prefix}%s%s▌${Bold}%s${NC}\n" \
-			"$agg_bar_filled" "$agg_bar_empty" "$agg_suffix"
-
-		# Check if all done
-		all_done=true
-		for i in "${!_pids[@]}"; do
-			if kill -0 "${_pids[$i]}" 2>/dev/null; then
-				all_done=false
-				break
-			fi
-		done
-
-		if [[ "$all_done" != "true" ]]; then
-			sleep 1
-		fi
-	done
-
-	# Wait for all
-	local pid=""
-	for pid in "${_pids[@]}"; do
-		wait "$pid" 2>/dev/null
-	done
-	return 0
-}
-
-###############################################################################
-# OFFSITE SYNC SINGLE HOST
-#
-# The rsync step now uses run_rsync_with_progress() which renders the same
-# aggregate-style bar (▐█░▌) as virtnbdbackup.  All other logic is unchanged.
-###############################################################################
-
-offsite_sync_single_host() {
-	local oip="$1"
-	local offsite_log="$2"
-	local offsite_event_log="$3"
-	local status_file="$4"
-	local progress_file="$5"
-
-	local offsite_lock="$offsite_lock_dir/${vm_name}_${schedule}_offsite_${oip}"
-	local remote_user="root"
-	# Per-host destination base: use the offsite host's custom path if one was
-	# configured, otherwise mirror the source pool path (legacy behavior).
-	local remote_base="${OFFSITE_PATH_BY_IP[$oip]:-}"
-	[[ -z "$remote_base" ]] && remote_base="$backup_path"
-	local remote_vm_dir="$remote_base/$vm_name"
-
-	# Per-pool disk-usage guard for this offsite destination. Falls back to the
-	# global threshold when the controller didn't send a per-pool value. The
-	# warning level is always a fixed 60% (stop check runs first).
-	local remote_threshold="${OFFSITE_THRESHOLD_BY_IP[$oip]:-$disk_usage_threshold}"
-	local remote_warn=60
-
-	# ── Progress-file writer (for the per-host monitor bars) ─────────────
-	write_progress() {
-		local pct="${1:-0}"
-		local speed="${2:-}"
-		local xferred="${3:-0B}"
-		local eta="${4:-}"
-		local status="${5:-checking}"
-
-		# Write pipe-delimited format for terminal monitor
-		echo "${pct}|${speed}|${xferred}|${eta}|${status}" >"$progress_file" 2>/dev/null
-
-		# Also write JSON format to main progress file (for frontend) if it exists
-		if [[ -n "${progress_metadata_dir:-}" ]]; then
-			local text=""
-			if [[ "$status" == "syncing" && -n "$speed" && -n "$xferred" ]]; then
-				text="Offsite sync ($oip): $xferred @ $speed"
-			elif [[ "$status" == "success" ]]; then
-				text="Offsite sync ($oip): Complete"
-			elif [[ "$status" == "failed" ]]; then
-				text="Offsite sync ($oip): Failed"
-			else
-				text="Offsite sync ($oip): $status"
-			fi
-
-			local json_output=""
-			json_output=$(printf '{"percentage":%d,"text":"%s","type":"rsync","timestamp":"%s"}\n' \
-				"$pct" "$text" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")")
-
-			local main_progress_file="$progress_metadata_dir/${vm_name}_${schedule}.progress"
-			echo "$json_output" >"$main_progress_file" 2>/dev/null
-		fi
-	}
-
-	# ── Event emitter scoped to this offsite host ─────────────────────────
-	offsite_emit() {
-		local etype="$1"
-		local estatus="$2"
-		local emsg="$3"
-		shift 3
-		local extras=""
-		local kv=""
-		for kv in "$@"; do
-			local key="${kv%%=*}"
-			local val="${kv#*=}"
-			extras+=", \"${key}\": \"${val}\""
-		done
-		local ts=""
-		ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-		printf '{"timestamp":"%s","event":"%s","status":"%s","domain":"%s","offsite_ip":"%s","message":"%s"%s}\n' \
-			"$ts" "$etype" "$estatus" "$vm_name" "$oip" "$emsg" "$extras" >>"$offsite_event_log" 2>/dev/null
-	}
-
-	# ── rsync progress bridge ─────────────────────────────────────────────
-	# run_rsync_with_progress writes parsed progress to stdout (the bar) AND
-	# calls emit_event.  We additionally need to forward pct/speed/eta into
-	# the progress_file so monitor_offsite_progress can update per-host bars.
-	# We do this by wrapping the fifo read in a co-process that tees progress
-	# data into the progress_file while the bar is drawn on stdout.
-	#
-	# Because offsite_sync_single_host runs entirely inside a subshell (the
-	# background ( … ) & block in offsite_sync), stdout here goes to the log
-	# file, NOT the terminal.  The per-host monitor reads progress_file for
-	# display; run_rsync_with_progress's bar output goes into the log.
-	# That is the correct separation: log gets the bar escape sequences,
-	# terminal gets the clean monitor view.
-
-	run_rsync_for_offsite() {
-		# Wrapper that also keeps progress_file updated for the monitor.
-		local detail_log="$1"
-		local label="$2"
-		shift 2
-		# remaining args → rsync arguments
-
-		local fifo_prog=""
-		fifo_prog="$BACKUP_TMP_FIFOS/.rsync_offsite_prog_${oip}_$$"
-		mkfifo "$fifo_prog"
-
-		local exit_code_file="$BACKUP_TMP_EXIT/.rsync_offsite_exit_${oip}_$$"
-		rm -f "$exit_code_file"
-
-		# rsync → fifo
-		(
-			rsync --info=progress2 "$@" >"$fifo_prog" 2>&1
-			echo $? >"$exit_code_file"
-		) &
-		local bg_pid=$!
-
-		local _rp_pct="" _rp_speed="" _rp_xferred="" _rp_eta=""
-		local char="" line_buf=""
-		local last_emit_pct=-1
-
-		while IFS= read -r -n1 -d '' char || {
-			if [[ -n "$line_buf" ]]; then
-				echo "$line_buf" >>"$detail_log"
-				if parse_rsync_progress "$line_buf"; then
-					_rp_pct="$_rsync_pct"
-					_rp_speed="$_rsync_speed"
-					_rp_xferred="$_rsync_xferred"
-					_rp_eta="$_rsync_eta"
-					# Debug: log parsed progress
-					echo "[$(date '+%H:%M:%S')] Parsed progress: ${_rp_pct}% | ${_rp_speed} | ${_rp_xferred} | ${_rp_eta}" >>"$detail_log"
-					# Write progress for terminal monitor
-					write_progress "$_rp_pct" "$_rp_speed" "$_rp_xferred" "$_rp_eta" "syncing"
-					if [[ $((_rp_pct - last_emit_pct)) -ge 5 ]]; then
-						last_emit_pct=$_rp_pct
-						offsite_emit "offsite_rsync_progress" "in_progress" \
-							"rsync ${_rp_pct}%" \
-							"percent=$_rp_pct" "speed=$_rp_speed" \
-							"transferred=$_rp_xferred" "eta=$_rp_eta"
-					fi
-				fi
-				line_buf=""
-			fi
-			false
-		}; do
-			case "$char" in
-			$'\r' | $'\n')
-				if [[ -n "$line_buf" ]]; then
-					echo "$line_buf" >>"$detail_log"
-					if parse_rsync_progress "$line_buf"; then
-						_rp_pct="$_rsync_pct"
-						_rp_speed="$_rsync_speed"
-						_rp_xferred="$_rsync_xferred"
-						_rp_eta="$_rsync_eta"
-						# Debug: log parsed progress
-						echo "[$(date '+%H:%M:%S')] Parsed progress: ${_rp_pct}% | ${_rp_speed} | ${_rp_xferred} | ${_rp_eta}" >>"$detail_log"
-						# Write progress for terminal monitor
-						write_progress "$_rp_pct" "$_rp_speed" "$_rp_xferred" "$_rp_eta" "syncing"
-						if [[ $((_rp_pct - last_emit_pct)) -ge 5 ]]; then
-							last_emit_pct=$_rp_pct
-							offsite_emit "offsite_rsync_progress" "in_progress" \
-								"rsync ${_rp_pct}%" \
-								"percent=$_rp_pct" "speed=$_rp_speed" \
-								"transferred=$_rp_xferred" "eta=$_rp_eta"
-						fi
-					fi
-				fi
-				line_buf=""
-				;;
-			*)
-				line_buf+="$char"
-				;;
-			esac
-		done <"$fifo_prog"
-
-		wait "$bg_pid" 2>/dev/null
-		rm -f "$fifo_prog"
-
-		local rc=1
-		if [[ -f "$exit_code_file" ]]; then
-			rc=$(cat "$exit_code_file")
-			rm -f "$exit_code_file"
-		fi
-		return $rc
-	}
-
-	# ════════════════════════════════════════════════════════════════════════
-	# Main body — all output goes to offsite_log
-	# ════════════════════════════════════════════════════════════════════════
-	{
-		echo "═══════════════════════════════════════════════════════════"
-		echo "  OFFSITE SYNC: $vm_name → $oip"
-		echo "  Started: $(date '+%Y-%m-%d %H:%M:%S')"
-		echo "═══════════════════════════════════════════════════════════"
-		echo ""
-
-		write_progress 0 "" "0B" "" "checking"
-		offsite_emit "offsite_host_start" "in_progress" "Starting sync to $oip"
-
-		# ── Step 1: Previous rsync check ─────────────────────────────────
-		if [[ -f "$offsite_lock" ]]; then
-			local lock_pid=""
-			lock_pid=$(cat "$offsite_lock" 2>/dev/null)
-			if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
-				echo "⚠ Previous rsync running (PID: $lock_pid). Waiting ..."
-				write_progress 0 "" "0B" "" "waiting"
-				offsite_emit "offsite_wait" "in_progress" "Waiting for previous rsync"
-
-				local wait_start=0
-				local max_wait=7200
-				wait_start=$(date +%s)
-				while kill -0 "$lock_pid" 2>/dev/null; do
-					local elapsed=$(($(date +%s) - wait_start))
-					if [[ "$elapsed" -ge "$max_wait" ]]; then
-						echo "✗ Timeout. Killing PID $lock_pid."
-						kill -9 "$lock_pid" 2>/dev/null
-						sleep 2
-						break
-					fi
-					sleep 10
-				done
-				echo "✓ Previous rsync finished."
-			fi
-			rm -f "$offsite_lock"
-		fi
-
-		echo $BASHPID >"$offsite_lock"
-
-		# Set trap to clean up lock file on exit or interruption
-		trap "rm -f '$offsite_lock' 2>/dev/null" EXIT INT TERM
-
-		# ── Step 2: SSH liveness ─────────────────────────────────────────
-		write_progress 0 "" "0B" "" "checking"
-		echo "Verifying SSH to $oip ..."
-		if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "${remote_user}@${oip}" exit &>/dev/null; then
-			echo "✗ SSH failed."
-			write_progress 0 "" "0B" "" "failed"
-			offsite_emit "offsite_fail" "error" "SSH failed"
-			rm -f "$offsite_lock"
-			echo "FAILED|SSH connection failed" >"$status_file"
-			return 1
-		fi
-		echo "✓ SSH OK"
-
-		# ── Step 3: rsync check/install ──────────────────────────────────
-		echo "Checking rsync on $oip ..."
-		if ! ssh "${remote_user}@${oip}" "command -v rsync" &>/dev/null; then
-			echo "⚠ Installing rsync ..."
-			offsite_emit "offsite_install" "in_progress" "Installing rsync"
-			if ! ssh "${remote_user}@${oip}" "apt-get update -qq && apt-get install -y -qq rsync" &>/dev/null; then
-				echo "✗ Failed to install rsync."
-				write_progress 0 "" "0B" "" "failed"
-				offsite_emit "offsite_fail" "error" "rsync install failed"
-				rm -f "$offsite_lock"
-				echo "FAILED|rsync install failed on offsite host" >"$status_file"
-				return 1
-			fi
-			echo "✓ rsync installed"
-		else
-			echo "✓ rsync present"
-		fi
-
-		# ── Step 4: Remote disk space ────────────────────────────────────
-		echo "Checking disk space on $oip ..."
-		local remote_usage=""
-		remote_usage=$(ssh "${remote_user}@${oip}" \
-			"mkdir -p '$remote_base'; df '$remote_base' | awk 'NR>1 {print \$5}' | sed 's/%//g'" 2>/dev/null)
-
-		if [[ -n "$remote_usage" ]] && [[ "$remote_usage" -gt "$remote_threshold" ]]; then
-			echo "✗ Remote disk ${remote_usage}% (>${remote_threshold}%)."
-			write_progress 0 "" "0B" "" "failed"
-			offsite_emit "offsite_fail" "error" "Remote disk >${remote_threshold}%"
-			rm -f "$offsite_lock"
-			echo "FAILED|Remote disk ${remote_usage}% (>${remote_threshold}%)" >"$status_file"
-			return 1
-		elif [[ -n "$remote_usage" ]] && [[ "$remote_usage" -gt "$remote_warn" ]]; then
-			echo "⚠ Remote disk ${remote_usage}%"
-		fi
-		echo "✓ Disk OK (${remote_usage:-?}%)"
-
-		# ── Step 5: Replicate archive/prune ──────────────────────────────
-		ssh "${remote_user}@${oip}" \
-			"mkdir -p '$remote_vm_dir/archived' '$remote_vm_dir/daily' \
-             '$remote_vm_dir/weekly' '$remote_vm_dir/monthly' \
-             '$remote_vm_dir/once' '$remote_vm_dir/custom'" 2>/dev/null
-
-		if [[ -n "$_archived_this_run" ]]; then
-			write_progress 0 "" "0B" "" "archiving"
-			echo "Replicating archive on $oip ..."
-			local remote_schedule_dir="$remote_vm_dir/$schedule"
-			local remote_archive_target="$remote_vm_dir/archived/$_archived_this_run"
-
-			local remote_has_data=""
-			remote_has_data=$(ssh "${remote_user}@${oip}" \
-				"if [ -d '$remote_schedule_dir' ] && \
-                 [ \"\$(ls -A '$remote_schedule_dir' 2>/dev/null)\" ]; \
-                 then echo 'yes'; else echo 'no'; fi" 2>/dev/null)
-
-			if [[ "$remote_has_data" == "yes" ]]; then
-				ssh "${remote_user}@${oip}" \
-					"mkdir -p '$remote_archive_target'; \
-                     find '$remote_schedule_dir' -mindepth 1 -maxdepth 1 ! -name 'logs' \
-                     -exec mv {} '$remote_archive_target/' \; 2>/dev/null" 2>/dev/null
-				echo "✓ Archive replicated"
-				offsite_emit "offsite_archive" "success" "Replicated archive" \
-					"archive=$_archived_this_run"
-			else
-				echo "  No data to archive on $oip."
-			fi
-		fi
-
-		if [[ ${#_pruned_archives[@]} -gt 0 ]]; then
-			echo "Replicating pruning on $oip ..."
-			local pruned=""
-			for pruned in "${_pruned_archives[@]}"; do
-				ssh "${remote_user}@${oip}" \
-					"rm -rf '$remote_vm_dir/archived/$pruned'" 2>/dev/null
-				offsite_emit "offsite_prune" "success" "Pruned $pruned" "pruned=$pruned"
-			done
-			echo "✓ Pruning replicated"
-		fi
-
-		# ── Step 6: rsync with aggregate-style progress bar ──────────────
-		# Retried in-place (attempt N waits offsite_retry_backoff_base * 2^(N-1)
-		# seconds before the next try) so a brief network blip doesn't fail the
-		# whole offsite sync for this host — only after every attempt fails is
-		# the host marked FAILED. This is cheap: it just re-runs rsync, not the
-		# VM backup.
-		local rsync_max_attempts="${offsite_retry_attempts:-3}"
-		[[ "$rsync_max_attempts" =~ ^[0-9]+$ ]] || rsync_max_attempts=3
-		[[ "$rsync_max_attempts" -lt 1 ]] && rsync_max_attempts=1
-		local rsync_backoff_base="${offsite_retry_backoff_base:-15}"
-		[[ "$rsync_backoff_base" =~ ^[0-9]+$ ]] || rsync_backoff_base=15
-
-		local rsync_attempt=1
-		local rsync_ok="false"
-		local rsync_duration=0
-
-		while [[ "$rsync_attempt" -le "$rsync_max_attempts" ]]; do
-			echo ""
-			if [[ "$rsync_attempt" -gt 1 ]]; then
-				echo "Retrying rsync to $oip (attempt $rsync_attempt/$rsync_max_attempts) ..."
-				write_progress 0 "" "0B" "" "syncing"
-				offsite_emit "offsite_rsync_retry" "in_progress" \
-					"Retrying rsync (attempt $rsync_attempt/$rsync_max_attempts)" \
-					"attempt=$rsync_attempt" "max_attempts=$rsync_max_attempts"
-			else
-				echo "Starting rsync to $oip ..."
-				write_progress 0 "" "0B" "" "syncing"
-				offsite_emit "offsite_rsync_start" "in_progress" "Starting rsync"
-			fi
-
-			local rsync_detail_log="$log_dir/${log_timestamp}_offsite_${oip}_rsync_detail.log"
-			local rsync_start_time=0
-			rsync_start_time=$(date +%s)
-
-			local rsync_label="${vm_name} → ${oip}"
-
-			if run_rsync_for_offsite \
-				"$rsync_detail_log" \
-				"$rsync_label" \
-				-az --delete --sparse \
-				--no-inc-recursive \
-				--partial-dir="$OFFSITE_PARTIAL_DIR" \
-				--exclude="$OFFSITE_PARTIAL_DIR/" \
-				--timeout="$offsite_rsync_timeout" \
-				--exclude='logs/' \
-				--exclude='in_progress_backups/' \
-				--exclude='offsite_locks/' \
-				--exclude='*.partial' \
-				"$vm_base_dir/" \
-				"${remote_user}@${oip}:${remote_vm_dir}/"; then
-
-				local rsync_end_time=0
-				rsync_end_time=$(date +%s)
-				rsync_duration=$((rsync_end_time - rsync_start_time))
-				rsync_ok="true"
-				break
-			fi
-
-			local rsync_end_time=0
-			rsync_end_time=$(date +%s)
-			rsync_duration=$((rsync_end_time - rsync_start_time))
-
-			echo "✗ rsync FAILED after $(format_duration $rsync_duration) (attempt $rsync_attempt/$rsync_max_attempts)"
-			offsite_emit "offsite_rsync_attempt_fail" "error" \
-				"rsync failed (attempt $rsync_attempt/$rsync_max_attempts)" \
-				"duration_seconds=$rsync_duration" "attempt=$rsync_attempt"
-
-			if [[ "$rsync_attempt" -lt "$rsync_max_attempts" ]]; then
-				local rsync_backoff=$((rsync_backoff_base * (1 << (rsync_attempt - 1))))
-				echo "  Waiting ${rsync_backoff}s before retrying ..."
-				write_progress 0 "" "0B" "" "checking"
-				sleep "$rsync_backoff"
-			fi
-
-			rsync_attempt=$((rsync_attempt + 1))
-		done
-
-		if [[ "$rsync_ok" == "true" ]]; then
-			echo "✓ rsync completed in $(format_duration $rsync_duration)"
-
-			# Sweep orphaned resume data. rsync removes a staging file as soon
-			# as it has served its purpose, so anything still here is debris
-			# from a transfer whose source no longer exists (an archived
-			# chain, say) and would otherwise sit on the offsite host forever.
-			# Scoped to THIS VM's remote directory so a concurrent sync of
-			# another VM can never have its in-flight resume data deleted.
-			ssh "${remote_user}@${oip}" \
-				"find '$remote_vm_dir' -type d -name '$OFFSITE_PARTIAL_DIR' \
-                 -exec find {} -type f -mtime +$offsite_partial_max_age_days -delete \; 2>/dev/null" \
-				2>/dev/null || true
-
-			# Ensure progress is set to 100% on success
-			write_progress 100 "0B/s" "0B" "0:00:00" "success"
-			sleep 1 # Give monitor time to read the final progress
-			offsite_emit "offsite_rsync_complete" "success" "rsync completed" \
-				"duration_seconds=$rsync_duration"
-			rm -f "$offsite_lock"
-			echo "SUCCESS" >"$status_file"
-
-			echo ""
-			echo "═══════════════════════════════════════════════════════════"
-			echo "  OFFSITE COMPLETE: $vm_name → $oip ($(format_duration $rsync_duration))"
-			echo "═══════════════════════════════════════════════════════════"
-		else
-			write_progress 0 "0B/s" "0B" "0:00:00" "failed"
-			offsite_emit "offsite_rsync_fail" "error" \
-				"rsync failed after $rsync_max_attempts attempt(s)" \
-				"duration_seconds=$rsync_duration" "attempts=$rsync_max_attempts"
-			rm -f "$offsite_lock"
-			echo "FAILED|rsync transfer failed after $rsync_max_attempts attempt(s)" >"$status_file"
-			return 1
-		fi
-
-	} >>"$offsite_log" 2>&1
-}
 
 ###############################################################################
 # CLEANUP AND SIGNAL HANDLING
@@ -3187,7 +2246,15 @@ cleanup_on_exit() {
 	# a libvirt EOF error) — otherwise an interrupted cleanup leaves a stale
 	# lock that keeps this backup showing "in progress" even though it isn't.
 	remove_backup_lock
-	
+
+	# A rotation that was interrupted leaves its fence behind, and a stale fence
+	# would hold every offsite sync for this VM at the door. Rsync_Manager.sh
+	# also ages it out, but clearing it here is what makes the normal
+	# interrupted-backup case instant instead of delayed.
+	if [[ -n "$rotation_marker" && -f "$rotation_marker" ]]; then
+		rm -f "$rotation_marker" 2>/dev/null || true
+	fi
+
 	# Clean up scheduler validation flag file
 	rm -f "/tmp/.backup_manager_scheduler_validated_$$" 2>/dev/null || true
 
@@ -3224,10 +2291,8 @@ cleanup_on_exit() {
 		rm -f "$nbd_port_claim_file" 2>/dev/null || true
 	fi
 
-	# Clean up temporary files from organized directories. These are named per
-	# VM+schedule, so an offsite-only resync (which never wrote them) must
-	# leave them alone — they may belong to a real backup running alongside it.
-	if [[ -n "$vm_name" && -n "$schedule" && "$offsite_only" != "true" ]]; then
+	# Clean up temporary files from organized directories.
+	if [[ -n "$vm_name" && -n "$schedule" ]]; then
 		rm -f "$BACKUP_TMP_LOGS/backup_${vm_name}_${schedule}_"*.log 2>/dev/null || true
 		rm -f "$BACKUP_TMP_EXIT/backup_exit_${vm_name}_${schedule}.code" 2>/dev/null || true
 	fi
@@ -3237,11 +2302,8 @@ cleanup_on_exit() {
 		echo "Backup did not complete successfully (exit code: $exit_code)"
 		cleanup_progress_metadata
 
-		# Write final error state to progress. Skipped for an offsite-only
-		# resync: the progress file is shared per VM+schedule, and stamping
-		# "Backup interrupted or failed" on it would misreport a backup this
-		# run never touched.
-		if [[ -n "$backup_path" && "$offsite_only" != "true" ]]; then
+		# Write final error state to progress.
+		if [[ -n "$backup_path" ]]; then
 			local progress_file="$backup_path/.progress/${vm_name}_${schedule}.progress"
 			if [[ -f "$progress_file" ]]; then
 				local ts
@@ -3335,40 +2397,28 @@ main() {
 	printf "${Bold}║${NC}  %-14s %s\n" "Backup Dir:" "$backup_dir"
 	printf "${Bold}║${NC}  %-14s %s\n" "Log:" "$log_file_path"
 	printf "${Bold}║${NC}  %-14s %s\n" "Events:" "$events_file"
-	if [[ -n "$offsite_ips" ]]; then printf "${Bold}║${NC}  %-14s %s\n" "Offsite:" "$offsite_ips"; fi
 	echo -e "${Bold}╚══════════════════════════════════════════════════════════════╝${NC}"
 	echo ""
 
 	emit_event "job_start" "in_progress" "Backup job started"
 	info "Backup started at $(date '+%Y-%m-%d %H:%M:%S')"
 
-	# ── Offsite-only mode ─────────────────────────────────────────────────
-	# Used by the controller to retry a failed/partial offsite sync without
-	# re-running virtnbdbackup: skips the VM backup entirely (no hypervisor
-	# SSH, no checkpoint/retention handling) and just replicates the existing
-	# backup directory to the offsite host(s) named in --offsite-ip.
-	if [[ "$offsite_only" == "true" ]]; then
-		info "Offsite-only mode: skipping VM backup, syncing existing data for $vm_name"
-		emit_event "offsite_only_start" "in_progress" "Offsite-only resync (no VM backup)"
-
-		if [[ -z "$offsite_ips" ]]; then
-			die "--offsite-only requires --offsite-ip."
-		fi
-
-		local offsite_only_rc=0
-		offsite_sync || offsite_only_rc=1
-
-		local end_time=0
-		end_time=$(date +%s)
-		local duration=$((end_time - start_time))
-		if [[ "$offsite_only_rc" -eq 0 ]]; then
-			echo -e "${Green}${CHECK} Offsite-only resync completed after $(format_duration $duration)${NC}"
-			emit_event "job_complete" "success" "Offsite-only resync completed" "duration_seconds=$duration"
-		else
-			echo -e "${Red}${CROSS} Offsite-only resync FAILED after $(format_duration $duration)${NC}"
-			emit_event "job_fail" "error" "Offsite-only resync failed" "duration_seconds=$duration"
-		fi
-		exit "$offsite_only_rc"
+	# ── Offsite flags from a controller that has not been upgraded ────────
+	# The backup itself is unaffected and will run normally. What will NOT
+	# happen is any replication, and that has to be impossible to miss: a
+	# controller still asking this script to sync is a controller that is not
+	# scheduling the separate sync jobs either, so every VM it manages would
+	# quietly stop being replicated while every backup kept reporting success.
+	if [[ "$_offsite_flags_ignored" == "true" ]]; then
+		echo ""
+		warn "This agent no longer performs offsite replication from the backup script."
+		warn "The controller asked for it (--offsite-ip ${offsite_ips:-<unset>}), which means it"
+		warn "has not been upgraded and is not scheduling offsite sync jobs either."
+		warn "NOTHING WILL BE REPLICATED until the controller is updated."
+		echo ""
+		emit_event "offsite_flags_ignored" "error" \
+			"Controller requested offsite sync from the backup script; upgrade the controller" \
+			"offsite_ips=${offsite_ips}" "action=upgrade_controller"
 	fi
 
 	# ── Pre-flight checks ────────────────────────────────────────────────
@@ -3512,14 +2562,6 @@ main() {
 		echo -e "${Red}${CROSS} Log: $log_file_path${NC}"
 		emit_event "job_fail" "error" "Failed after $(format_duration $duration)" "duration_seconds=$duration"
 
-		# Even though this run failed, still replicate the VM's existing
-		# backup data (previous fulls/incrementals, archives) to the offsite
-		# hosts so they don't go stale. Partial files from the failed run are
-		# excluded by the rsync filter. Running this here — inside the tmux
-		# session, before exit — keeps the sync monitored, so the panel can
-		# show its progress and outcome even though the backup itself failed.
-		offsite_sync || true
-
 		exit 1
 	fi
 
@@ -3542,13 +2584,6 @@ main() {
 	fi
 
 	remove_backup_lock
-
-	# ── Offsite sync ─────────────────────────────────────────────────
-	# offsite_sync returns non-zero when a host failed or was skipped, but an
-	# offsite problem never fails the backup job itself — the primary backup
-	# already succeeded. The controller picks up the per-host outcomes from the
-	# events file and schedules an offsite-only retry if needed.
-	offsite_sync || true
 
 	# ── Summary ──────────────────────────────────────────────────────
 	local end_time=$(date +%s)

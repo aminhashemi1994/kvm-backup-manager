@@ -13,6 +13,8 @@ export interface BackupHost {
   vmCount: number
   createdAt: string
   updatedAt: string
+  /** Set only in the initial list response: a live reachability sweep is running in the background for this host. */
+  checking?: boolean
 }
 
 // Hypervisor = KVM server with VMs (Agent connects via SSH)
@@ -28,6 +30,8 @@ export interface Hypervisor {
   lastError?: string
   createdAt: string
   updatedAt: string
+  /** Set only in the initial list response: a live connectivity check is running in the background for this hypervisor. */
+  checking?: boolean
 }
 
 // Virtual Machine on a hypervisor
@@ -75,6 +79,8 @@ export interface OffsiteHost {
   status: 'connected' | 'disconnected' | 'pending'
   createdAt: string
   updatedAt: string
+  /** Set only in the initial list response: a live reachability check is running in the background for this offsite host. */
+  checking?: boolean
 }
 
 // A schedule/job's chosen offsite destination: one pool per offsite host
@@ -92,22 +98,6 @@ export interface OffsiteWarning {
 }
 
 // Backup Schedule
-/**
- * Per-event notification toggles. A key that is absent (or undefined) means
- * "inherit the global setting" — that is how every pre-existing schedule
- * behaves, so opting in is always explicit.
- */
-export interface NotificationEventToggles {
-  backupSuccess?: boolean
-  backupFailure?: boolean
-  offsiteSuccess?: boolean
-  offsitePartial?: boolean
-  offsiteFailure?: boolean
-  retry?: boolean
-  missed?: boolean
-  certificateExpiry?: boolean
-}
-
 /**
  * Every notification the platform can send, as shown in
  * Settings → Notifications. Keys must match TYPE_DEFAULTS in
@@ -129,17 +119,18 @@ export const NOTIFICATION_TYPE_GROUPS = [
   'Summaries',
 ] as const
 
+// Backup failed, offsite sync failed, and backup skipped have no toggle here
+// any more — they always send via the daily incident board (one running
+// message a day, edited in place). Who gets @-mentioned for those is
+// configured per backup host in the "Notify by backup host" section, not
+// here. See services/dailyIncidentBoardService.js on the backend.
 export const NOTIFICATION_TYPES: NotificationTypeMeta[] = [
-  { key: 'backupFailed', group: 'Backups', label: 'Backup failed', hint: 'A backup did not complete' },
   { key: 'backupCompleted', group: 'Backups', label: 'Backup succeeded', hint: 'Every successful backup — high volume' },
   { key: 'scheduledBackupFailed', group: 'Backups', label: 'Scheduled run could not start', hint: 'The scheduler could not launch the run at all' },
-  { key: 'backupSkipped', group: 'Backups', label: 'Backup skipped', hint: 'Run skipped because the VM or host was unavailable' },
   { key: 'backupRetry', group: 'Backups', label: 'Retry started', hint: 'A failed run is being retried' },
   { key: 'multipleBackupFailures', group: 'Backups', label: 'Repeated failures', hint: 'The same VM has failed several times in a row' },
   { key: 'backupStuck', group: 'Backups', label: 'Backup stuck', hint: 'No progress reported for an hour' },
   { key: 'backupVerificationFailed', group: 'Backups', label: 'Verification failed', hint: 'The backup was written but failed its check' },
-
-  { key: 'offsiteSyncFailed', group: 'Offsite', label: 'Offsite sync failed', hint: 'Replication to an offsite destination failed' },
 
   { key: 'restoreStarted', group: 'Restore', label: 'Restore started' },
   { key: 'restoreCompleted', group: 'Restore', label: 'Restore completed' },
@@ -156,27 +147,12 @@ export const NOTIFICATION_TYPES: NotificationTypeMeta[] = [
   { key: 'criticalError', group: 'Infrastructure', label: 'Critical component error' },
   { key: 'missedRunsRecovered', group: 'Infrastructure', label: 'Missed runs recovered', hint: 'After controller downtime' },
 
-  { key: 'certificateExpiring', group: 'TLS certificates', label: 'Certificate expiring soon', hint: '30/14/7/3/1 days before expiry' },
+  { key: 'certificateExpiring', group: 'TLS certificates', label: 'Certificate expiring soon', hint: 'One reminder a week from 15 days out, then daily inside the last 3 days' },
   { key: 'certificateExpired', group: 'TLS certificates', label: 'Certificate expired', hint: 'Repeats daily until renewed' },
   { key: 'agentTlsDegraded', group: 'TLS certificates', label: 'Agent link degraded' },
 
   { key: 'groupedSummary', group: 'Summaries', label: 'Grouped failure summary', hint: 'One message per root cause instead of one per VM' },
   { key: 'dailyDigest', group: 'Summaries', label: 'Daily digest', hint: 'Once a day: everything still open, or an all-clear. Turning this off while repeat-suppression is on makes long-running failures silent.' },
-]
-
-export const NOTIFICATION_EVENTS: Array<{ key: keyof NotificationEventToggles; label: string; hint: string }> = [
-  { key: 'backupSuccess', label: 'Backup succeeded', hint: 'Every successful backup' },
-  { key: 'backupFailure', label: 'Backup failed', hint: 'The backup itself did not complete' },
-  { key: 'offsiteSuccess', label: 'Offsite sync succeeded', hint: 'Replication finished on every target' },
-  { key: 'offsitePartial', label: 'Offsite sync partial', hint: 'Some targets synced, others did not' },
-  { key: 'offsiteFailure', label: 'Offsite sync failed', hint: 'No target received the backup' },
-  { key: 'retry', label: 'Retry started', hint: 'A failed run is being retried' },
-  { key: 'missed', label: 'Missed run recovered', hint: 'A skipped schedule was replayed' },
-  {
-    key: 'certificateExpiry',
-    label: 'TLS certificate problem',
-    hint: 'Certificate expiring or expired on this schedule’s backup host. Backups keep running regardless.',
-  },
 ]
 
 export interface BackupSchedule {
@@ -227,12 +203,6 @@ export interface BackupSchedule {
   // retry settings (retryCount / retryDelayMinutes).
   offsiteResyncAttempts?: number | null
   offsiteResyncDelayMinutes?: number | null
-  // RocketChat usernames @-mentioned when this schedule's backups fail.
-  // Empty = inherit the global list from Settings → Notifications.
-  notifyMentions?: string[]
-  // Per-event notification toggles. An absent key means "inherit the global
-  // setting" — see controller notificationPolicyService.
-  notifications?: NotificationEventToggles
   // Migration/validation flags: set when a schedule is disabled for a missing offsite pool selection
   invalid?: boolean
   invalidReason?: string | null
@@ -334,17 +304,29 @@ export interface BackupDirectory {
 }
 
 // Backup Stats
-export interface BackupStats {
+/**
+ * Every status the controller can report, so the dashboard cards add up to the
+ * total above them. `other` collects any status this build doesn't know about.
+ */
+export interface BackupStatusBreakdown {
   total: number
   completed: number
   failed: number
   running: number
   queued: number
-  last24h: {
-    total: number
-    completed: number
-    failed: number
-  }
+  retrying: number
+  skipped: number
+  cancelled: number
+  rejected: number
+  other: number
+}
+
+export interface BackupStats extends BackupStatusBreakdown {
+  /** VMs whose most recent attempt failed — failures that still stand. */
+  vmsFailingNow: number
+  /** VMs that have ever run a backup, the denominator for vmsFailingNow. */
+  vmsWithJobs: number
+  last24h: BackupStatusBreakdown
 }
 
 // API Response wrapper
@@ -353,4 +335,117 @@ export interface ApiResponse<T> {
   data?: T
   error?: string
   errors?: string[]
+}
+
+// ── Offsite replication ────────────────────────────────────────────────────
+
+/**
+ * An offsite replication job. Separate from BackupJob because it has its own
+ * lifecycle: a backup finishing only *asks* for a sync, and the sync then runs
+ * on its own lock, its own tmux session and its own retry budget.
+ */
+export type OffsiteJobStatus =
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'busy'
+  | 'cancelled'
+  | 'unsupported'
+
+export interface OffsiteJobTarget {
+  ip: string
+  path?: string
+  offsiteHostId?: string
+  offsiteHostName?: string
+  offsitePoolId?: string
+  offsitePoolName?: string
+}
+
+export interface OffsiteJob {
+  id: string
+  vmId: string
+  vmName: string
+  backupHostId: string
+  backupHostName: string
+  hypervisorId?: string | null
+  hypervisorName?: string | null
+  storagePoolId?: string
+  storagePoolPath?: string
+  scheduleId?: string | null
+  /** What asked for this sync. */
+  trigger?: 'backup' | 'manual' | 'check' | 'retry'
+  /** The backup job whose completion asked for it, when there was one. */
+  triggeredByJobId?: string | null
+  offsiteTargets?: OffsiteJobTarget[]
+  offsiteHosts?: string[]
+  status: OffsiteJobStatus
+  progress: number
+  progressText?: string
+  createdAt: string
+  startTime?: string | null
+  endTime?: string | null
+  error?: string | null
+  exitCode?: number | null
+  offsiteResults?: Array<{ ip: string; poolPath?: string; status: string; reason?: string }>
+  // Live per-target progress while the sync is running. Cleared once the job
+  // reaches a terminal status; offsiteResults is the post-run equivalent.
+  offsiteProgress?: Array<{ ip: string; percentage: number; text?: string; status?: string }>
+  attemptNumber?: number
+  /** Set by a retry that was told to re-baseline the source-pool guard. */
+  resetSourceGuard?: boolean
+}
+
+/** Per-VM outcome of a replication check. */
+export type ReplicationCheckState =
+  | 'in_sync'
+  | 'out_of_sync'
+  | 'skipped'
+  | 'unreachable'
+  | 'error'
+  | 'source_unavailable'
+  /** Offsite is on, but nothing it points at exists any more. */
+  | 'no_target'
+  /**
+   * Offsite is on and resolves, but no check has compared this VM yet —
+   * typically because replication was switched on since the last run.
+   */
+  | 'not_checked'
+
+export interface ReplicationCheckVM {
+  vmId: string
+  vmName: string
+  backupHostId: string
+  backupHostName: string
+  scheduleId?: string | null
+  targets?: OffsiteJobTarget[]
+  /** Null for a `not_checked` row: nothing has been compared yet. */
+  checkedAt: string | null
+  state: ReplicationCheckState
+  reason?: string
+  outOfSyncTargets?: number
+  unreachableTargets?: number
+  targetDetail?: Array<{ ip: string; state?: string; reason?: string; [k: string]: any }>
+  /** The agent is too old to answer the check at all. */
+  agentUnsupported?: boolean
+  /** Set when auto-sync queued a job for this VM. */
+  syncJobId?: string
+  /** Set when auto-sync declined to queue one, and why. */
+  syncNote?: string
+}
+
+export interface ReplicationCheckSummary {
+  startedAt: string | null
+  finishedAt: string | null
+  checked: number
+  inSync?: number
+  outOfSync?: number
+  skipped?: number
+  failed?: number
+  sourceUnavailable?: number
+  noTarget?: number
+  /** VMs replicating now that the last run never saw. */
+  notChecked?: number
+  synced?: number
+  vms: ReplicationCheckVM[]
 }

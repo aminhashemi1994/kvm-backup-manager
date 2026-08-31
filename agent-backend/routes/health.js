@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const os = require('os');
+const pkg = require('../package.json');
 const backupExecutor = require('../services/backupExecutor');
 const concurrencyConfigSyncService = require('../services/concurrencyConfigSyncService');
 const controllerTlsService = require('../services/controllerTlsService');
@@ -40,6 +41,22 @@ router.get('/', async (req, res) => {
     // when the controller's own cert is fine.
     tls: controllerTlsService.getState(),
     outbox: controllerOutbox.getStatus(),
+    version: pkg.version,
+    /**
+     * What this agent can actually do, stated outright.
+     *
+     * The controller used to infer "this agent is too old to replicate" from a
+     * 404 on /api/offsite/sync. A 404 has several other causes — a reverse
+     * proxy that does not forward that path, a process still running old code
+     * after a deploy — and every one of them was reported to the operator as
+     * "agent too old", which sends them to update an agent that is already
+     * current. An explicit flag cannot be guessed wrong: if this key is
+     * present and true, the endpoint exists in this process.
+     */
+    capabilities: {
+      offsiteSync: true,
+      replicationCheck: true,
+    },
   });
 });
 

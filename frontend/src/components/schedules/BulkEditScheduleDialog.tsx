@@ -11,7 +11,6 @@ import { Loader2, AlertCircle, CheckCircle } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { toast } from 'sonner'
-import { NOTIFICATION_EVENTS, type NotificationEventToggles } from '@/types'
 
 interface BulkEditScheduleDialogProps {
   schedules: any[]
@@ -31,14 +30,13 @@ export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditS
     updateRetry: false,
     updateOffsiteRetry: false,
     updateOffsiteResync: false,
-    updateNotifications: false,
-    updateMentions: false,
 
     // Values
     time: '02:00',
     retention: 7,
     keepArchive: 2,
     noCompression: false,
+    compression: 2,
     noVerify: false,
     enabled: true,
 
@@ -51,10 +49,6 @@ export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditS
     // their own Retry on Failure settings.
     offsiteResyncAttempts: '' as number | '',
     offsiteResyncDelayMinutes: '' as number | '',
-
-    // Per-event notification overrides applied to every selected schedule.
-    notifications: {} as NotificationEventToggles,
-    notifyMentions: '',
 
     // Offsite values
     syncToOffsite: false,
@@ -111,9 +105,7 @@ export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditS
                        formData.updateOffsite ||
                        formData.updateRetry ||
                        formData.updateOffsiteRetry ||
-                       formData.updateOffsiteResync ||
-                       formData.updateNotifications ||
-                       formData.updateMentions
+                       formData.updateOffsiteResync
 
     if (!hasUpdates) {
       toast.error('Please select at least one field to update')
@@ -175,6 +167,10 @@ export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditS
         }
         if (formData.updateCompression) {
           updates.noCompression = formData.noCompression
+          // The level, not just the on/off flag. Sending only noCompression
+          // left every schedule's level untouched, so "Update Compression
+          // Setting" applied half of what it appeared to.
+          updates.compression = formData.noCompression ? 0 : formData.compression
         }
         if (formData.updateVerify) {
           updates.noVerify = formData.noVerify
@@ -198,17 +194,6 @@ export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditS
             formData.offsiteResyncAttempts === '' ? null : formData.offsiteResyncAttempts
           updates.offsiteResyncDelayMinutes =
             formData.offsiteResyncDelayMinutes === '' ? null : formData.offsiteResyncDelayMinutes
-        }
-        if (formData.updateMentions) {
-          // Blank clears the per-schedule list, so these schedules fall back to
-          // the global mention list.
-          updates.notifyMentions = formData.notifyMentions
-            .split(',').map(v => v.trim().replace(/^@+/, '')).filter(Boolean)
-        }
-        if (formData.updateNotifications) {
-          // Replaces the whole map: keys left on "Inherit" are absent, which
-          // is exactly how a schedule falls back to the global setting.
-          updates.notifications = formData.notifications
         }
         if (formData.updateOffsite) {
           updates.syncToOffsite = formData.syncToOffsite
@@ -416,6 +401,31 @@ export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditS
                         <Label htmlFor="noCompression" className="cursor-pointer font-normal">
                           Disable compression
                         </Label>
+                      </div>
+                    )}
+                    {formData.updateCompression && !formData.noCompression && (
+                      <div className="mt-2">
+                        <Label htmlFor="bulkCompressionLevel" className="text-xs text-gray-500">
+                          Compression level
+                        </Label>
+                        <Select
+                          id="bulkCompressionLevel"
+                          value={formData.compression.toString()}
+                          onChange={(e: any) =>
+                            setFormData({ ...formData, compression: parseInt(e.target.value, 10) })
+                          }
+                          className="mt-1 w-56"
+                        >
+                          <option value="1">1 - Minimal compression</option>
+                          <option value="2">2 - Default</option>
+                          <option value="3">3 - Good compression</option>
+                          <option value="4">4 - Better compression</option>
+                          <option value="5">5 - High compression</option>
+                          <option value="6">6 - Very high compression</option>
+                          <option value="7">7 - Maximum compression</option>
+                          <option value="8">8 - Ultra compression</option>
+                          <option value="9">9 - Best compression (slowest)</option>
+                        </Select>
                       </div>
                     )}
                   </div>
@@ -645,102 +655,6 @@ export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditS
               </div>
             </div>
 
-            {/* Notifications (All Schedules) */}
-            <div className="space-y-4 p-4 border rounded-md bg-slate-50 dark:bg-slate-900/20 dark:border-slate-800">
-              <h3 className="font-medium text-sm flex items-center">
-                <span className="mr-2">🔔</span>
-                Notifications
-              </h3>
-
-              {/* Who is @-mentioned, as its own opt-in: assigning people and
-                  changing which events fire are separate decisions, and a bulk
-                  edit should not force one to touch the other. */}
-              <div className="flex items-start space-x-3 pb-4 border-b border-slate-200 dark:border-slate-800">
-                <Checkbox
-                  id="updateMentions"
-                  checked={formData.updateMentions}
-                  onChange={(e: any) => setFormData({ ...formData, updateMentions: e.target.checked })}
-                />
-                <div className="flex-1">
-                  <Label htmlFor="updateMentions" className="cursor-pointer">
-                    Update People to Notify
-                  </Label>
-                  <p className="text-xs text-gray-500 mt-1">
-                    Replaces the per-schedule list on every selected schedule. Leave the field
-                    blank to clear it, so those schedules fall back to the global list from
-                    Settings &rarr; Notifications.
-                  </p>
-
-                  {formData.updateMentions && (
-                    <div className="mt-3 space-y-2">
-                      <Input
-                        id="bulkNotifyMentions"
-                        placeholder="alice, bob"
-                        value={formData.notifyMentions}
-                        onChange={(e) => setFormData({ ...formData, notifyMentions: e.target.value })}
-                        spellCheck={false}
-                        autoComplete="off"
-                      />
-                      <p className="text-xs text-gray-500">
-                        Comma-separated RocketChat usernames — the <code className="px-1">@</code>{' '}
-                        is optional. They are @-mentioned at the top of messages for these
-                        schedules so someone is visibly on the hook.
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex items-start space-x-3">
-                <Checkbox
-                  id="updateNotifications"
-                  checked={formData.updateNotifications}
-                  onChange={(e: any) => setFormData({ ...formData, updateNotifications: e.target.checked })}
-                />
-                <div className="flex-1">
-                  <Label htmlFor="updateNotifications" className="cursor-pointer">
-                    Update Notification Events
-                  </Label>
-                  <p className="text-xs text-gray-500 mt-1">
-                    Applies this exact set to every selected schedule, replacing their current
-                    overrides. Events left on <span className="font-medium">Inherit</span> follow
-                    the system-wide default.
-                  </p>
-
-                  {formData.updateNotifications && (
-                    <div className="mt-3 space-y-2">
-                      {NOTIFICATION_EVENTS.map(ev => {
-                        const current = formData.notifications[ev.key]
-                        const mode = typeof current === 'boolean' ? (current ? 'on' : 'off') : 'inherit'
-                        return (
-                          <div key={ev.key} className="flex items-center justify-between gap-4">
-                            <div className="min-w-0">
-                              <Label className="text-sm">{ev.label}</Label>
-                              <p className="text-xs text-gray-500">{ev.hint}</p>
-                            </div>
-                            <Select
-                              className="w-32 shrink-0"
-                              value={mode}
-                              onChange={(e) => {
-                                const next: NotificationEventToggles = { ...formData.notifications }
-                                if (e.target.value === 'inherit') delete next[ev.key]
-                                else next[ev.key] = e.target.value === 'on'
-                                setFormData({ ...formData, notifications: next })
-                              }}
-                            >
-                              <option value="inherit">Inherit</option>
-                              <option value="on">On</option>
-                              <option value="off">Off</option>
-                            </Select>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-
             {/* Offsite Settings (All Schedules) */}
             <div className="space-y-4 p-4 border rounded-md bg-blue-50 dark:bg-blue-900/10">
               <h3 className="font-medium text-sm flex items-center">
@@ -817,7 +731,7 @@ export default function BulkEditScheduleDialog({ schedules, onClose }: BulkEditS
                                         <Label htmlFor={`bulkedit-offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
                                           {host.name} ({host.ip})
                                         </Label>
-                                        {host.status === 'online' ? (
+                                        {host.status === 'connected' ? (
                                           <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
                                             Connected
                                           </Badge>

@@ -13,7 +13,9 @@ import { offsiteHostsApi, metricsApi, storagePoolsApi } from '@/services/api'
 import { toast } from 'sonner'
 import { getStatusColor } from '@/lib/utils'
 import { useInitOffsiteHost } from '@/hooks/useInit'
+import { useLiveCheckStatusMap } from '@/hooks/useLiveCheckStatus'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+import { getErrorMessage } from '@/lib/errors'
 
 interface OffsiteHostManagerProps {
   backupHostId: string
@@ -35,6 +37,7 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
   const initOffsiteHost = useInitOffsiteHost()
   
   const { data: offsiteHosts, isLoading } = useOffsiteHostsByBackupHost(backupHostId)
+  const checkingOffsiteHostIds = useLiveCheckStatusMap(offsiteHosts, 'offsite-host-status-updated')
   const deleteHost = useDeleteOffsiteHost()
   const testHost = useTestOffsiteHost()
   const confirm = useConfirm()
@@ -108,7 +111,7 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
       setFormData({ name: '', ip: '', username: 'root', backupPath: '' })
     },
     onError: (error: any) => {
-      toast.error(error.response?.data?.error || 'Failed to add offsite host')
+      toast.error(getErrorMessage(error, 'Failed to add offsite host'))
     },
   })
 
@@ -179,9 +182,16 @@ export default function OffsiteHostManager({ backupHostId, backupHostName }: Off
                                 {host.username || 'root'}@{host.ip}
                               </p>
                             </div>
-                            <Badge className={getStatusColor(host.status)} variant="outline">
-                              {host.status}
-                            </Badge>
+                            {checkingOffsiteHostIds.has(host.id) ? (
+                              <Badge className="bg-blue-100 text-blue-800" variant="outline">
+                                <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+                                Connecting...
+                              </Badge>
+                            ) : (
+                              <Badge className={getStatusColor(host.status)} variant="outline">
+                                {host.status === 'disconnected' ? 'Unavailable' : host.status}
+                              </Badge>
+                            )}
                           </div>
                           <div className="flex items-center space-x-1">
                             <Button

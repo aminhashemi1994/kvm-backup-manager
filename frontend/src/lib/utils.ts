@@ -104,6 +104,9 @@ export function jobTypeCode(jobType?: string | null): { code: string; label: str
   switch ((jobType || 'backup').toLowerCase()) {
     case 'restore':
       return { code: 'R', label: 'Restore', className: 'bg-purple-50 text-purple-700 border-purple-200' }
+    case 'rsync':
+    case 'replication':
+      return { code: 'S', label: 'Rsync', className: 'bg-teal-50 text-teal-700 border-teal-200' }
     case 'sync':
     case 'offsite':
       return { code: 'S', label: 'Sync (offsite replication)', className: 'bg-teal-50 text-teal-700 border-teal-200' }
@@ -124,6 +127,8 @@ export function methodCode(method?: string | null): { code: string; label: strin
     cron: 'C',
     'custom-days': 'X',
     custom: 'X',
+    manual: 'H',     // Hand-triggered: not a cadence, but the honest answer
+                     // for a run nobody scheduled
     full: 'F',
     inc: 'N',        // iNcremental — I is taken by interval
     incremental: 'N',
@@ -131,6 +136,7 @@ export function methodCode(method?: string | null): { code: string; label: strin
   }
   if (!raw) return { code: '-', label: 'Unknown' }
   const code = map[raw] || raw.charAt(0).toUpperCase()
+  if (raw === 'custom-days') return { code, label: 'Custom' }
   return { code, label: raw.charAt(0).toUpperCase() + raw.slice(1) }
 }
 
@@ -168,7 +174,15 @@ export function getStatusColor(status: string): string {
     case 'retrying':
       return 'text-purple-600 bg-purple-100'
     case 'skipped':
+    // An offsite sync that did nothing because another transfer held the VM's
+    // lock. Retryable, but not a failure — so it must not read red.
+    case 'busy':
       return 'text-orange-600 bg-orange-100'
+    case 'cancelled':
+      return 'text-gray-600 bg-gray-100'
+    // The agent on that host predates independent replication.
+    case 'unsupported':
+      return 'text-orange-700 bg-orange-100'
     // Declined because the VM was already backing up — not a failure.
     case 'rejected':
       return 'text-amber-700 bg-amber-100'

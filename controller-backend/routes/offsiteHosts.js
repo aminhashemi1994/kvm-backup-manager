@@ -35,12 +35,84 @@ router.get('/', async (req, res, next) => {
   }
 });
 
+// How long a single offsite host is allowed to hold up the live-status sweep
+// below — see the matching constant/helper in routes/hypervisors.js for why
+// this is short and separate from the multi-minute agent request timeout.
+const OFFSITE_HOST_STATUS_CHECK_TIMEOUT_MS = 10000;
+
+// Probe every offsite host's live reachability in the background (through
+// the owning backup host's agent) and push results out as they land, so the
+// list itself never waits on connectivity checks.
+function checkOffsiteHostStatusesInBackground(io, backupHostId, hostUrl, offsiteHosts) {
+  offsiteHosts.forEach((offsiteHost) => {
+    agentService.testOffsiteConnection(hostUrl, { ip: offsiteHost.ip }, OFFSITE_HOST_STATUS_CHECK_TIMEOUT_MS)
+      .then(async (result) => {
+        const newStatus = result.success ? 'connected' : 'error';
+        const newLastError = result.success ? null : result.message;
+
+        const unchanged = offsiteHost.status === newStatus && offsiteHost.lastError === newLastError;
+
+        if (!unchanged) {
+          const allHosts = await getOffsiteHosts();
+          const index = allHosts.findIndex(h => h.id === offsiteHost.id);
+          if (index === -1) return; // deleted while the probe was in flight
+
+          allHosts[index] = {
+            ...allHosts[index],
+            status: newStatus,
+            lastError: newLastError,
+            updatedAt: new Date().toISOString(),
+          };
+          await saveOffsiteHosts(allHosts);
+        }
+
+        // Always broadcast, even when nothing changed — see the matching
+        // fix/comment in routes/hypervisors.js and routes/backupHosts.js.
+        if (io) {
+          io.emit('offsite-host-status-updated', {
+            backupHostId,
+            offsiteHostId: offsiteHost.id,
+            status: newStatus,
+            lastError: newLastError,
+          });
+        }
+      })
+      .catch((error) => {
+        console.error(`[OffsiteHosts] Background status check failed for ${offsiteHost.id}: ${error.message}`);
+      });
+  });
+}
+
 // GET /api/offsite-hosts/backup-host/:backupHostId
 router.get('/backup-host/:backupHostId', async (req, res, next) => {
   try {
     const hosts = await getOffsiteHosts();
     const filtered = hosts.filter(h => h.backupHostId === req.params.backupHostId);
-    res.json({ success: true, data: filtered });
+
+    // Respond immediately with what's already known. If the owning backup
+    // host is online, kick off a live reachability sweep in the background —
+    // the frontend shows a "checking" state per offsite host until a
+    // `offsite-host-status-updated` socket event (or its own timeout)
+    // resolves it.
+    let checking = false;
+    if (filtered.length > 0) {
+      const backupHosts = await getBackupHosts();
+      const backupHost = backupHosts.find(h => h.id === req.params.backupHostId);
+      if (backupHost && backupHost.status === 'online') {
+        checkOffsiteHostStatusesInBackground(
+          req.app.get('io'),
+          req.params.backupHostId,
+          ensureProtocol(backupHost.url),
+          filtered
+        );
+        checking = true;
+      }
+    }
+
+    res.json({
+      success: true,
+      data: checking ? filtered.map(h => ({ ...h, checking: true })) : filtered,
+    });
   } catch (error) {
     next(error);
   }

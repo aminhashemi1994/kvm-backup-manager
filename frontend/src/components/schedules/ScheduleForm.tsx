@@ -15,7 +15,6 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { useQuery } from '@tanstack/react-query'
 import { storagePoolsApi, hypervisorsApi } from '@/services/api'
 import { toast } from 'sonner'
-import { NOTIFICATION_EVENTS, type NotificationEventToggles } from '@/types'
 
 interface ScheduleFormProps {
   schedule?: any
@@ -84,10 +83,8 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
 
     // RocketChat usernames to @-mention on failure. Comma-separated in the
     // form, stored as an array. Empty = inherit the global list.
-    notifyMentions: Array.isArray(schedule?.notifyMentions) ? schedule.notifyMentions.join(', ') : '',
 
     // Per-event notification overrides. Absent key = inherit global setting.
-    notifications: (schedule?.notifications || {}) as NotificationEventToggles,
 
     // Offsite - Changed to support multiple hosts
     syncToOffsite: false,
@@ -220,16 +217,23 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         name: schedule.name,
         scheduleType: schedule.scheduleType || 'daily',
         time: schedule.time || '02:00',
-        incrementalCount: schedule.incrementalCount || 6,
-        retention: schedule.retention || 7,
-        keepArchive: schedule.keepArchive || 2,
+        // `typeof === 'number'`, not `||`, for every numeric field below.
+        //
+        // `||` treats a saved 0 as absent and substitutes the default, so
+        // reopening a schedule showed the wrong number and the next save wrote
+        // that wrong number back — the edit silently undid itself. 0 is a real
+        // value for several of these: incrementalCount 0 means full backups
+        // only, keepArchive 0 means keep no archives, compression 0 means none.
+        incrementalCount: typeof schedule.incrementalCount === 'number' ? schedule.incrementalCount : 6,
+        retention: typeof schedule.retention === 'number' ? schedule.retention : 7,
+        keepArchive: typeof schedule.keepArchive === 'number' ? schedule.keepArchive : 2,
         daysOfWeek: schedule.daysOfWeek || [],
         customDates: schedule.customDates || [],
-        retentionCount: schedule.retentionCount || 5,
-        intervalValue: schedule.intervalValue || 12,
+        retentionCount: typeof schedule.retentionCount === 'number' ? schedule.retentionCount : 5,
+        intervalValue: typeof schedule.intervalValue === 'number' ? schedule.intervalValue : 12,
         intervalUnit: schedule.intervalUnit || 'hours',
         cronExpression: schedule.cronExpression || '0 2 * * *',
-        compression: schedule.compression || 2,
+        compression: typeof schedule.compression === 'number' ? schedule.compression : 2,
         noCompression: schedule.noCompression || false,
         noVerify: schedule.noVerify || false,
         enabled: schedule.enabled !== false,
@@ -242,13 +246,16 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         offsiteRetryBackoffSeconds: typeof schedule.offsiteRetryBackoffSeconds === 'number' ? schedule.offsiteRetryBackoffSeconds : 15,
         offsiteResyncAttempts: typeof schedule.offsiteResyncAttempts === 'number' ? schedule.offsiteResyncAttempts : '',
         offsiteResyncDelayMinutes: typeof schedule.offsiteResyncDelayMinutes === 'number' ? schedule.offsiteResyncDelayMinutes : '',
-        notifyMentions: Array.isArray(schedule.notifyMentions) ? schedule.notifyMentions.join(', ') : '',
-        notifications: (schedule.notifications || {}) as NotificationEventToggles,
-        // Derive syncToOffsite from presence of offsite targets
-        syncToOffsite: schedule.syncToOffsite || 
-          (Array.isArray(schedule.offsiteTargets) && schedule.offsiteTargets.length > 0) ||
-          (schedule.offsiteHostIds && schedule.offsiteHostIds.length > 0) ||
-          !!schedule.offsiteHostId,
+        // An explicitly stored `false` is the operator's decision and wins
+        // outright. Only when the field is absent (a schedule saved before it
+        // was persisted) is the value inferred from the targets — otherwise a
+        // stale target left on an older record would re-tick a box the
+        // operator had just cleared.
+        syncToOffsite: typeof schedule.syncToOffsite === 'boolean'
+          ? schedule.syncToOffsite
+          : ((Array.isArray(schedule.offsiteTargets) && schedule.offsiteTargets.length > 0) ||
+             (schedule.offsiteHostIds && schedule.offsiteHostIds.length > 0) ||
+             !!schedule.offsiteHostId),
         // Prefer the new offsiteTargets shape; fall back to legacy
         // offsiteHostIds/offsiteHostId (no pool -> user must pick one).
         offsiteHostIds: Array.isArray(schedule.offsiteTargets) && schedule.offsiteTargets.length > 0
@@ -349,7 +356,18 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
 
     // Offsite validation (mirrors server Req 4.3): every checked offsite host
     // must have a destination pool selected before we allow save.
-    if (formData.syncToOffsite && formData.offsiteHostIds.length > 0) {
+    if (formData.syncToOffsite) {
+      // "Sync offsite" on with nothing selected is not a state worth saving:
+      // it reads as enabled while replicating nowhere. It also has to be
+      // rejected rather than sent, because the payload below expresses it as
+      // an empty target list — which is the same thing we send to turn offsite
+      // OFF, and would therefore silently clear the existing selection.
+      // BulkEditScheduleDialog already rejects it for the same reason.
+      if (formData.offsiteHostIds.length === 0) {
+        setOffsiteValidationAttempted(true)
+        toast.error('Select at least one offsite host, or untick "Sync backups to offsite location(s)"')
+        return
+      }
       const missing = formData.offsiteHostIds.filter(id => !formData.offsitePoolByHost[id])
       if (missing.length > 0) {
         setOffsiteValidationAttempted(true)
@@ -380,14 +398,21 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
         // Blank = inherit; send an explicit null so the API clears any override.
         offsiteResyncAttempts: formData.offsiteResyncAttempts === '' ? null : formData.offsiteResyncAttempts,
         offsiteResyncDelayMinutes: formData.offsiteResyncDelayMinutes === '' ? null : formData.offsiteResyncDelayMinutes,
-        notifications: formData.notifications,
-        notifyMentions: formData.notifyMentions
-          .split(',').map(v => v.trim().replace(/^@+/, '')).filter(Boolean),
         syncToOffsite: formData.syncToOffsite,
-        // Primary field: one { offsiteHostId, offsitePoolId } per checked host.
-        offsiteTargets: formData.syncToOffsite && offsiteTargets.length > 0 ? offsiteTargets : undefined,
+        // ALWAYS sent as an array, never omitted.
+        //
+        // These used to be `undefined` when offsite was switched off, and
+        // JSON.stringify drops undefined keys entirely — so "turn offsite off"
+        // arrived at the API as a body with no offsite fields at all. That is
+        // indistinguishable from a partial update that simply does not mention
+        // offsite, which the API deliberately treats as "leave the existing
+        // selection alone". The result: unchecking the box silently did
+        // nothing. An explicit empty array says "no targets" outright, which is
+        // a different statement from saying nothing. Matches what
+        // BulkEditScheduleDialog already did.
+        offsiteTargets: formData.syncToOffsite ? offsiteTargets : [],
         // Kept for backward-compat with any existing read paths.
-        offsiteHostIds: formData.syncToOffsite && formData.offsiteHostIds.length > 0 ? formData.offsiteHostIds : undefined,
+        offsiteHostIds: formData.syncToOffsite ? formData.offsiteHostIds : [],
       }
       switch (formData.scheduleType) {
         case 'daily':
@@ -1367,7 +1392,7 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
                               <Label htmlFor={`offsite-${host.id}`} className="font-normal cursor-pointer flex-1">
                                 {host.name} ({host.ip})
                               </Label>
-                              {host.status === 'online' ? (
+                              {host.status === 'connected' ? (
                                 <Badge variant="outline" className="text-xs bg-green-50 text-green-700 border-green-200">
                                   Connected
                                 </Badge>
@@ -1539,62 +1564,6 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
               </div>
             )}
 
-            {/* Notifications */}
-            <div className="space-y-4 p-4 border rounded-md bg-slate-50 dark:bg-slate-900/20 dark:border-slate-800">
-              <h3 className="font-medium text-sm flex items-center">
-                <span className="mr-2">🔔</span>
-                Notifications
-              </h3>
-              <p className="text-xs text-gray-600 dark:text-gray-400">
-                Choose which events send a message for this schedule. Leave an event on
-                <span className="font-medium"> Inherit </span>
-                to follow the system-wide default from Settings → Notifications.
-              </p>
-
-              <div className="space-y-2 pb-3 mb-1 border-b border-slate-200 dark:border-slate-800">
-                <Label htmlFor="notifyMentions">Notify these people (RocketChat)</Label>
-                <Input
-                  id="notifyMentions"
-                  placeholder="alice, bob"
-                  value={formData.notifyMentions}
-                  onChange={(e) => setFormData({ ...formData, notifyMentions: e.target.value })}
-                />
-                <p className="text-xs text-gray-500">
-                  Comma-separated usernames, @-mentioned at the top of failure messages for this
-                  schedule so someone is visibly on the hook. Leave blank to use the global list
-                  from Settings → Notifications.
-                </p>
-              </div>
-
-              <div className="space-y-2">
-                {NOTIFICATION_EVENTS.map(ev => {
-                  const current = formData.notifications[ev.key]
-                  const mode = typeof current === 'boolean' ? (current ? 'on' : 'off') : 'inherit'
-                  return (
-                    <div key={ev.key} className="flex items-center justify-between gap-4 py-1">
-                      <div className="min-w-0">
-                        <Label className="text-sm">{ev.label}</Label>
-                        <p className="text-xs text-gray-500">{ev.hint}</p>
-                      </div>
-                      <Select
-                        className="w-32 shrink-0"
-                        value={mode}
-                        onChange={(e) => {
-                          const next: NotificationEventToggles = { ...formData.notifications }
-                          if (e.target.value === 'inherit') delete next[ev.key]
-                          else next[ev.key] = e.target.value === 'on'
-                          setFormData({ ...formData, notifications: next })
-                        }}
-                      >
-                        <option value="inherit">Inherit</option>
-                        <option value="on">On</option>
-                        <option value="off">Off</option>
-                      </Select>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
           </div>
 
           <DialogFooter>

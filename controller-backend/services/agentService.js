@@ -11,23 +11,23 @@ class AgentService {
     return url;
   }
 
-  createAgentClient(agentUrl, agentId = 'controller', agentName = 'Controller') {
+  createAgentClient(agentUrl, agentId = 'controller', agentName = 'Controller', timeoutMs = config.agentRequestTimeout) {
     const url = this.ensureProtocol(agentUrl);
     const token = generateAgentToken(agentId, agentName);
-    
+
     return axios.create({
       baseURL: url,
-      timeout: config.agentRequestTimeout,
-      headers: { 
+      timeout: timeoutMs,
+      headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`
       },
     });
   }
 
-  async healthCheck(agentUrl) {
+  async healthCheck(agentUrl, timeoutMs) {
     try {
-      const client = this.createAgentClient(agentUrl);
+      const client = this.createAgentClient(agentUrl, 'controller', 'Controller', timeoutMs);
       const response = await client.get('/api/health');
       return { success: true, data: response.data };
     } catch (error) {
@@ -41,9 +41,13 @@ class AgentService {
     return response.data;
   }
 
-  async testHypervisor(agentUrl, hypervisorId) {
+  // `timeoutMs` lets callers that probe many hypervisors in the background
+  // (e.g. the backup-host card's live status sweep) cap how long a single
+  // unreachable one can hold things up, instead of inheriting the multi-
+  // minute default meant for real backup/restore calls.
+  async testHypervisor(agentUrl, hypervisorId, timeoutMs) {
     try {
-      const client = this.createAgentClient(agentUrl);
+      const client = this.createAgentClient(agentUrl, 'controller', 'Controller', timeoutMs);
       const response = await client.post(`/api/hypervisors/${hypervisorId}/test`);
       return response.data.data;
     } catch (error) {
@@ -51,10 +55,22 @@ class AgentService {
     }
   }
 
+  // Callers branch on `success`, so an agent-side failure has to come back as a
+  // value rather than a thrown axios error - otherwise it escapes to the global
+  // error handler and the agent's real message (SSH refused, virsh failed, disk
+  // full on the hypervisor) is lost behind a generic 500.
   async listVMs(agentUrl, hypervisorId) {
-    const client = this.createAgentClient(agentUrl);
-    const response = await client.get(`/api/hypervisors/${hypervisorId}/vms`);
-    return response.data;
+    try {
+      const client = this.createAgentClient(agentUrl);
+      const response = await client.get(`/api/hypervisors/${hypervisorId}/vms`);
+      return response.data;
+    } catch (error) {
+      const agentError = error.response?.data?.error;
+      const message = typeof agentError === 'string'
+        ? agentError
+        : agentError?.message || error.message;
+      return { success: false, error: message };
+    }
   }
 
   async triggerBackup(agentUrl, backupData) {
@@ -72,6 +88,36 @@ class AgentService {
     // agent-side cycle bookkeeping can use safely.
     const client = this.createAgentClient(agentUrl);
     const response = await client.post('/api/backup/trigger', backupData);
+    return response.data;
+  }
+
+  /**
+   * Start an offsite sync on the agent.
+   *
+   * A 404 here is meaningful rather than incidental: it means the agent predates
+   * the split and has no offsite endpoint, so it is not going to replicate
+   * anything no matter what the controller does. Callers surface that as an
+   * upgrade prompt instead of a generic failure.
+   */
+  async triggerOffsiteSync(agentUrl, syncData) {
+    const client = this.createAgentClient(agentUrl);
+    const response = await client.post('/api/offsite/sync', syncData);
+    return response.data;
+  }
+
+  async cancelOffsiteSync(agentUrl, jobId) {
+    const client = this.createAgentClient(agentUrl);
+    const response = await client.post(`/api/offsite/sync/${jobId}/cancel`, {});
+    return response.data;
+  }
+
+  /**
+   * Ask the agent whether a VM's offsite copies match its backup directory.
+   * Reads only; the agent takes no lock and transfers nothing.
+   */
+  async checkOffsiteReplication(agentUrl, checkData, timeoutMs = 330000) {
+    const client = this.createAgentClient(agentUrl);
+    const response = await client.post('/api/offsite/check', checkData, { timeout: timeoutMs });
     return response.data;
   }
 
@@ -211,9 +257,9 @@ class AgentService {
   // Offsite operations
   // NOTE: Offsite backup is handled by backup_manager.sh script
   // This only tests basic connectivity (ping)
-  async testOffsiteConnection(agentUrl, offsiteData) {
+  async testOffsiteConnection(agentUrl, offsiteData, timeoutMs) {
     try {
-      const client = this.createAgentClient(agentUrl);
+      const client = this.createAgentClient(agentUrl, 'controller', 'Controller', timeoutMs);
       const response = await client.post('/api/offsite/test', { ip: offsiteData.ip });
       return response.data.data;
     } catch (error) {
@@ -283,6 +329,25 @@ class AgentService {
    * Item 2: Batched live-status lookup. Used after agent reconnect to
    * reconcile every job in a single round-trip.
    */
+  /**
+   * What this agent is replicating right now.
+   *
+   * Used to reconcile replication jobs the controller believes are running.
+   * A failure is reported rather than thrown: "we could not ask" must never be
+   * mistaken for "the agent is not running it", or a brief network blip would
+   * finalize live transfers as failed.
+   */
+  async getActiveOffsiteSyncs(agentUrl) {
+    try {
+      const client = this.createAgentClient(agentUrl);
+      const response = await client.get('/api/offsite/sync', { timeout: 10000 });
+      const data = (response.data && response.data.data) || [];
+      return { success: true, data: Array.isArray(data) ? data : (data.jobs || []) };
+    } catch (error) {
+      return { success: false, error: error.message, data: [] };
+    }
+  }
+
   async getJobsLiveStatusBatch(agentUrl, jobIds) {
     try {
       if (!jobIds || jobIds.length === 0) return { success: true, data: [] };
