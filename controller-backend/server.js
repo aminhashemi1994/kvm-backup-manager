@@ -308,9 +308,14 @@ auditService.initialize().catch(err => {
 // Collapse notification bursts into one message per root cause. Must come up
 // before the services that emit notifications, or an early failure would be
 // sent ungrouped.
-notificationAggregator.initialize().catch(err => {
-  console.error('[NotifAgg] Failed to initialize:', err.message);
-});
+// Initialized with the PERSISTED aggregation settings, not the built-in
+// defaults: booting with defaults meant the panel's grouping/suppression
+// settings were ignored until someone happened to re-save them.
+loadNotificationSettings()
+  .then(settings => notificationAggregator.initialize((settings && settings.aggregation) || {}))
+  .catch(err => {
+    console.error('[NotifAgg] Failed to initialize:', err.message);
+  });
 dailyIncidentBoardService.initialize();
 
 // Start monitoring service

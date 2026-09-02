@@ -81,7 +81,10 @@ class MonitoringService {
             rocketChatService.notifyBackupStuck(
               job.vmName,
               job.id,
-              `no updates for ${mins} minutes`
+              `no updates for ${mins} minutes`,
+              job.scheduleId || null,
+              // Needed for the board's zone grouping and host mentions.
+              job.backupHostId || null
             );
 
             this.notifiedStuckJobs.add(jobKey);
@@ -252,7 +255,12 @@ class MonitoringService {
             rocketChatService.notifyMultipleBackupFailures(
               latestJob.vmName,
               consecutiveFailures,
-              latestJob.error || 'Unknown error'
+              latestJob.error || 'Unknown error',
+              latestJob.scheduleId || null,
+              // The board decides who to @-mention from the backup host, so it
+              // has to be passed through — without it the VM lands under
+              // "UNKNOWN HOST" with nobody named.
+              latestJob.backupHostId || null
             );
             
             this.consecutiveFailures.set(vmId, consecutiveFailures);

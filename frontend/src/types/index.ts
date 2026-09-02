@@ -119,17 +119,23 @@ export const NOTIFICATION_TYPE_GROUPS = [
   'Summaries',
 ] as const
 
-// Backup failed, offsite sync failed, and backup skipped have no toggle here
-// any more — they always send via the daily incident board (one running
-// message a day, edited in place). Who gets @-mentioned for those is
-// configured per backup host in the "Notify by backup host" section, not
-// here. See services/dailyIncidentBoardService.js on the backend.
+// Every per-VM backup problem — failed, offsite sync failed, skipped, stalled,
+// repeatedly failing, or a scheduled run that could not start — reports on the
+// daily incident board (one running message a day, edited in place) rather than
+// as its own message. Who gets @-mentioned for those is configured per backup
+// host in the "Notify by backup host" section, NOT by the per-section mention
+// lists here. Backup failed / offsite failed / skipped have no toggle at all;
+// the three that do still have one only control whether they reach the board.
+// A successful backup sends nothing, ever.
+// See services/dailyIncidentBoardService.js on the backend.
 export const NOTIFICATION_TYPES: NotificationTypeMeta[] = [
-  { key: 'backupCompleted', group: 'Backups', label: 'Backup succeeded', hint: 'Every successful backup — high volume' },
-  { key: 'scheduledBackupFailed', group: 'Backups', label: 'Scheduled run could not start', hint: 'The scheduler could not launch the run at all' },
+  // 'backupCompleted' is deliberately absent: a successful backup never sends
+  // anything, at any point. Its only effect is that the VM's line comes off
+  // the daily incident board. A toggle here would have been dead UI.
+  { key: 'scheduledBackupFailed', group: 'Backups', label: 'Scheduled run could not start', hint: 'The scheduler could not launch the run at all. Posts to the daily incident board — mentions come from "Notify by backup host" below, not from this section.' },
   { key: 'backupRetry', group: 'Backups', label: 'Retry started', hint: 'A failed run is being retried' },
-  { key: 'multipleBackupFailures', group: 'Backups', label: 'Repeated failures', hint: 'The same VM has failed several times in a row' },
-  { key: 'backupStuck', group: 'Backups', label: 'Backup stuck', hint: 'No progress reported for an hour' },
+  { key: 'multipleBackupFailures', group: 'Backups', label: 'Repeated failures', hint: 'The same VM has failed several times in a row. Posts to the daily incident board — mentions come from "Notify by backup host" below, not from this section.' },
+  { key: 'backupStuck', group: 'Backups', label: 'Backup stuck', hint: 'The agent stopped reporting on a running job. Posts to the daily incident board — mentions come from "Notify by backup host" below, not from this section.' },
   { key: 'backupVerificationFailed', group: 'Backups', label: 'Verification failed', hint: 'The backup was written but failed its check' },
 
   { key: 'restoreStarted', group: 'Restore', label: 'Restore started' },

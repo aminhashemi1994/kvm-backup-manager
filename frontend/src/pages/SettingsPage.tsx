@@ -1367,6 +1367,14 @@ function NotificationSettings() {
             section to see exactly which notifications it covers.
           </p>
           <p className="text-xs text-gray-500 mt-1">
+            <span className="font-medium">Backups are the exception.</span> Every per-VM backup
+            problem reports on the daily incident board instead of as its own message, and the
+            people mentioned there come from{' '}
+            <span className="font-medium">Notify by backup host</span> below — not from the
+            Backups section's list. A successful backup never sends anything; it just takes the
+            VM's line off the board.
+          </p>
+          <p className="text-xs text-gray-500 mt-1">
             Usernames are comma-separated. The <code className="px-1">@</code> is optional — type
             <code className="mx-1">alice, bob</code> or <code className="mx-1">@alice, @bob</code>,
             both work.

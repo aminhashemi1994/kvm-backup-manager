@@ -251,7 +251,34 @@ class NotificationAggregator {
    * @param {function} ev.sendSingle - fallback that sends the original ungrouped message
    */
   submit(ev) {
+    const succeeded = !(ev.kind.includes('failed') || ev.kind.includes('failure'));
+
+    // Successes are handled before anything else, and identically whether or
+    // not grouping is enabled: clear the open incident, take the VM off the
+    // board, say nothing. Doing this inside the grouping path meant that with
+    // grouping switched off a successful backup neither cleared the board nor
+    // was suppressed — it just fell through to sendSingle and announced itself.
+    if (succeeded && !ev.trackOnly) {
+      const done = [...this.knownFailing.keys()].filter(k => k.startsWith(`${ev.subject}::`));
+      if (done.length > 0) {
+        done.forEach(k => this.knownFailing.delete(k));
+        this.saveState().catch(() => {});
+      }
+      try {
+        require('./dailyIncidentBoardService').resolveIssues(ev.subject);
+      } catch (err) {
+        console.error('[NotifAgg] Board resolve failed:', err.message);
+      }
+      return;
+    }
+
     if (!this.settings.enabled) {
+      // Grouping off still means "send each event as it comes", NOT "ignore
+      // every other rule". A trackOnly event has no message of its own (the
+      // daily incident board owns it), and a muted one is switched off — both
+      // used to slip straight through this shortcut and send the very messages
+      // the settings say not to send, simply because grouping was disabled.
+      if (ev.trackOnly || ev.mute) return;
       return ev.sendSingle && Promise.resolve(ev.sendSingle())
         .catch(err => console.error('[NotifAgg] sendSingle failed:', err.message));
     }
@@ -285,7 +312,9 @@ class NotificationAggregator {
           && Date.now() - lastAnnounced >= this.settings.repeatRenotifyMs;
 
         if (!due) {
-          this.enqueue(ev.kind, cause, { ...ev, repeat: true });
+          // trackOnly events have no message to group, so don't open a group
+          // for them — it would only ever flush as "suppressed 1 repeat".
+          if (!ev.trackOnly) this.enqueue(ev.kind, cause, { ...ev, repeat: true });
           return;
         }
 
@@ -308,24 +337,6 @@ class NotificationAggregator {
     // only here to keep knownFailing accurate so a later success still
     // triggers a recovery announcement.
     if (ev.trackOnly) return;
-
-    if (!isFailure) {
-      // A success clears any open incident for this subject, and that
-      // transition IS worth reporting — a recovery is the thing an operator
-      // waiting on a fix actually wants to hear.
-      const failKeys = [...this.knownFailing.keys()].filter(k => k.startsWith(`${ev.subject}::`));
-      if (failKeys.length > 0) {
-        failKeys.forEach(k => this.knownFailing.delete(k));
-        this.saveState().catch(() => {});
-        // Explicitly NOT muted, whatever the incoming event carried. A
-        // recovery is a different event from a routine success: switching off
-        // "every backup completed" must not also switch off "the VM that has
-        // been failing for three weeks just came back", which is the single
-        // most useful message this system sends.
-        this.enqueue('recovered', 'recovered', { ...ev, recovered: true, mute: false });
-        return;
-      }
-    }
 
     this.enqueue(ev.kind, cause, ev);
   }
@@ -378,7 +389,7 @@ class NotificationAggregator {
     // A single new event with nothing to group it with keeps its original,
     // more detailed message — grouping should never make one failure harder
     // to read than it was before.
-    if (fresh.length === 1 && repeats.length === 0 && typeof fresh[0].sendSingle === 'function') {
+    if (fresh.length === 1 && repeats.length === 0 && !fresh[0].mute && typeof fresh[0].sendSingle === 'function') {
       // sendSingle resolves its own mentions, so it may be async — catch both
       // a synchronous throw and a rejected promise.
       try {
