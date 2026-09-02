@@ -825,15 +825,30 @@ class RocketChatService {
     });
   }
 
-  notifyScheduledBackupFailed(vmName, scheduleType, error) {
+  /**
+   * A scheduled run could not even be triggered (agent unreachable, bad
+   * payload, hypervisor refused). That is a failed backup like any other, so
+   * it goes on the daily incident board rather than out as its own message —
+   * otherwise the same night's problem is reported twice in two different
+   * formats, and this path could never @-mention the host owner because
+   * mentions for backup failures are configured per backup host, which only
+   * the board reads.
+   */
+  notifyScheduledBackupFailed(vmName, scheduleType, error, scheduleId = null, backupHostId = null) {
     if (!this.isTypeEnabled('scheduledBackupFailed')) return this._muted('scheduledBackupFailed');
-    return this.notify({
-        typeKey: 'scheduledBackupFailed',
-      entity: 'Backup',
-      state: `${scheduleType} schedule`,
-      status: 'Failed',
-      name: vmName,
-      details: `Error: ${error}`,
+    try {
+      require('./notificationAggregator').submit({
+        kind: 'backup-failed', subject: vmName, cause: error, scheduleId, trackOnly: true,
+      });
+    } catch (err) {
+      console.error('[RocketChat] Aggregator tracking failed:', err.message);
+    }
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: vmName,
+      kind: 'backup-failed',
+      detail: `${scheduleType} schedule could not start: ${error}`,
+      scheduleId,
+      backupHostId,
     });
   }
 
@@ -861,15 +876,19 @@ class RocketChatService {
     });
   }
 
-  notifyBackupStuck(vmName, jobId, duration) {
+  /**
+   * A running job has gone silent. Tonight's backup is very likely not
+   * happening, so it belongs on the board next to the outright failures — and
+   * it clears itself off there the moment the VM does back up successfully.
+   */
+  notifyBackupStuck(vmName, jobId, duration, scheduleId = null, backupHostId = null) {
     if (!this.isTypeEnabled('backupStuck')) return this._muted('backupStuck');
-    return this.notify({
-        typeKey: 'backupStuck',
-      entity: 'Backup',
-      state: 'Job Health',
-      status: 'Stuck',
-      name: vmName,
-      details: `Job ID: ${jobId}, Running for: ${duration}`,
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: vmName,
+      kind: 'stuck',
+      detail: `stalled — ${duration}`,
+      scheduleId,
+      backupHostId,
     });
   }
 
@@ -885,25 +904,36 @@ class RocketChatService {
     });
   }
 
-  notifyMultipleBackupFailures(vmName, failureCount, lastError) {
+  /**
+   * A VM has now failed N times in a row. This is not a separate incident from
+   * the failures themselves, so it does not get a message of its own: it
+   * sharpens the VM's existing line on the daily incident board.
+   *
+   * It used to send a standalone "Reliability / Multiple Failures" message per
+   * VM and, once several VMs shared a cause, a grouped "Failure Summary" — both
+   * in the old per-message format, both bypassing the board, and neither able
+   * to @-mention the host owner (mentions for backup failures are configured
+   * per backup host, and only the board reads that list).
+   */
+  notifyMultipleBackupFailures(vmName, failureCount, lastError, scheduleId = null, backupHostId = null) {
     if (!this.isTypeEnabled('multipleBackupFailures')) return this._muted('multipleBackupFailures');
-    // The worst offender in practice: 15 VMs sharing one fault produced 15 of
-    // these on top of 15 failure messages, every night, for three weeks. The
-    // aggregator groups them by cause and suppresses the ones already open, so
-    // a long-running incident stops re-announcing itself.
-    return this._viaAggregator({
-      kind: 'backup-repeat-failure',
-      subject: vmName,
-      cause: lastError,
-      context: `Consecutive failures: ${failureCount}`,
-      sendSingle: () => this.notify({
-        typeKey: 'multipleBackupFailures',
-        entity: 'Backup',
-        state: 'Reliability',
-        status: 'Multiple Failures',
-        name: vmName,
-        details: `Consecutive failures: ${failureCount}, Last error: ${lastError}`,
-      }),
+
+    // Bookkeeping only — keeps the aggregator's open-incident state accurate so
+    // a later success still clears the board entry.
+    try {
+      require('./notificationAggregator').submit({
+        kind: 'backup-repeat-failure', subject: vmName, cause: lastError, scheduleId, trackOnly: true,
+      });
+    } catch (err) {
+      console.error('[RocketChat] Aggregator tracking failed:', err.message);
+    }
+
+    return require('./dailyIncidentBoardService').recordIssue({
+      vm: vmName,
+      kind: 'backup-failed',
+      detail: `${lastError} (${failureCount} consecutive failures)`,
+      scheduleId,
+      backupHostId,
     });
   }
 

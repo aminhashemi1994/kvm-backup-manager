@@ -1899,9 +1899,11 @@ class SchedulerService {
       const vm = vms.find(v => v.id === schedule.vmId);
       if (vm) {
         rocketChatService.notifyScheduledBackupFailed(
-          vm.name, 
-          schedule.scheduleType, 
-          error.message
+          vm.name,
+          schedule.scheduleType,
+          error.message,
+          schedule.id || null,
+          (job && job.backupHostId) || null
         );
       }
 
@@ -2082,9 +2084,11 @@ class SchedulerService {
       const vm = vms.find(v => v.id === schedule.vmId);
       if (vm) {
         rocketChatService.notifyScheduledBackupFailed(
-          vm.name, 
-          'custom-days', 
-          error.message
+          vm.name,
+          'custom-days',
+          error.message,
+          schedule.id || null,
+          (job && job.backupHostId) || null
         );
       }
 

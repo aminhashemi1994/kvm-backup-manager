@@ -34,6 +34,7 @@ const SEVERITY_ICON = {
   'offsite-behind': '🟠',        // the check found the offsite copy out of date
   'offsite-unsupported': '🟠',   // the agent cannot replicate at all
   'source-unavailable': '🔴',    // the pool holding the backups is not mounted
+  stuck: '🔴',                   // job still "running" but the agent stopped reporting
 };
 
 /**
@@ -46,6 +47,7 @@ const SEVERITY_ICON = {
 const SEVERITY_TIER = {
   'backup-failed': 'critical',
   'source-unavailable': 'critical',
+  stuck: 'critical',
   offsite: 'warning',
   'offsite-failed': 'warning',
   'offsite-behind': 'warning',
@@ -215,7 +217,6 @@ class DailyIncidentBoardService {
         ? `${kind}::${backupHostId || ''}`
         : `${vm}::${kind}`;
       let entry = state.entries.find(e => e.key === key);
-      const isNewEntry = !entry;
       const nowIso = now.toISOString();
 
       if (!entry) {
@@ -240,7 +241,7 @@ class DailyIncidentBoardService {
         entry.detail = this._truncate(detail);
       }
 
-      const text = await this._render(state, { isNewEntry, backupHostId: entry.backupHostId });
+      const text = await this._render(state);
 
       if (!state.messageId) {
         const result = await rocketChatService.postNewMessage(text);
@@ -255,6 +256,38 @@ class DailyIncidentBoardService {
         if (!result || !result.success) {
           console.error('[IncidentBoard] Failed to update board message:', result && result.error);
         }
+      }
+    });
+  }
+
+  /**
+   * A VM backed up successfully — take its lines off the board.
+   *
+   * This is the ONLY thing a success does. Recoveries are deliberately not
+   * announced (no message of any kind for a successful backup); the card
+   * shrinking is the signal. Host-level kinds are left alone: one VM
+   * succeeding says nothing about an unmounted pool or an agent that cannot
+   * replicate.
+   */
+  async resolveIssues(vm) {
+    if (!vm) return;
+    const rocketChatService = require('./rocketChatService');
+
+    await this._withState(async (state) => {
+      if (!Array.isArray(state.entries) || state.entries.length === 0) return;
+      const before = state.entries.length;
+      state.entries = state.entries.filter(
+        e => !(e.vm === vm && !HOST_LEVEL_KINDS.has(e.kind))
+      );
+      if (state.entries.length === before) return;   // nothing on the board for this VM
+
+      state.lastUpdatedAt = new Date().toISOString();
+      if (!state.messageId) return;                  // no card open — nothing to edit
+
+      const text = await this._render(state);
+      const result = await rocketChatService.updateMessageById(state.roomId, state.messageId, text);
+      if (!result || !result.success) {
+        console.error('[IncidentBoard] Failed to update board message:', result && result.error);
       }
     });
   }
@@ -311,6 +344,9 @@ class DailyIncidentBoardService {
     if (entry.kind === 'offsite-unsupported') {
       return `${icon} ${vm} — ⚠️ ${detail || 'agent cannot replicate — update it'}`;
     }
+    if (entry.kind === 'stuck') {
+      return `${icon} ${vm} — ⏱️ ${detail || 'stalled, no updates from the agent'}`;
+    }
     if (entry.kind === 'source-unavailable') {
       return `${icon} ${vm} — ⛔ ${detail || 'not mounted — replication refused'}`;
     }
@@ -325,7 +361,7 @@ class DailyIncidentBoardService {
    * this a clean fixed-width card. The mention line has to stay OUTSIDE the
    * fence, or it would never actually notify anyone.
    */
-  async _render(state, { isNewEntry, backupHostId }) {
+  async _render(state) {
     let hosts = [];
     try {
       hosts = await getBackupHosts();
@@ -345,6 +381,10 @@ class DailyIncidentBoardService {
       counts[tier] += 1;
     }
     const total = state.entries.length;
+    // An emptied board is the normal end state of a good night: every VM that
+    // failed earlier has since backed up and had its line removed. Say so,
+    // rather than leaving a "🚨 BACKUP HEALTH — NOTICE / 0 issues" card behind.
+    const allClear = total === 0;
     const severityWord = counts.critical > 0 ? 'CRITICAL' : counts.warning > 0 ? 'WARNING' : 'NOTICE';
 
     // Group by zone (backup host), preserving each zone's first-appearance
@@ -361,7 +401,7 @@ class DailyIncidentBoardService {
     }
 
     const card = [];
-    card.push(`🚨 BACKUP HEALTH — ${severityWord}`);
+    card.push(allClear ? '✅ BACKUP HEALTH — ALL CLEAR' : `🚨 BACKUP HEALTH — ${severityWord}`);
     card.push('');
     card.push(`🔴 ${counts.critical} Failed · 🟠 ${counts.warning} Warnings · ⚪ ${counts.unknown} Unknown`);
     card.push(`${total} issue${total === 1 ? '' : 's'} · Created ${this._hhmm(state.periodStart)} · Updated ${this._hhmm(state.lastUpdatedAt)}`);
@@ -376,13 +416,26 @@ class DailyIncidentBoardService {
     card.push('');
     card.push(`🤖 ${require('./rocketChatService').entity || 'Backup Manager'}`);
 
+    // The mention line is rebuilt from EVERY host currently on the board, on
+    // every render — not just the host whose entry triggered this update.
+    // Rendering it only for a new entry meant each edit erased the people named
+    // by the previous one, so a host configured for mentions ended up with
+    // nobody on the card as soon as another host had an issue.
     const lines = [];
-    if (isNewEntry) {
-      const mentions = await this._mentionsForHost(backupHostId);
-      if (mentions.length > 0) {
-        lines.push(mentions.map(m => `@${m}`).join(' '));
-        lines.push('');
+    const mentioned = [];
+    const seenHosts = new Set();
+    for (const entry of state.entries) {
+      const hostId = entry.backupHostId || '';
+      if (!hostId || seenHosts.has(hostId)) continue;
+      seenHosts.add(hostId);
+      for (const name of await this._mentionsForHost(hostId)) {
+        const clean = String(name).trim().replace(/^@+/, '');
+        if (clean && !mentioned.includes(clean)) mentioned.push(clean);
       }
+    }
+    if (mentioned.length > 0) {
+      lines.push(mentioned.map(m => `@${m}`).join(' '));
+      lines.push('');
     }
     lines.push('```');
     lines.push(...card);
