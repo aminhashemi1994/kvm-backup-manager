@@ -1,6 +1,0 @@
-imagine we have multiple backups hosts and multiple vms on multiple hypervisor multiple agents and multiple backup and restore job at the same time. or somtimes because the vm datas are large like 7 TB and syncing them to another datacenter with a low speet at 4 MB/S failure during run retrying and so many other stuff  what can go wrong that will cause data drift or panel cannot determine the backup or restore situations or the exit codes.
-you need to read and semiulate the situations.
-
-
-we also need a monitoring panel to manage the vms and the success of them. 
-a monitoring like grafana but super good visualizations that can be fetched from apis or can have a database it self aand store that status of vms for a log period of time and also have alerting for each vm and we can handle those alerts
