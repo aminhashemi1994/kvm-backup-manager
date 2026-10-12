@@ -115,20 +115,9 @@ export default function LoginPage() {
           </CardContent>
         </Card>
         
-        {/* Footer with author credit */}
+        {/* Footer */}
         <div className="text-center text-xs text-gray-400">
-          <p>
-            Built by{' '}
-            <a
-              href="https://www.linkedin.com/in/amin-hashemi-2955061bb"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-400 hover:text-blue-300 hover:underline transition-colors"
-            >
-              Mohammad Amin Hashemi
-            </a>
-          </p>
-          <p className="mt-1 text-gray-500">
+          <p className="text-gray-500">
             Powered by{' '}
             <a
               href="https://github.com/abbbi/virtnbdbackup"

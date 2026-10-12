@@ -173,14 +173,25 @@ class OffsiteJobService {
    * @param {string} opts.vmId
    * @param {string} [opts.scheduleId]  Where the offsite targets come from.
    * @param {string} opts.trigger       'backup' | 'manual' | 'check' | 'retry'
+   * @param {Array}  [opts.offsiteTargets] Destinations that do not come from a
+   *   schedule: a one-off "Backup now" with offsite ticked, or a manual sync
+   *   picked on the replication page. `{ offsiteHostId, offsitePoolId }` each,
+   *   offsitePoolId null for a legacy host-level target. Merged with whatever
+   *   the VM's schedules already replicate to.
+   * @param {string} [opts.storagePoolId] The source pool, when the caller knows
+   *   it (the backup it came from). Otherwise inferred from the schedule.
    * @returns {Promise<{created: boolean, job?: object, reason?: string}>}
    */
   async requestSync(opts) {
     return this._serialize(() => this._requestSync(opts));
   }
 
-  async _requestSync({ vmId, scheduleId = null, trigger = 'manual', triggeredByJobId = null }) {
-    const resolved = await this._resolveContext(vmId, scheduleId);
+  async _requestSync({
+    vmId, scheduleId = null, trigger = 'manual', triggeredByJobId = null,
+    offsiteTargets = null, storagePoolId = null,
+  }) {
+    const explicitTargets = this._explicitTargets(offsiteTargets);
+    const resolved = await this._resolveContext(vmId, scheduleId, { explicitTargets, storagePoolId });
     if (!resolved.ok) return { created: false, reason: resolved.reason };
 
     const { vm, host, hypervisor, pool, schedule, targets, encoded } = resolved;
@@ -210,10 +221,16 @@ class OffsiteJobService {
       //
       // One flag, not a counter: a single follow-up covers any amount of new
       // data, because the transfer is of the whole directory.
-      if (!existing.followUpRequested) {
+      //
+      // Explicit targets are remembered with it: they belong to no schedule, so
+      // a follow-up that re-resolved from schedules alone would drop them.
+      const pendingTargets = this._mergeExplicit(existing.followUpTargets, explicitTargets);
+      if (!existing.followUpRequested || pendingTargets.length !== (existing.followUpTargets || []).length) {
         await this._patch(existing.id, {
           followUpRequested: true,
-          followUpReason: trigger,
+          followUpReason: existing.followUpReason || trigger,
+          followUpTargets: pendingTargets,
+          followUpStoragePoolId: existing.followUpStoragePoolId || storagePoolId || null,
         });
       }
       return {
@@ -242,6 +259,9 @@ class OffsiteJobService {
       // reached the offsite hosts, without the backup job itself waiting for it.
       triggeredByJobId,
       offsiteTargets: targets,
+      // The non-schedule destinations this job was asked for, kept so a
+      // follow-up can ask for them again.
+      explicitTargets,
       offsiteHosts: encoded,
       offsiteRetryAttempts: (schedule && schedule.offsiteRetryAttempts) || 3,
       offsiteRetryBackoffSeconds: (schedule && schedule.offsiteRetryBackoffSeconds) || 15,
@@ -278,11 +298,12 @@ class OffsiteJobService {
    * de-duplicated by host+pool: syncing to a target twice in one pass would be
    * pointless work at best and two writers on one destination at worst.
    */
-  async _resolveContext(vmId, scheduleId) {
-    const [vms, hosts, hypervisors, pools, schedules, offsiteHosts] = await Promise.all([
+  async _resolveContext(vmId, scheduleId, { explicitTargets = [], storagePoolId = null } = {}) {
+    const [vms, hosts, hypervisors, pools, schedules, offsiteHosts, manual] = await Promise.all([
       getVirtualMachines(), getBackupHosts(), getHypervisors(), getStoragePools(),
-      getBackupSchedules(), getOffsiteHosts(),
+      getBackupSchedules(), getOffsiteHosts(), this.manualReplicas(),
     ]);
+
 
     const vm = vms.find(v => v.id === vmId);
     if (!vm) return { ok: false, reason: `VM ${vmId} not found` };
@@ -297,6 +318,17 @@ class OffsiteJobService {
     // so the two can never disagree about whether a VM replicates.
     const { replicationEnabled } = require('./replicationCheckService');
     const vmSchedules = schedules.filter(s => replicationEnabled(s) && s.vmId === vmId);
+
+    // A VM synced by hand and replicated by no schedule keeps the destinations
+    // it was last sent to, so a request that names none (the panel's Sync
+    // button, the check's auto-sync, a follow-up) still goes where the
+    // operator chose. Only then: a VM that has an offsite schedule replicates
+    // where its schedule says, and a one-off manual sync does not add to that.
+    const remembered = manual.get(vmId);
+    if (remembered && vmSchedules.length === 0 && explicitTargets.length === 0) {
+      explicitTargets = remembered.offsiteTargets;
+      storagePoolId = storagePoolId || remembered.storagePoolId;
+    }
     // An explicitly named schedule still has to pass the same test. It used to
     // be looked up in the unfiltered list, so a caller passing the scheduleId of
     // a schedule whose offsite had been switched off would have its targets
@@ -314,7 +346,10 @@ class OffsiteJobService {
     // host. The transfer needs the source path, and every schedule of a VM
     // writes into the same VM directory under that pool.
     let pool = null;
-    if (schedule && schedule.storagePoolId) {
+    if (storagePoolId) {
+      pool = pools.find(p => p.id === storagePoolId && p.backupHostId === host.id) || null;
+    }
+    if (!pool && schedule && schedule.storagePoolId) {
       pool = pools.find(p => p.id === schedule.storagePoolId && p.backupHostId === host.id);
     }
     if (!pool) {
@@ -328,7 +363,15 @@ class OffsiteJobService {
     // Merge the targets of every offsite-enabled schedule of this VM.
     const seen = new Set();
     const targets = [];
-    for (const s of (schedule ? [schedule, ...vmSchedules.filter(x => x.id !== schedule.id)] : vmSchedules)) {
+    // Explicit targets are shaped like schedules so they resolve through the
+    // same code: per-pool ones and legacy host-level ones separately, because
+    // _targetsOf reads one shape or the other, never both.
+    const sources = schedule ? [schedule, ...vmSchedules.filter(x => x.id !== schedule.id)] : [...vmSchedules];
+    if (explicitTargets.length > 0) {
+      sources.push({ offsiteTargets: explicitTargets.filter(t => t.offsitePoolId) });
+      sources.push({ offsiteHostIds: explicitTargets.filter(t => !t.offsitePoolId).map(t => t.offsiteHostId) });
+    }
+    for (const s of sources) {
       for (const t of this._targetsOf(s, offsiteHosts)) {
         const key = `${t.offsiteHostId}::${t.offsitePoolId || t.path || ''}`;
         if (seen.has(key)) continue;
@@ -344,6 +387,47 @@ class OffsiteJobService {
     });
 
     return { ok: true, vm, host, hypervisor, pool, schedule, targets, encoded };
+  }
+
+  /** Normalise caller-supplied targets to `{ offsiteHostId, offsitePoolId }`. */
+  _explicitTargets(list) {
+    if (!Array.isArray(list)) return [];
+    return this._mergeExplicit([], list
+      .filter(t => t && t.offsiteHostId)
+      .map(t => ({ offsiteHostId: t.offsiteHostId, offsitePoolId: t.offsitePoolId || null })));
+  }
+
+  _mergeExplicit(a, b) {
+    const out = [];
+    const seen = new Set();
+    for (const t of [...(a || []), ...(b || [])]) {
+      const key = `${t.offsiteHostId}::${t.offsitePoolId || ''}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(t);
+    }
+    return out;
+  }
+
+  /**
+   * VMs replicated by hand, and where to.
+   *
+   * A sync started from "Sync a backup" (or after a one-off backup with offsite
+   * ticked) names destinations no schedule holds. The latest such job per VM is
+   * what that VM replicates to from then on, so the replication page can list
+   * it, check it, and its Sync button and follow-ups know where to send.
+   *
+   * @returns {Promise<Map<string, {offsiteTargets: Array, storagePoolId: string|null}>>}
+   */
+  async manualReplicas(jobs = null) {
+    const list = jobs || await getOffsiteJobs();
+    const out = new Map();
+    const sorted = [...list].sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+    for (const j of sorted) {
+      if (!j || !j.vmId || !Array.isArray(j.explicitTargets) || j.explicitTargets.length === 0) continue;
+      out.set(j.vmId, { offsiteTargets: j.explicitTargets, storagePoolId: j.storagePoolId || null });
+    }
+    return out;
   }
 
   _scheduleHasTargets(schedule) {
@@ -629,13 +713,15 @@ class OffsiteJobService {
     if (!job || !job.followUpRequested) return;
     if (job.status === 'busy') return;
 
-    await this._patch(job.id, { followUpRequested: false });
+    await this._patch(job.id, { followUpRequested: false, followUpTargets: [], followUpStoragePoolId: null });
     try {
       const result = await this.requestSync({
         vmId: job.vmId,
         scheduleId: job.scheduleId,
         trigger: job.followUpReason || 'backup',
         triggeredByJobId: job.triggeredByJobId || null,
+        offsiteTargets: this._mergeExplicit(job.explicitTargets, job.followUpTargets),
+        storagePoolId: job.followUpStoragePoolId || job.storagePoolId || null,
       });
       if (result.created) {
         console.log(`[OffsiteJobs] Follow-up sync queued for ${job.vmName} (data arrived mid-transfer)`);
@@ -865,8 +951,9 @@ class OffsiteJobService {
       // a load-order cycle with replicationCheckService.
       if (status === 'completed') {
         try {
-          const { updateFromSync } = require('./replicationCheckService');
-          await updateFromSync(job);
+          // Called on the instance: destructuring it off lost `this`, so every
+          // call threw inside getResults() and the panel never moved.
+          await require('./replicationCheckService').updateFromSync(job);
         } catch (err) {
           console.error(`[OffsiteJobs] Could not refresh replication-check from sync ${jobId}: ${err.message}`);
         }

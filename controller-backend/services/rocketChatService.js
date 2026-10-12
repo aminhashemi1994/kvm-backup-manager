@@ -672,7 +672,7 @@ class RocketChatService {
     // board.
     try {
       require('./notificationAggregator').submit({
-        kind: 'backup-failed', subject: vmName, cause: error, scheduleId, trackOnly: true,
+        kind: 'backup-failed', subject: vmName, cause: error, scheduleId, backupHostId, trackOnly: true,
       });
     } catch (err) {
       console.error('[RocketChat] Aggregator tracking failed:', err.message);
@@ -685,7 +685,7 @@ class RocketChatService {
   notifyOffsiteSyncFailed(vmName, offsiteHost, error, scheduleId = null, offsiteSuccessSeen = false, backupHostId = null) {
     try {
       require('./notificationAggregator').submit({
-        kind: 'offsite-failed', subject: vmName, cause: `${offsiteHost}: ${error}`, scheduleId, trackOnly: true,
+        kind: 'offsite-failed', subject: vmName, cause: `${offsiteHost}: ${error}`, scheduleId, backupHostId, trackOnly: true,
       });
     } catch (err) {
       console.error('[RocketChat] Aggregator tracking failed:', err.message);
@@ -707,7 +707,7 @@ class RocketChatService {
   notifyOffsiteJobFailed(vmName, reason, scheduleId = null, backupHostId = null) {
     try {
       require('./notificationAggregator').submit({
-        kind: 'offsite-failed', subject: vmName, cause: reason, scheduleId, trackOnly: true,
+        kind: 'offsite-failed', subject: vmName, cause: reason, scheduleId, backupHostId, trackOnly: true,
       });
     } catch (err) {
       console.error('[RocketChat] Aggregator tracking failed:', err.message);
@@ -838,7 +838,7 @@ class RocketChatService {
     if (!this.isTypeEnabled('scheduledBackupFailed')) return this._muted('scheduledBackupFailed');
     try {
       require('./notificationAggregator').submit({
-        kind: 'backup-failed', subject: vmName, cause: error, scheduleId, trackOnly: true,
+        kind: 'backup-failed', subject: vmName, cause: error, scheduleId, backupHostId, trackOnly: true,
       });
     } catch (err) {
       console.error('[RocketChat] Aggregator tracking failed:', err.message);
@@ -922,7 +922,7 @@ class RocketChatService {
     // a later success still clears the board entry.
     try {
       require('./notificationAggregator').submit({
-        kind: 'backup-repeat-failure', subject: vmName, cause: lastError, scheduleId, trackOnly: true,
+        kind: 'backup-repeat-failure', subject: vmName, cause: lastError, scheduleId, backupHostId, trackOnly: true,
       });
     } catch (err) {
       console.error('[RocketChat] Aggregator tracking failed:', err.message);

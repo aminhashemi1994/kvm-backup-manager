@@ -9,6 +9,7 @@ require('dotenv').config();
 
 const config = require('./config/config');
 const errorHandler = require('./middleware/errorHandler');
+const { authenticateApiToken, parseTokens } = require('./middleware/apiToken');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -28,6 +29,7 @@ const reportDownloadRoutes = require('./routes/reportDownload');
 const missedBackupsRoutes = require('./routes/missedBackups');
 const metricsRoutes = require('./routes/metrics');
 const prometheusRoutes = require('./routes/prometheus');
+const inventoryRoutes = require('./routes/inventory');
 const fixBackupRoutes = require('./routes/fixBackup');
 const cleanupBackupRoutes = require('./routes/cleanupBackup');
 const backupStatusRoutes = require('./routes/backupStatus');
@@ -152,6 +154,18 @@ app.use('/api/auth', authRoutes); // Authentication routes (no auth required)
 // and /api/metrics/prometheus (for deployments where only /api is proxied).
 app.use('/metrics', prometheusRoutes);
 app.use('/api/metrics/prometheus', prometheusRoutes);
+
+// Read-only inventory / asset API for external consumers (CMDB, asset
+// register, capacity reporting). Mounted before authenticateUser for the same
+// reason as /metrics: an integration script cannot hold a panel session. It
+// carries its own per-client token and every route behind it is a GET.
+app.use('/api/inventory', authenticateApiToken, inventoryRoutes);
+if (parseTokens(process.env.INVENTORY_API_TOKENS).length === 0) {
+  console.log('· /api/inventory disabled (INVENTORY_API_TOKENS is not set)');
+} else {
+  const labels = parseTokens(process.env.INVENTORY_API_TOKENS).map((t) => t.label);
+  console.log(`\u2713 /api/inventory enabled for ${labels.length} client(s): ${labels.join(', ')}`);
+}
 if (!process.env.METRICS_TOKEN) {
   console.warn('⚠ /metrics is unauthenticated (METRICS_TOKEN is not set).');
   console.warn('  The exposition names every VM, host, schedule and pool — ');

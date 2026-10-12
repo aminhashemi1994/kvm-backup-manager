@@ -112,7 +112,7 @@ router.get('/:id/log', async (req, res, next) => {
 // POST /api/offsite-jobs — start a sync for one VM.
 router.post('/', async (req, res, next) => {
   try {
-    const { vmId, scheduleId } = req.body;
+    const { vmId, scheduleId, offsiteTargets, storagePoolId, triggeredByJobId } = req.body;
     if (!vmId) {
       return res.status(400).json({ success: false, error: 'vmId is required' });
     }
@@ -121,6 +121,10 @@ router.post('/', async (req, res, next) => {
       vmId,
       scheduleId: scheduleId || null,
       trigger: 'manual',
+      // Picked on the replication page for a backup with no offsite schedule.
+      offsiteTargets: Array.isArray(offsiteTargets) ? offsiteTargets : null,
+      storagePoolId: storagePoolId || null,
+      triggeredByJobId: triggeredByJobId || null,
     });
 
     if (!result.created) {

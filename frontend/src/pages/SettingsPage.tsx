@@ -411,24 +411,10 @@ function GeneralSettings() {
             <span>{version ? `${version.license} (Open Source)` : 'Open Source'}</span>
           </div>
           <div className="flex items-center justify-between">
-            <span className="text-gray-500">Built by</span>
-            <a
-              href="https://www.linkedin.com/in/amin-hashemi-2955061bb"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-primary hover:underline"
-            >
-              Mohammad Amin Hashemi
-            </a>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-gray-500">Contact</span>
-            <a
-              href="mailto:aminhashemiwin10@gmail.com"
-              className="text-primary hover:underline"
-            >
-              aminhashemiwin10@gmail.com
-            </a>
+            <span className="text-gray-500">Author &amp; credits</span>
+            <NavLink to="/about" className="text-primary hover:underline">
+              About page
+            </NavLink>
           </div>
           <div className="flex items-center justify-between">
             <span className="text-gray-500">Powered by</span>

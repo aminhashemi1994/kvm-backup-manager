@@ -248,7 +248,15 @@ export default function ReplicationCheckPanel() {
   }
 
   const sorted = useMemo(() => {
-    if (!sort) return filtered
+    // With no sort chosen, rows with a sync in progress come first, the rest
+    // keep the controller's order. Otherwise a VM just sent offsite by hand is
+    // appended at the end of the results and lands on a later page, where it
+    // reads as "it never appeared".
+    if (!sort) {
+      const active = filtered.filter(v => syncingVmIds.has(v.vmId))
+      if (active.length === 0) return filtered
+      return [...active, ...filtered.filter(v => !syncingVmIds.has(v.vmId))]
+    }
     const dir = sort.dir === 'asc' ? 1 : -1
     return [...filtered].sort((a, b) => {
       const av = sortValue(a, sort.key)

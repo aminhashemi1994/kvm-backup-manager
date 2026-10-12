@@ -139,6 +139,12 @@ router.post('/', async (req, res, next) => {
       name: req.body.name,
       url: req.body.url,
       description: req.body.description || '',
+      // Datacenter / zone this backup server physically sits in. Purely
+      // descriptive — nothing routes on it. Hypervisors, offsite targets and
+      // VMs under this host inherit it rather than storing their own copy,
+      // so a datacenter move is a one-field edit here. Empty until an
+      // operator fills it in; existing hosts are not backfilled.
+      site: typeof req.body.site === 'string' ? req.body.site.trim() : '',
       // Allow 0 (= unlimited). Only fall back to the system default when the
       // field is genuinely absent.
       maxConcurrentBackups: (req.body.maxConcurrentBackups === undefined || req.body.maxConcurrentBackups === null)
@@ -181,6 +187,10 @@ router.put('/:id', async (req, res, next) => {
       name: req.body.name || before.name,
       url: req.body.url || before.url,
       description: req.body.description !== undefined ? req.body.description : before.description,
+      // `!== undefined` rather than `||` so the site can be cleared back to ''.
+      site: req.body.site !== undefined
+        ? (typeof req.body.site === 'string' ? req.body.site.trim() : '')
+        : (before.site ?? ''),
       maxConcurrentBackups: req.body.maxConcurrentBackups !== undefined ? req.body.maxConcurrentBackups : before.maxConcurrentBackups,
       updatedAt: new Date().toISOString(),
     };

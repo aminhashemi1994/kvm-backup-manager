@@ -292,9 +292,9 @@ class ReplicationCheckService {
    * recorded as failed — nothing is known about it either way.
    */
   async _candidates(backupHostId) {
-    const [vms, hosts, schedules, pools, offsiteHosts] = await Promise.all([
+    const [vms, hosts, schedules, pools, offsiteHosts, manual] = await Promise.all([
       getVirtualMachines(), getBackupHosts(), getBackupSchedules(),
-      getStoragePools(), getOffsiteHosts(),
+      getStoragePools(), getOffsiteHosts(), offsiteJobService.manualReplicas(),
     ]);
 
     const out = [];
@@ -309,8 +309,9 @@ class ReplicationCheckService {
 
       // A schedule replicates only when the operator has not switched offsite
       // off AND it still has somewhere to send to. See replicationEnabled().
+      // Or it was synced by hand ("Sync a backup"), which counts too.
       const vmSchedules = schedules.filter(s => replicationEnabled(s) && s.vmId === vm.id);
-      if (vmSchedules.length === 0) continue;
+      if (vmSchedules.length === 0 && !manual.has(vm.id)) continue;
 
       // Reuse the job service's resolution so the check and the sync can never
       // disagree about which targets a VM has.
@@ -579,7 +580,7 @@ class ReplicationCheckService {
     }
 
     const known = new Set(base.vms.map(v => v && v.vmId));
-    const enabledVmIds = new Set(schedules.filter(replicationEnabled).map(s => s.vmId));
+    const enabledVmIds = await this._replicatedVmIds(schedules);
 
     const pending = [];
     for (const vm of vms) {
@@ -657,9 +658,7 @@ class ReplicationCheckService {
       return summary;
     }
 
-    const enabledVmIds = new Set(
-      schedules.filter(replicationEnabled).map(s => s.vmId)
-    );
+    const enabledVmIds = await this._replicatedVmIds(schedules);
 
     const vms = summary.vms.filter(v => enabledVmIds.has(v.vmId));
     if (vms.length === summary.vms.length) return summary;
@@ -677,6 +676,17 @@ class ReplicationCheckService {
       sourceUnavailable: vms.filter(v => v.state === 'source_unavailable').length,
       noTarget: vms.filter(v => v.state === 'no_target').length,
     };
+  }
+
+  /** VMs that replicate: by an offsite-enabled schedule, or synced by hand. */
+  async _replicatedVmIds(schedules) {
+    const ids = new Set(schedules.filter(replicationEnabled).map(s => s.vmId));
+    try {
+      for (const vmId of (await offsiteJobService.manualReplicas()).keys()) ids.add(vmId);
+    } catch (err) {
+      console.error(`[ReplicationCheck] Could not read manual replicas: ${err.message}`);
+    }
+    return ids;
   }
 
   async _saveResults(summary) {
@@ -718,10 +728,30 @@ class ReplicationCheckService {
       console.error(`[ReplicationCheck] Could not load results to update from sync: ${err.message}`);
       return false;
     }
-    if (!Array.isArray(results.vms) || results.vms.length === 0) return false;
+    if (!results || !Array.isArray(results.vms)) {
+      results = { startedAt: null, finishedAt: null, checked: 0, vms: [] };
+    }
 
-    const idx = results.vms.findIndex(v => v && v.vmId === job.vmId);
-    if (idx < 0) return false;
+    // A VM the last check never saw (just synced by hand, or just configured)
+    // gets its row from this sync, instead of staying "not checked" until the
+    // next check happens to run.
+    let idx = results.vms.findIndex(v => v && v.vmId === job.vmId);
+    if (idx < 0) {
+      results.vms.push({
+        vmId: job.vmId,
+        vmName: job.vmName,
+        backupHostId: job.backupHostId,
+        backupHostName: job.backupHostName,
+        scheduleId: job.scheduleId || null,
+        targets: (job.offsiteTargets || []).map(t => ({
+          ip: t.ip, path: t.path,
+          offsiteHostId: t.offsiteHostId, offsiteHostName: t.offsiteHostName,
+          offsitePoolId: t.offsitePoolId, offsitePoolName: t.offsitePoolName,
+        })),
+      });
+      idx = results.vms.length - 1;
+      results.checked = (results.checked || 0) + 1;
+    }
 
     const prev = results.vms[idx];
     const checkedAt = job.endTime || new Date().toISOString();

@@ -250,6 +250,9 @@ export interface BackupJob {
   coveredBy?: string // ID of the backup that was already running when this run was rejected
   collidedWithSession?: string // tmux session of that running backup
   storagePoolPath?: string // Pool a tmux-adopted run is writing into (for log lookup)
+  storagePoolId?: string
+  storagePoolName?: string
+  offsiteTargets?: { offsiteHostId: string | null; offsitePoolId: string | null }[] // Resolved on manual triggers
   canRetry?: boolean // Whether this job can be retried
   retryOf?: string // ID of the original job if this is a retry
   supersededBy?: string // ID of the retry job that superseded this skipped record

@@ -1,6 +1,12 @@
 const path = require('path');
 const config = require('../config/config');
-const { readJSON, writeJSON } = require('./fileStorage');
+const { readJSON, writeJSON, getBackupHosts, getBackupJobs } = require('./fileStorage');
+
+// How many VMs one cause lists in the daily digest before collapsing the rest
+// into a "+N more" line, and how much of an error sentence its heading carries.
+// Both exist to keep the card scannable when a whole host is down.
+const DIGEST_ZONE_LIMIT = 12;
+const DIGEST_CAUSE_CHARS = 100;
 
 /**
  * Collapses a burst of per-VM notifications into one message per root cause.
@@ -133,62 +139,185 @@ class NotificationAggregator {
 
     this.lastDigestDate = today;
     await this.saveState();
-    return this.sendDigest();
+    return await this.sendDigest();
   }
 
-  sendDigest() {
+  /**
+   * Fill in the backup host for incidents that don't carry one.
+   *
+   * Incidents opened before backupHostId was tracked have none, and without it
+   * every one of them would pile up under "UNKNOWN HOST" in the digest. The job
+   * history knows which host each VM actually ran on, so resolve it from the
+   * most recent job for that VM. Read once per digest, not once per incident.
+   */
+  async _resolveHostIds(incidents) {
+    if (incidents.every(i => i.backupHostId)) return;
+    let jobs = [];
+    try {
+      jobs = await getBackupJobs();
+    } catch (err) {
+      console.error('[NotifAgg] Job history lookup failed:', err.message);
+      return;
+    }
+    // Latest job per VM wins — a VM moved between hosts should show where it
+    // runs now, not where it ran a year ago.
+    const latest = new Map();
+    for (const job of jobs) {
+      if (!job || !job.vmName || !job.backupHostId) continue;
+      const at = Date.parse(job.startTime || job.endTime || '') || 0;
+      const seen = latest.get(job.vmName);
+      if (!seen || at >= seen.at) latest.set(job.vmName, { at, hostId: job.backupHostId });
+    }
+    for (const incident of incidents) {
+      if (incident.backupHostId) continue;
+      const hit = latest.get(incident.subject);
+      if (hit) incident.backupHostId = hit.hostId;
+    }
+  }
+
+  /**
+   * The once-a-day summary of everything still open.
+   *
+   * Deliberately grouped by backup host, in the same fixed-width card as the
+   * daily incident board, because the two are read together: the board is
+   * tonight, this is what is still broken and for how long. The age column is
+   * the thing the board cannot show — it resets each day, while these
+   * incidents persist until the VM actually backs up.
+   *
+   * Mentions come from the 'dailyDigest' type (the Summaries section), NOT
+   * from hostMentions. That is on purpose: the board already pages the host
+   * owners the moment something breaks, and this message is a daily review,
+   * not a page.
+   */
+  async sendDigest() {
     const rocketChatService = require('./rocketChatService');
     if (!rocketChatService.isTypeEnabled('dailyDigest')) return false;
-    const open = [...this.knownFailing.entries()];
 
-    if (open.length === 0) {
+    const incidents = [...this.knownFailing.entries()].map(([key, value]) => ({
+      subject: key.split('::')[0],
+      cause: value.cause,
+      since: value.since,
+      backupHostId: value.backupHostId || null,
+    }));
+
+    const card = [];
+    if (incidents.length === 0) {
       if (!this.settings.digestWhenClear) return false;
-      rocketChatService.sendGrouped({
-        entity: 'Backup',
-        state: 'Daily Digest',
-        status: 'All Clear',
-        name: 'No open incidents',
-        details: 'No backup or offsite failures are currently open.\nThis message also confirms the notification pipeline is working.',
-      });
-      console.log('[NotifAgg] Daily digest sent: all clear');
-      return true;
+      card.push('✅ BACKUP DIGEST — ALL CLEAR');
+      card.push('');
+      card.push('No backup or offsite failures are open.');
+      card.push(`Reported ${this._hhmm(new Date())} · this message also confirms notifications are working.`);
+    } else {
+      await this._resolveHostIds(incidents);
+
+      let hosts = [];
+      try {
+        hosts = await getBackupHosts();
+      } catch (err) {
+        console.error('[NotifAgg] Backup host lookup failed:', err.message);
+      }
+      const hostName = (id) => {
+        const host = id && hosts.find(h => h && h.id === id);
+        return host ? host.name : null;
+      };
+
+      // One VM failing for two causes is ONE failing VM. The old header added
+      // the per-cause counts together and reported 22 for 15 machines.
+      const distinctVms = new Set(incidents.map(i => i.subject));
+      const oldest = incidents.reduce(
+        (acc, i) => (Date.parse(i.since) < Date.parse(acc) ? i.since : acc),
+        incidents[0].since
+      );
+
+      const zones = new Map();
+      for (const incident of incidents) {
+        const zoneKey = incident.backupHostId || '';
+        if (!zones.has(zoneKey)) {
+          zones.set(zoneKey, {
+            label: (hostName(incident.backupHostId) || 'UNKNOWN HOST').toUpperCase(),
+            incidents: [],
+          });
+        }
+        zones.get(zoneKey).incidents.push(incident);
+      }
+      // Worst zone first, so the host needing attention is at the top.
+      const zoneList = [...zones.values()].sort((a, b) => b.incidents.length - a.incidents.length);
+
+      card.push(`📋 BACKUP DIGEST — ${distinctVms.size} VM${distinctVms.size === 1 ? '' : 's'} STILL FAILING`);
+      card.push('');
+      card.push(`🔴 ${distinctVms.size} failing · ${zoneList.length} zone${zoneList.length === 1 ? '' : 's'} · oldest open ${this._ageInDays(oldest)}`);
+      card.push(`Reported ${this._hhmm(new Date())} · everything still open, not just today`);
+
+      for (const zone of zoneList) {
+        card.push('');
+        card.push(zone.label);
+
+        // Within a zone, group by cause. Printing the cause on every VM line
+        // repeated the same error sentence fifteen times and buried the VM
+        // names; as a sub-heading it is stated once and the machines under it
+        // read as a list.
+        const byCause = new Map();
+        for (const incident of zone.incidents) {
+          if (!byCause.has(incident.cause)) byCause.set(incident.cause, []);
+          byCause.get(incident.cause).push(incident);
+        }
+        const causeList = [...byCause.entries()].sort((a, b) => b[1].length - a[1].length);
+
+        for (const [cause, group] of causeList) {
+          // Oldest first: the longest-broken VM has been ignored longest.
+          group.sort((a, b) => Date.parse(a.since) - Date.parse(b.since));
+          const oldestHere = group[0].since;
+          card.push(`🔴 ${this._shortCause(cause)}`);
+          card.push(`   ${group.length} VM${group.length === 1 ? '' : 's'} · oldest ${this._ageInDays(oldestHere)}`);
+          for (const incident of group.slice(0, DIGEST_ZONE_LIMIT)) {
+            card.push(`   ${incident.subject}  (${this._ageInDays(incident.since)})`);
+          }
+          const more = group.length - DIGEST_ZONE_LIMIT;
+          if (more > 0) card.push(`   +${more} more`);
+        }
+      }
     }
 
-    // Re-group the open incidents by cause so the digest reads as a list of
-    // problems, not a list of VMs.
-    const byCause = new Map();
-    for (const [key, value] of open) {
-      const subject = key.split('::')[0];
-      if (!byCause.has(value.cause)) byCause.set(value.cause, { subjects: [], oldest: value.since });
-      const entry = byCause.get(value.cause);
-      entry.subjects.push(subject);
-      if (new Date(value.since) < new Date(entry.oldest)) entry.oldest = value.since;
-    }
+    card.push('');
+    card.push(`🤖 ${rocketChatService.entity || 'Backup Manager'}`);
 
-    const ageInDays = (iso) => {
-      const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
-      return days >= 1 ? `${days}d` : '<1d';
-    };
-
+    // Same shape as the incident board: mentions outside the fence (inside it
+    // they render as literal text and notify nobody), card inside.
     const lines = [];
-    const sorted = [...byCause.entries()].sort((a, b) => b[1].subjects.length - a[1].subjects.length);
-    for (const [cause, entry] of sorted) {
-      const shown = entry.subjects.slice(0, 8);
-      const more = entry.subjects.length - shown.length;
-      lines.push(`• ${cause}`);
-      lines.push(`   ${entry.subjects.length} VM${entry.subjects.length === 1 ? '' : 's'}, open ${ageInDays(entry.oldest)} — ${shown.join(', ')}${more > 0 ? ` (+${more} more)` : ''}`);
+    const mentioned = (rocketChatService.mentionsForType('dailyDigest') || [])
+      .map(m => String(m).trim().replace(/^@+/, ''))
+      .filter(Boolean);
+    if (mentioned.length > 0) {
+      lines.push(mentioned.map(m => `@${m}`).join(' '));
+      lines.push('');
     }
+    lines.push('```');
+    lines.push(...card);
+    lines.push('```');
 
-    rocketChatService.sendGrouped({
-      entity: 'Backup',
-      state: 'Daily Digest',
-      status: `${open.length} Still Failing`,
-      name: `${byCause.size} open incident${byCause.size === 1 ? '' : 's'}`,
-      details: lines.join('\n'),
-    });
-
-    console.log(`[NotifAgg] Daily digest sent: ${open.length} open across ${byCause.size} cause(s)`);
+    await rocketChatService.sendMessage(lines.join('\n'));
+    console.log(
+      incidents.length === 0
+        ? '[NotifAgg] Daily digest sent: all clear'
+        : `[NotifAgg] Daily digest sent: ${incidents.length} open incident(s)`
+    );
     return true;
+  }
+
+  /** Causes are whole error sentences; a zone line has room for the gist. */
+  _shortCause(cause) {
+    const text = String(cause || 'unknown error').replace(/\s+/g, ' ').trim();
+    return text.length > DIGEST_CAUSE_CHARS ? `${text.slice(0, DIGEST_CAUSE_CHARS - 1)}…` : text;
+  }
+
+  _ageInDays(iso) {
+    const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+    return days >= 1 ? `${days}d` : '<1d';
+  }
+
+  _hhmm(date) {
+    const d = new Date(date);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
   }
 
   async loadState() {
@@ -301,6 +430,7 @@ class NotificationAggregator {
         // Same VM, same fault, still broken.
         known.count = (known.count || 1) + 1;
         known.lastAt = new Date().toISOString();
+        if (ev.backupHostId && !known.backupHostId) known.backupHostId = ev.backupHostId;
 
         // Announce again once the re-notify interval has passed, so a fault
         // that keeps recurring keeps being reported — daily by default rather
@@ -328,6 +458,11 @@ class NotificationAggregator {
           lastAt: new Date().toISOString(),
           lastAnnouncedAt: new Date().toISOString(),
           count: 1,
+          // Which backup host this VM lives on, so the daily digest can group
+          // by zone the way the incident board does. Incidents opened before
+          // this field existed are backfilled from the job history at render
+          // time — see _resolveHostIds().
+          backupHostId: ev.backupHostId || null,
         });
         this.saveState().catch(() => {});
       }

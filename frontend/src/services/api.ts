@@ -312,7 +312,15 @@ export const offsiteJobsApi = {
   // Start a sync for one VM. The controller coalesces: if a sync for this VM
   // is already queued or running it answers 200 with that job instead of
   // creating a second one.
-  create: (data: { vmId: string; scheduleId?: string | null }) => api.post('/offsite-jobs', data),
+  // `offsiteTargets` lets a backup with no offsite schedule be sent somewhere
+  // anyway; they are merged with whatever the VM's schedules replicate to.
+  create: (data: {
+    vmId: string
+    scheduleId?: string | null
+    offsiteTargets?: { offsiteHostId: string; offsitePoolId: string }[]
+    storagePoolId?: string | null
+    triggeredByJobId?: string | null
+  }) => api.post('/offsite-jobs', data),
   // `resetSourceGuard` re-records the source-filesystem baseline instead of
   // refusing. It disarms the check that stops an unmounted pool from deleting
   // the offsite copies, so it is only ever correct for a pool that has

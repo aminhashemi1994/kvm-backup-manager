@@ -76,12 +76,27 @@ export function useOffsiteJobLog(id: string | null, isActive = false) {
 export function useTriggerOffsiteSync() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: async (data: { vmId: string; scheduleId?: string | null; vmName?: string }) => {
-      const res = await offsiteJobsApi.create({ vmId: data.vmId, scheduleId: data.scheduleId ?? null })
+    mutationFn: async (data: {
+      vmId: string
+      scheduleId?: string | null
+      vmName?: string
+      offsiteTargets?: { offsiteHostId: string; offsitePoolId: string }[]
+      storagePoolId?: string | null
+      triggeredByJobId?: string | null
+    }) => {
+      const res = await offsiteJobsApi.create({
+        vmId: data.vmId,
+        scheduleId: data.scheduleId ?? null,
+        offsiteTargets: data.offsiteTargets,
+        storagePoolId: data.storagePoolId ?? null,
+        triggeredByJobId: data.triggeredByJobId ?? null,
+      })
       return { ...res.data, vmName: data.vmName, httpStatus: res.status }
     },
     onSuccess: (data: any) => {
       queryClient.invalidateQueries({ queryKey: ['offsite-jobs'] })
+      // A VM synced by hand joins the replication panel from now on.
+      queryClient.invalidateQueries({ queryKey: ['offsite-check'] })
       const name = data.vmName ? ` for ${data.vmName}` : ''
       if (data.note) {
         // The controller coalesced onto an existing sync. That is the correct
