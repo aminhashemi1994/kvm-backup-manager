@@ -1697,6 +1697,14 @@ router.post('/jobs/:id/update', async (req, res, next) => {
         scheduleId: job.scheduleId || null,
         trigger: 'backup',
         triggeredByJobId: job.id,
+        // A manual or one-off backup's offsite choice lives on the job, not on
+        // any schedule. Without passing it here, a VM with no offsite-enabled
+        // schedule resolved to "no target" and its backup never left the host.
+        // Scheduled jobs are left to their schedule: their copied targets are
+        // resolved without the offsite on/off switch, so passing them would
+        // resurrect replication the operator had turned off.
+        offsiteTargets: job.scheduleId ? null : (job.offsiteTargets || null),
+        storagePoolId: job.storagePoolId || null,
       }).then(result => {
         if (result.created) {
           console.log(`[Backups] Offsite sync queued for ${job.vmName} after job ${job.id}`);

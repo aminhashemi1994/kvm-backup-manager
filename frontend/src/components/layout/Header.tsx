@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Settings, User, LogOut, Search, Command, PanelLeftClose, PanelLeft, Sun, Moon } from 'lucide-react'
+import { Settings, User, LogOut, Search, Command, PanelLeftClose, PanelLeft, Sun, Moon, Info } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useSocket } from '@/hooks/useSocket'
 import { useAuth } from '@/contexts/AuthContext'
@@ -113,6 +113,10 @@ export default function Header() {
             <DropdownMenuItem onClick={() => navigate('/settings')}>
               <Settings className="mr-2 h-4 w-4" />
               Settings
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => navigate('/about')}>
+              <Info className="mr-2 h-4 w-4" />
+              About
             </DropdownMenuItem>
             <DropdownMenuItem onClick={logout} className="text-red-600">
               <LogOut className="mr-2 h-4 w-4" />

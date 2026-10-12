@@ -19,6 +19,7 @@ import StoragePoolsPage from './pages/StoragePoolsPage'
 import CleanupPage from './pages/CleanupPage'
 import OffsiteSyncPage from './pages/OffsiteSyncPage'
 import SettingsPage from './pages/SettingsPage'
+import AboutPage from './pages/AboutPage'
 import { useHealthCheckOnMount } from './hooks/useHealthCheck'
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
@@ -200,6 +201,16 @@ function AppRoutes() {
           <PrivateRoute>
             <Layout>
               <SettingsPage />
+            </Layout>
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/about"
+        element={
+          <PrivateRoute>
+            <Layout>
+              <AboutPage />
             </Layout>
           </PrivateRoute>
         }

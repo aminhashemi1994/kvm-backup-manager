@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   LayoutDashboard, Server, HardDrive, Calendar, Activity,
   History, FileText, Cpu, Settings, Users, Shield, Search,
-  Database, ArrowRightLeft, Trash2, Bell
+  Database, ArrowRightLeft, Trash2, Bell, Info
 } from 'lucide-react'
 
 interface CommandItem {
@@ -42,6 +42,7 @@ export default function CommandPalette() {
     { id: 'settings', label: 'Settings', icon: <Settings className="h-4 w-4" />, action: () => navigate('/settings'), keywords: ['config', 'preferences', 'notifications'] },
     { id: 'users', label: 'User Management', icon: <Users className="h-4 w-4" />, action: () => navigate('/settings/users'), keywords: ['rbac', 'roles', 'access'] },
     { id: 'audit', label: 'Audit Log', icon: <Shield className="h-4 w-4" />, action: () => navigate('/settings/audit'), keywords: ['trail', 'history', 'security'] },
+    { id: 'about', label: 'About', icon: <Info className="h-4 w-4" />, action: () => navigate('/about'), keywords: ['author', 'version', 'credits', 'license', 'contact'] },
   ]
 
   const filtered = query.trim()

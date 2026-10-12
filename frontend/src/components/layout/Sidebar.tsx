@@ -16,6 +16,7 @@ import {
   Users,
   Shield,
   Bell,
+  Info,
   ChevronDown
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -79,6 +80,7 @@ const navGroups: NavGroup[] = [
       { name: 'Users & Access', to: '/settings/users', icon: Users },
       { name: 'Audit Log', to: '/settings/audit', icon: Shield },
       { name: 'Notifications', to: '/settings/notifications', icon: Bell },
+      { name: 'About', to: '/about', icon: Info },
     ],
   },
 ]
@@ -174,17 +176,12 @@ export default function Sidebar() {
           <p className="text-[10px] text-gray-400 dark:text-gray-500">
             {version ? `v${version.version}` : 'v…'} • Open Source
           </p>
-          <p className="text-[10px] text-gray-400 dark:text-gray-500 mt-1.5 pt-1.5 border-t border-gray-200/40 dark:border-gray-700/40">
-            Built by{' '}
-            <a
-              href="https://www.linkedin.com/in/amin-hashemi-2955061bb"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-blue-500 hover:text-blue-600 hover:underline transition-colors"
-            >
-              Mohammad Amin Hashemi
-            </a>
-          </p>
+          <NavLink
+            to="/about"
+            className="block text-[10px] text-blue-500 hover:text-blue-600 hover:underline transition-colors mt-1.5 pt-1.5 border-t border-gray-200/40 dark:border-gray-700/40"
+          >
+            About this project
+          </NavLink>
         </div>
       </div>
     </aside>

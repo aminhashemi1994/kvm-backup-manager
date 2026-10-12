@@ -23,13 +23,14 @@ export function useActiveBackups() {
   })
 }
 
-export function useBackupHistory(params?: any) {
+export function useBackupHistory(params?: any, options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: ['backups', 'history', params],
     queryFn: async () => {
       const response = await backupsApi.getHistory(params)
       return response.data.data as BackupJob[]
     },
+    enabled: options?.enabled ?? true,
   })
 }
 

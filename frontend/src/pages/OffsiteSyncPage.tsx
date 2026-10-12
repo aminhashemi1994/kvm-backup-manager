@@ -1,6 +1,8 @@
-import { useMemo } from 'react'
-import { ArrowRightLeft, Loader2 } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { ArrowRightLeft, Loader2, UploadCloud } from 'lucide-react'
 import ReplicationCheckPanel from '@/components/offsite/ReplicationCheckPanel'
+import ManualOffsiteSyncDialog from '@/components/offsite/ManualOffsiteSyncDialog'
+import { Button } from '@/components/ui/button'
 import { Link } from 'react-router-dom'
 import { useActiveOffsiteJobs, useOffsiteJobEvents } from '@/hooks/useOffsiteJobs'
 
@@ -17,6 +19,7 @@ export default function OffsiteSyncPage() {
   useOffsiteJobEvents()
 
   const { data: active } = useActiveOffsiteJobs()
+  const [syncOpen, setSyncOpen] = useState(false)
 
   const runningLabel = useMemo(() => {
     if (!active || active.length === 0) return null
@@ -45,15 +48,22 @@ export default function OffsiteSyncPage() {
             they finish.
           </p>
         </div>
+        <div className="flex items-center gap-2 flex-wrap">
         {runningLabel && (
           <div className="flex items-center gap-2 text-sm text-purple-700 dark:text-purple-300 bg-purple-100 dark:bg-purple-950/50 border border-purple-200 dark:border-purple-800 rounded-xl px-3 py-2">
             <Loader2 className="h-4 w-4 animate-spin" />
             {runningLabel}
           </div>
         )}
+          <Button onClick={() => setSyncOpen(true)}>
+            <UploadCloud className="h-4 w-4 mr-2" />
+            Sync a backup
+          </Button>
+        </div>
       </div>
 
       <ReplicationCheckPanel />
+      <ManualOffsiteSyncDialog open={syncOpen} onOpenChange={setSyncOpen} />
     </div>
   )
 }

@@ -347,8 +347,13 @@ tbody tr:hover {
 
 /* ─── Responsive layout helpers ─────────────────────────────────────────── */
 
-/* Make all tables horizontally scrollable on mobile */
-table {
+/* Make all tables horizontally scrollable on mobile.
+   Fixed-layout tables are excluded: they size to their container and
+   truncate cell content on purpose. Firefox resolves max-content on a
+   fixed-layout table from the full, untruncated cell text, which pushed
+   the Progress/Actions columns of the job tables out of the scroll
+   container (Chrome resolved it to the container width). */
+table:not(.table-fixed) {
   min-width: max-content;
 }
 
