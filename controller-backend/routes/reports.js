@@ -1,7 +1,42 @@
 const express = require('express');
 const router = express.Router();
 const agentService = require('../services/agentService');
-const { getBackupHosts } = require('../services/fileStorage');
+const { getBackupHosts, getVirtualMachines, getBackupSchedules } = require('../services/fileStorage');
+const { toAgentScheduleType } = require('../services/scheduleAdherenceService');
+
+/**
+ * Tag each reported VM with the state of its controller schedules, keyed by
+ * the agent's schedule directory (daily/weekly/monthly/custom/once):
+ * 'active' when any matching schedule is enabled, 'disabled' when they all are
+ * off. A directory with no matching schedule is left out, which the UI reads
+ * as "no schedule". Without this, a VM whose schedule was switched off or
+ * removed just showed its backups ageing into "Stale" with no explanation.
+ */
+async function annotateScheduleStates(report, hostId) {
+  if (!report || !Array.isArray(report.vms)) return report;
+  let vms, schedules;
+  try {
+    [vms, schedules] = await Promise.all([getVirtualMachines(), getBackupSchedules()]);
+  } catch (err) {
+    console.error(`[Reports] Schedule lookup failed: ${err.message}`);
+    return report;
+  }
+  return {
+    ...report,
+    vms: report.vms.map(vmReport => {
+      const vm = (vms || []).find(v => v.name === vmReport.vm_name && v.backupHostId === hostId)
+        || (vms || []).find(v => v.name === vmReport.vm_name);
+      const states = {};
+      for (const s of (schedules || [])) {
+        if (!vm || s.vmId !== vm.id) continue;
+        const key = toAgentScheduleType(s.scheduleType);
+        if (s.enabled !== false) states[key] = 'active';
+        else if (!states[key]) states[key] = 'disabled';
+      }
+      return { ...vmReport, vmId: vm ? vm.id : null, scheduleStates: states };
+    }),
+  };
+}
 
 // GET /api/reports/:backupHostId - Get backup report for a specific backup host
 router.get('/:backupHostId', async (req, res, next) => {
@@ -24,7 +59,7 @@ router.get('/:backupHostId', async (req, res, next) => {
         res.json({
           success: true,
           data: {
-            ...result.data,
+            ...(await annotateScheduleStates(result.data, host.id)),
             backupHostId: host.id,
             backupHostName: host.name,
             backupHostUrl: host.url

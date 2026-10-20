@@ -185,6 +185,27 @@ export default function ScheduleForm({ schedule, onClose }: ScheduleFormProps) {
     )
   }, [vms, vmSearchQuery])
 
+  // A schedule saved before an offsite host or pool was deleted/re-added still
+  // carries the old ids. They don't appear in the picker (so they can't be
+  // unticked) but were submitted anyway and rejected as "not found". Drop any
+  // selection that no longer resolves against the current list.
+  useEffect(() => {
+    if (!Array.isArray(offsiteHosts)) return
+    setFormData(prev => {
+      const known = new Map((offsiteHosts as any[]).map((h: any) => [h.id, h]))
+      const nextHostIds = prev.offsiteHostIds.filter(id => known.has(id))
+      const nextPools: Record<string, string> = {}
+      for (const id of nextHostIds) {
+        const poolId = prev.offsitePoolByHost[id]
+        const pools: any[] = known.get(id)?.storagePools || []
+        if (poolId && pools.some((p: any) => p.id === poolId)) nextPools[id] = poolId
+      }
+      const unchanged = nextHostIds.length === prev.offsiteHostIds.length &&
+        Object.keys(nextPools).length === Object.keys(prev.offsitePoolByHost).length
+      return unchanged ? prev : { ...prev, offsiteHostIds: nextHostIds, offsitePoolByHost: nextPools }
+    })
+  }, [offsiteHosts, formData.offsiteHostIds, formData.offsitePoolByHost])
+
   const handleOffsiteHostToggle = (hostId: string) => {
     setFormData(prev => {
       const isChecked = prev.offsiteHostIds.includes(hostId)

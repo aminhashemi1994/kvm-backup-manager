@@ -38,15 +38,23 @@ function install_virtnbdbackup {
 		source /etc/os-release
 		echo "virtnbdbackup package status : Not Installed"
 
-		# Check if virtnbdbackup directory exists
+		# Extract bundled virtnbdbackup sources (resolved relative to this script, not a fixed install path)
+		VIRTNBD_TAR="${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup.tar"
+		if [[ ! -d "${VIRTNBD_DIR}" ]]; then
+			if [[ ! -f "${VIRTNBD_TAR}" ]]; then
+				echo -e "${Red}${CROSS}virtnbdbackup archive not found at ${VIRTNBD_TAR}${NC}"
+				exit 1
+			fi
+			mkdir -p "${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup"
+			if ! tar -xf "${VIRTNBD_TAR}" -C "${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup"; then
+				echo -e "${Red}${CROSS}Failed to extract ${VIRTNBD_TAR}${NC}"
+				exit 1
+			fi
+		fi
 		if [[ ! -d "${VIRTNBD_DIR}" ]]; then
 			echo -e "${Red}${CROSS}virtnbdbackup directory not found at ${VIRTNBD_DIR}${NC}"
-			echo -e "${Yellow}Please ensure virtnbdbackup directory is located in agent-backend/virtnbdbackup/.${NC}"
 			exit 1
 		fi
-		mkdir -p /opt/backup-manager/agent-backend/scripts/../virtnbdbackup/virtnbdbackup
-		tar -xf /opt/backup-manager/agent-backend/scripts/../virtnbdbackup/virtnbdbackup.tar \
-			-C /opt/backup-manager/agent-backend/scripts/../virtnbdbackup/virtnbdbackup
 		# Check Debian version compatibility
 		[[ $VERSION_ID -eq "10" ]] && echo "Debian Version is 10 (Buster) Does not support Virtnbd Backup Feature" && exit 1
 
@@ -57,7 +65,9 @@ function install_virtnbdbackup {
 		echo -e "\nPlease Wait ...⏳"
 
 		# Determine pip packages based on Debian version
-		if [[ $VERSION_ID -eq "12" ]]; then
+		# Debian 12+ marks the system python as externally managed (PEP 668)
+		[[ ${VERSION_ID%%.*} -ge 12 ]] && force_install="--break-system-packages"
+		if [[ ${VERSION_ID%%.*} -ge 12 ]]; then
 			pip_list=$(cat ${VIRTNBD_DIR}/pip_files/deb12_packages.txt)
 		else
 			pip_list=$(cat ${VIRTNBD_DIR}/pip_files/package_list.txt)
@@ -66,14 +76,18 @@ function install_virtnbdbackup {
 		# Install pip packages
 		for list in ${pip_list[@]}; do
 			echo -e "${Green}Installing $list, Please Wait ...⏳"
-			pip3 install $force_install --no-index ${VIRTNBD_DIR}/pip_files/$list
+			if ! pip3 install $force_install --no-index ${VIRTNBD_DIR}/pip_files/$list; then
+				echo -e "${Red}${CROSS}Failed to install $list${NC}"
+				cd $current_dir
+				exit 1
+			fi
 			echo -e "${Green}$list [OK]${CHECK}${NC}"
 		done
 
 		# Install virtnbdbackup
 
 		cd ${VIRTNBD_DIR}/
-		if ! python3 setup.py install &>/dev/null; then
+		if ! python3 setup.py install &>/dev/null && ! pip3 install $force_install --no-index --no-build-isolation . &>/dev/null; then
 			echo -e "${Red}${CROSS}Failed to install virtnbdbackup ${NC}"
 			cd $current_dir
 			exit 1
@@ -100,7 +114,14 @@ function install_virtnbdbackup {
 }
 function main() {
 	apt_update_repo_check
-	packages=(python3-paramiko bc libncurses5 nfs-common rsync python3-pip python3-all python3-stdeb dh-python python3-libnbd python3-tqdm python3-lz4 python3-lxml nbdkit libnbd-bin tmux)
+	source /etc/os-release
+	# libncurses5 was dropped in Debian 13 (trixie); libtinfo6/libncurses6 replace it
+	if [[ ${VERSION_ID%%.*} -ge 13 ]]; then
+		ncurses_pkgs=(libtinfo6 libncurses6)
+	else
+		ncurses_pkgs=(libncurses5)
+	fi
+	packages=(python3-paramiko bc "${ncurses_pkgs[@]}" nfs-common rsync python3-pip python3-all python3-stdeb dh-python python3-libnbd python3-tqdm python3-lz4 python3-lxml nbdkit libnbd-bin tmux)
 	for package in "${packages[@]}"; do
 		if [[ "$package" == "openvswitch-switch" ]] && dpkg -s "$package" &>/dev/null; then
 			echo -e "${Green}$package [Installed - Skipping Upgrade]${CHECK}${NC}"

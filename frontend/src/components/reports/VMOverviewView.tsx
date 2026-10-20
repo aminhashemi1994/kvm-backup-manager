@@ -10,7 +10,7 @@ interface VMOverviewViewProps {
   staleAfterDays?: number
 }
 
-type Freshness = 'today' | 'yesterday' | 'recent' | 'stale' | 'never' | 'archived' | 'legacy'
+type Freshness = 'today' | 'yesterday' | 'recent' | 'stale' | 'never' | 'archived' | 'legacy' | 'disabled' | 'unscheduled'
 type SortField = 'vm_name' | 'schedule' | 'last_backup' | 'method' | 'size'
 type SortDirection = 'asc' | 'desc'
 
@@ -94,6 +94,23 @@ const freshnessStyle: Record<Freshness, { badge: string; border: string; label: 
   archived: { badge: 'bg-gray-100 text-gray-700 border-gray-300', border: 'border-l-gray-400', label: 'Archived' },
   // Old-format backups in the VM's `current/` directory: frozen leftovers, not a live schedule.
   legacy: { badge: 'bg-slate-100 text-slate-700 border-slate-300', border: 'border-l-slate-400', label: 'Legacy' },
+  // The controller schedule behind these backups is switched off or was removed,
+  // so they are expected to age — say why rather than flagging them as stale.
+  disabled: { badge: 'bg-gray-100 text-gray-600 border-gray-300', border: 'border-l-gray-400', label: 'Schedule disabled' },
+  unscheduled: { badge: 'bg-gray-100 text-gray-600 border-gray-300', border: 'border-l-gray-400', label: 'No schedule' },
+}
+
+/**
+ * Freshness for a schedule the controller no longer runs. Only applies when the
+ * report carries scheduleStates (the controller annotates it) and only to
+ * recurring schedules; 'once' backups are expected not to repeat.
+ */
+const inactiveScheduleFreshness = (vm: any, schedule: string): Freshness | null => {
+  const states = vm?.scheduleStates
+  if (!states || typeof states !== 'object' || schedule === 'once') return null
+  const state = states[schedule]
+  if (state === 'active') return null
+  return state === 'disabled' ? 'disabled' : 'unscheduled'
 }
 
 // Matches the schedule colors used on the Backup Management page.
@@ -193,7 +210,9 @@ const buildRows = (vms: any[], staleAfterDays: number): OverviewRow[] => {
         sizeLabel: schedule.disk_usage_gb || formatBytes(schedule.disk_usage_bytes || 0),
         // Archived backups are kept copies, not part of the daily rotation,
         // so they get their own status instead of counting as stale.
-        freshness: isArchived ? 'archived' : isLegacy ? 'legacy' : getFreshness(lastBackup, staleAfterDays),
+        freshness: isArchived ? 'archived' : isLegacy ? 'legacy'
+          : inactiveScheduleFreshness(vm, String(schedule.schedule || '').trim().toLowerCase())
+            ?? getFreshness(lastBackup, staleAfterDays),
         hasBackup: !!lastBackup,
         isArchived,
         isLegacy,
@@ -260,7 +279,7 @@ export default function VMOverviewView({ vms, staleAfterDays = 7 }: VMOverviewVi
   }, [allRows, search, methodFilter, scheduleFilter])
 
   const counts = useMemo(() => {
-    const base = { all: rows.length, today: 0, yesterday: 0, recent: 0, stale: 0, never: 0, archived: 0, legacy: 0, corrupted: 0 }
+    const base = { all: rows.length, today: 0, yesterday: 0, recent: 0, stale: 0, never: 0, archived: 0, legacy: 0, disabled: 0, unscheduled: 0, corrupted: 0 }
     rows.forEach((row) => {
       base[row.freshness] += 1
       if (row.corrupted) base.corrupted += 1
@@ -271,7 +290,8 @@ export default function VMOverviewView({ vms, staleAfterDays = 7 }: VMOverviewVi
   // A VM counts as backed up today if any of its schedules ran today.
   const vmFreshness = useMemo(() => {
     const byVM = new Map<string, boolean>()
-    rows.filter((row) => !row.isArchived && !row.isLegacy).forEach((row) => {
+    // Rows whose schedule is off are not expected to back up, so they don't count as missing.
+    rows.filter((row) => !row.isArchived && !row.isLegacy && row.freshness !== 'disabled' && row.freshness !== 'unscheduled').forEach((row) => {
       byVM.set(row.vmName, (byVM.get(row.vmName) ?? false) || row.freshness === 'today')
     })
     let backedUpToday = 0
@@ -460,6 +480,12 @@ export default function VMOverviewView({ vms, staleAfterDays = 7 }: VMOverviewVi
         )}
         {counts.legacy > 0 && (
           <FilterChip id="legacy" label="Legacy" count={counts.legacy} className="text-slate-700" />
+        )}
+        {counts.disabled > 0 && (
+          <FilterChip id="disabled" label="Schedule disabled" count={counts.disabled} className="text-gray-700" />
+        )}
+        {counts.unscheduled > 0 && (
+          <FilterChip id="unscheduled" label="No schedule" count={counts.unscheduled} className="text-gray-700" />
         )}
         <FilterChip id="corrupted" label="Corrupted" count={counts.corrupted} className="text-red-700" />
       </div>
