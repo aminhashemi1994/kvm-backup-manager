@@ -65,6 +65,9 @@ const CONCURRENCY = 3;
  */
 function replicationEnabled(schedule) {
   if (!schedule) return false;
+  // A disabled schedule produces no new backups, so its offsite copy falling
+  // behind is expected, not an incident.
+  if (schedule.enabled === false) return false;
   if (schedule.offsiteEnabled === false) return false;
   if (schedule.syncToOffsite === false) return false;
   const targets = Array.isArray(schedule.offsiteTargets) ? schedule.offsiteTargets : [];
@@ -311,7 +314,8 @@ class ReplicationCheckService {
       // off AND it still has somewhere to send to. See replicationEnabled().
       // Or it was synced by hand ("Sync a backup"), which counts too.
       const vmSchedules = schedules.filter(s => replicationEnabled(s) && s.vmId === vm.id);
-      if (vmSchedules.length === 0 && !manual.has(vm.id)) continue;
+      const hasEnabledSchedule = schedules.some(s => s.vmId === vm.id && s.enabled !== false);
+      if (vmSchedules.length === 0 && !(manual.has(vm.id) && hasEnabledSchedule)) continue;
 
       // Reuse the job service's resolution so the check and the sync can never
       // disagree about which targets a VM has.
@@ -682,7 +686,11 @@ class ReplicationCheckService {
   async _replicatedVmIds(schedules) {
     const ids = new Set(schedules.filter(replicationEnabled).map(s => s.vmId));
     try {
-      for (const vmId of (await offsiteJobService.manualReplicas()).keys()) ids.add(vmId);
+      // A hand-synced VM stops counting once none of its schedules is enabled.
+      const active = new Set(schedules.filter(s => s.enabled !== false).map(s => s.vmId));
+      for (const vmId of (await offsiteJobService.manualReplicas()).keys()) {
+        if (active.has(vmId)) ids.add(vmId);
+      }
     } catch (err) {
       console.error(`[ReplicationCheck] Could not read manual replicas: ${err.message}`);
     }

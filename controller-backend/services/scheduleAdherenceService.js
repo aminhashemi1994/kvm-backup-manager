@@ -424,4 +424,4 @@ async function getMissedBackups(opts = {}) {
   };
 }
 
-module.exports = { getMissedBackups };
+module.exports = { getMissedBackups, toAgentScheduleType };

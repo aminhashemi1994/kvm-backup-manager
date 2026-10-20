@@ -1,6 +1,6 @@
 const path = require('path');
 const config = require('../config/config');
-const { readJSON, writeJSON, getBackupHosts, getBackupJobs } = require('./fileStorage');
+const { readJSON, writeJSON, getBackupHosts, getBackupJobs, getVirtualMachines, getBackupSchedules } = require('./fileStorage');
 
 // How many VMs one cause lists in the daily digest before collapsing the rest
 // into a "+N more" line, and how much of an error sentence its heading carries.
@@ -176,6 +176,39 @@ class NotificationAggregator {
   }
 
   /**
+   * Close incidents for VMs that will never back up again.
+   *
+   * An incident only closes on a successful backup, so a VM whose schedules
+   * were disabled or removed — or that was deleted outright — stayed "failing"
+   * in the digest forever, its age growing every day. Those are not failures
+   * anyone needs to act on. Leaves state alone if the lookup fails.
+   */
+  async _pruneInactive() {
+    if (this.knownFailing.size === 0) return;
+    let vms, schedules;
+    try {
+      [vms, schedules] = await Promise.all([getVirtualMachines(), getBackupSchedules()]);
+    } catch (err) {
+      console.error('[NotifAgg] VM/schedule lookup failed:', err.message);
+      return;
+    }
+    const activeVmIds = new Set((schedules || []).filter(s => s && s.enabled !== false).map(s => s.vmId));
+    const activeNames = new Set((vms || []).filter(v => v && activeVmIds.has(v.id)).map(v => v.name));
+
+    let pruned = 0;
+    for (const key of [...this.knownFailing.keys()]) {
+      if (!activeNames.has(key.split('::')[0])) {
+        this.knownFailing.delete(key);
+        pruned++;
+      }
+    }
+    if (pruned > 0) {
+      console.log(`[NotifAgg] Closed ${pruned} incident(s) for VMs with no enabled schedule or no longer present`);
+      await this.saveState().catch(() => {});
+    }
+  }
+
+  /**
    * The once-a-day summary of everything still open.
    *
    * Deliberately grouped by backup host, in the same fixed-width card as the
@@ -192,6 +225,8 @@ class NotificationAggregator {
   async sendDigest() {
     const rocketChatService = require('./rocketChatService');
     if (!rocketChatService.isTypeEnabled('dailyDigest')) return false;
+
+    await this._pruneInactive();
 
     const incidents = [...this.knownFailing.entries()].map(([key, value]) => ({
       subject: key.split('::')[0],

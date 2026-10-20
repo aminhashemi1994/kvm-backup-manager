@@ -577,6 +577,44 @@ router.put('/:id', requireUser, async (req, res, next) => {
     const existingSchedule = schedules[index];
     const scheduleType = req.body.scheduleType || existingSchedule.scheduleType;
 
+    // The VM and storage pool are editable too. A schedule whose backup host or
+    // hypervisor was deleted shows as "Unknown" and has to be re-pointed at a
+    // VM that still exists; likewise a schedule moved to another pool. Both
+    // used to be dropped here, so the edit "saved" but kept the old ids.
+    const vmId = req.body.vmId || existingSchedule.vmId;
+    const storagePoolId = req.body.storagePoolId || existingSchedule.storagePoolId;
+    if (vmId !== existingSchedule.vmId || storagePoolId !== existingSchedule.storagePoolId) {
+      const { getStoragePools } = require('../services/fileStorage');
+      const [allVms, allPools] = await Promise.all([getVirtualMachines(), getStoragePools()]);
+      const targetVm = allVms.find(v => v.id === vmId);
+      if (!targetVm) {
+        return res.status(400).json({ success: false, error: `Virtual machine not found: ${vmId}` });
+      }
+      const targetPool = allPools.find(p => p.id === storagePoolId);
+      if (!targetPool) {
+        return res.status(400).json({ success: false, error: `Storage pool not found: ${storagePoolId}` });
+      }
+      if (targetVm.backupHostId && targetPool.backupHostId && targetVm.backupHostId !== targetPool.backupHostId) {
+        return res.status(400).json({
+          success: false,
+          error: `Storage pool "${targetPool.name}" does not belong to the backup host of VM "${targetVm.name}"`,
+        });
+      }
+      if (vmId !== existingSchedule.vmId) {
+        const CHAIN_TYPES = ['daily', 'weekly', 'interval', 'cron', 'custom-days'];
+        const clash = CHAIN_TYPES.includes(scheduleType) && schedules.find(s =>
+          s.id !== existingSchedule.id && s.vmId === vmId &&
+          CHAIN_TYPES.includes(s.scheduleType) && s.scheduleType !== scheduleType
+        );
+        if (clash) {
+          return res.status(409).json({
+            success: false,
+            error: `VM "${targetVm.name}" already has a ${clash.scheduleType} schedule. Only one chain-based schedule (daily/weekly/interval/cron/custom-days) is allowed per VM.`,
+          });
+        }
+      }
+    }
+
     // If schedule type is changing, check for conflicts
     if (req.body.scheduleType && req.body.scheduleType !== existingSchedule.scheduleType) {
       // Controller-side conflict check: prevent changing to a chain-based
@@ -586,7 +624,7 @@ router.put('/:id', requireUser, async (req, res, next) => {
       if (CHAIN_SCHEDULE_TYPES.includes(req.body.scheduleType)) {
         const conflictingSchedule = schedules.find(s =>
           s.id !== existingSchedule.id &&
-          s.vmId === existingSchedule.vmId &&
+          s.vmId === vmId &&
           CHAIN_SCHEDULE_TYPES.includes(s.scheduleType) &&
           s.scheduleType !== req.body.scheduleType
         );
@@ -606,12 +644,12 @@ router.put('/:id', requireUser, async (req, res, next) => {
       }
 
       const vms = await getVirtualMachines();
-      const vm = vms.find(v => v.id === existingSchedule.vmId);
+      const vm = vms.find(v => v.id === vmId);
       
       if (vm) {
         const { getStoragePools, getBackupHosts } = require('../services/fileStorage');
         const pools = await getStoragePools();
-        const pool = pools.find(p => p.id === existingSchedule.storagePoolId);
+        const pool = pools.find(p => p.id === storagePoolId);
         
         if (pool) {
           const hosts = await getBackupHosts();
@@ -714,6 +752,8 @@ router.put('/:id', requireUser, async (req, res, next) => {
 
     schedules[index] = {
       ...existingSchedule,
+      vmId,
+      storagePoolId,
       name: req.body.name || existingSchedule.name,
       scheduleType,
       enabled: req.body.enabled !== undefined ? req.body.enabled : existingSchedule.enabled,

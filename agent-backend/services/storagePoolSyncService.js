@@ -253,7 +253,18 @@ class StoragePoolSyncService {
             console.error('[StoragePoolSync] Failed to notify report service:', notifyErr.message);
           }
         } else {
-          console.log(`[StoragePoolSync] Storage pools unchanged (${storagePools.length} pools)`);
+          // Same pools, but an edit (name, disk-usage threshold, ...) only shows
+          // up in the other fields. Comparing id+path alone meant those edits
+          // never reached the cache and the agent kept using the old values.
+          const settingsOf = (list) => JSON.stringify(list
+            .map(p => ({ id: p.id, name: p.name, diskUsageThreshold: p.diskUsageThreshold }))
+            .sort((a, b) => String(a.id).localeCompare(String(b.id))));
+          if (settingsOf(this.storagePools) !== settingsOf(storagePools)) {
+            console.log('[StoragePoolSync] Storage pool settings changed - updating cache');
+            this.saveStoragePools(storagePools);
+          } else {
+            console.log(`[StoragePoolSync] Storage pools unchanged (${storagePools.length} pools)`);
+          }
         }
         
         return { success: true, count: storagePools.length };
