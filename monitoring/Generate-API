@@ -1,0 +1,11 @@
+openssl rand -hex 32
+and set METRICS_TOKEN= on .env 
+then restart the controller and then sudo ./install-backup-metrics.sh on the relay host. It reads METRICS_TOKEN from controller-backend/.env, so if that file is on the same machine you don't need to pass anything. If it isn't, use --token <value>
+
+
+curl -sk -H "Authorization: Bearer <value>" https://<panel-host>/api-backup/metrics/prometheus | head
+
+# should return 401
+curl -sk -o /dev/null -w '%{http_code}\n' https://<panel-host>/api-backup/metrics/prometheus
+# should return 200
+curl -sk -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer <value>" https://<panel-host>/api-backup/metrics/prometheus

@@ -25,11 +25,11 @@ export default function StoragePoolsPage() {
 
   const isLoading = poolsLoading || hostsLoading || restorePoolsLoading
 
-  const handleSyncStoragePools = async (hostUrl: string, hostId: string, hostName: string) => {
+  const handleSyncStoragePools = async (hostId: string, hostName: string) => {
     try {
       setSyncingHosts(prev => new Set(prev).add(hostId))
       const { backupHostsApi } = await import('@/services/api')
-      await backupHostsApi.syncStoragePools(hostUrl)
+      await backupHostsApi.syncStoragePools(hostId)
       toast.success(`Storage pools synced successfully for ${hostName}`)
     } catch (error: any) {
       console.error('Failed to sync storage pools:', error)
@@ -161,7 +161,7 @@ export default function StoragePoolsPage() {
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() => handleSyncStoragePools(host.url, host.id, host.name)}
+                          onClick={() => handleSyncStoragePools(host.id, host.name)}
                           disabled={syncingHosts.has(host.id)}
                           title="Sync storage pools to agent"
                         >
@@ -236,7 +236,7 @@ export default function StoragePoolsPage() {
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() => handleSyncStoragePools(host.url, host.id, host.name)}
+                          onClick={() => handleSyncStoragePools(host.id, host.name)}
                           disabled={syncingHosts.has(host.id)}
                           title="Sync storage pools to agent"
                         >

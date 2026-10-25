@@ -165,7 +165,10 @@ class AgentService {
 
   async generateBackupReport(agentUrl) {
     const client = this.createAgentClient(agentUrl);
-    const response = await client.post('/api/report/generate');
+    // The agent replies only once generation finishes. A host with many VMs
+    // or large chains can take longer than the 5-minute default, which surfaced
+    // as a bare "status code 500" for that one host.
+    const response = await client.post('/api/report/generate', {}, { timeout: 30 * 60 * 1000 });
     return response.data;
   }
 
@@ -270,11 +273,14 @@ class AgentService {
   /**
    * Notify agent to sync storage pools
    */
-  async notifyStoragePoolSync(agentUrl) {
+  async notifyStoragePoolSync(agentUrl, backupHostId = null) {
     try {
       console.log(`[AgentService] Sending sync notification to agent: ${agentUrl}`);
       const client = this.createAgentClient(agentUrl);
-      const response = await client.post('/api/storage-pool-sync/sync');
+      // Tell the agent which backup host it is. Its own record of that is
+      // discovered once and cached, so after the backup host was re-added
+      // (new id) it kept asking for the old id's pools and got none.
+      const response = await client.post('/api/storage-pool-sync/sync', backupHostId ? { backupHostId } : {});
       console.log(`[AgentService] ✓ Agent responded:`, response.data);
       return { success: true, data: response.data };
     } catch (error) {
@@ -282,8 +288,16 @@ class AgentService {
       if (error.response) {
         console.error(`[AgentService] Response status: ${error.response.status}`);
         console.error(`[AgentService] Response data:`, error.response.data);
+        // The agent answered: surface its reason, not axios's status line.
+        const d = error.response.data || {};
+        return {
+          success: false,
+          reachable: true,
+          status: error.response.status,
+          error: (typeof d.error === 'string' && d.error) || d.message || error.message,
+        };
       }
-      return { success: false, error: error.message };
+      return { success: false, reachable: false, error: error.message };
     }
   }
 

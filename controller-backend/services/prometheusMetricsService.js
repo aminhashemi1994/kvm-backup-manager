@@ -98,6 +98,37 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'skipped', 'reject
 // Exposition-format helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * Some VM names carry a generated prefix, e.g.
+ * "20250426-123240539358103-87_cando-neobanksignoz-1-prod-site2.psg.network".
+ * Strip it so dashboards show the real name. Anchored to the
+ * "<6-8 digit date>-<digits>[-<digits>]_" shape (the date is not always
+ * zero-padded, e.g. "2025928-627898700694863_") rather than "everything before the
+ * first _", so ordinary names containing underscores are left alone. Applied
+ * to every `vm` label in emit(), so joins between metrics still line up.
+ */
+const VM_NAME_PREFIX = /^\d{6,8}-\d+(?:-\d+)?_/;
+function displayVmName(name) {
+  return String(name).replace(VM_NAME_PREFIX, '');
+}
+
+/**
+ * Backup host names read like "Backup Server Site2 (HV85)"; the short
+ * identifier in parentheses is the stable, readable one. Names without a
+ * trailing "(...)" are left alone.
+ */
+function displayHostName(name) {
+  const m = String(name).match(/\(([^()]+)\)\s*$/);
+  return m ? m[1] : String(name);
+}
+
+/** Per-label display transforms applied in MetricWriter.emit(). */
+function displayLabelValue(key, value) {
+  if (key === 'vm') return displayVmName(value);
+  if (key === 'backup_host') return displayHostName(value);
+  return value;
+}
+
 /** Escape a label VALUE per the exposition format: backslash, quote, newline. */
 function escapeLabelValue(v) {
   return String(v)
@@ -121,12 +152,13 @@ function escapeHelp(v) {
  */
 class MetricWriter {
   constructor() {
-    this.families = new Map(); // name -> { help, type, samples: [] }
+    this.families = new Map(); // name -> { help, type, samples: [], seen: Set }
+    this.duplicates = [];      // series keys dropped because they were emitted twice
   }
 
   family(name, type, help) {
     if (!this.families.has(name)) {
-      this.families.set(name, { help, type, samples: [] });
+      this.families.set(name, { help, type, samples: [], seen: new Set() });
     }
     return this.families.get(name);
   }
@@ -148,11 +180,19 @@ class MetricWriter {
     const fam = this.family(name, type, help);
     const pairs = Object.entries(labels || {})
       .filter(([, v]) => v !== undefined && v !== null && v !== '')
-      .map(([k, v]) => `${k}="${escapeLabelValue(v)}"`);
+      .map(([k, v]) => `${k}="${escapeLabelValue(displayLabelValue(k, v))}"`);
 
-    fam.samples.push(
-      pairs.length > 0 ? `${name}{${pairs.join(',')}} ${num}` : `${name} ${num}`
-    );
+    // The same name+labels twice is invalid exposition: Prometheus rejects the
+    // duplicate sample and may fail the whole scrape. It means two records in
+    // the data collapse to one label set (e.g. one hypervisor registered under
+    // two backup hosts). Keep the first, drop the rest, and report it.
+    const series = pairs.length > 0 ? `${name}{${pairs.join(',')}}` : name;
+    if (fam.seen.has(series)) {
+      this.duplicates.push(series);
+      return;
+    }
+    fam.seen.add(series);
+    fam.samples.push(`${series} ${num}`);
   }
 
   gauge(name, labels, value, help) {
@@ -425,8 +465,21 @@ class PrometheusMetricsService {
       'Time the controller spent building this /metrics response.');
     w.gauge(`${NS}_snapshot_age_seconds`, {}, (Date.now() - this.snapshotAt) / 1000,
       'Age of the cached data snapshot this response was rendered from.');
+    w.gauge(`${NS}_scrape_duplicate_series_dropped`, {}, w.duplicates.length,
+      'Series left out of this response because the data produced the same label set twice. Should be 0; above 0 means duplicate records in the data.');
+    this.warnAboutDuplicates(w.duplicates);
 
     return w.render();
+  }
+
+  /** Log duplicate series at most once every 10 minutes, with a few examples. */
+  warnAboutDuplicates(duplicates) {
+    if (duplicates.length === 0) return;
+    const now = Date.now();
+    if (this.lastDuplicateWarnAt && now - this.lastDuplicateWarnAt < 10 * 60 * 1000) return;
+    this.lastDuplicateWarnAt = now;
+    const sample = [...new Set(duplicates)].slice(0, 3).join(' ; ');
+    console.warn(`⚠ /metrics dropped ${duplicates.length} duplicate series (duplicate hypervisor/VM records?). e.g. ${sample}`);
   }
 
   /** Fleet-wide totals — the top row of any dashboard. */
@@ -568,14 +621,12 @@ class PrometheusMetricsService {
         vm: name,
         hypervisor: hypervisor?.name || '',
         backup_host: latest?.backupHostName || '',
-        schedule: schedule?.name || '',
         schedule_type: schedule?.scheduleType || '',
       };
       const vmOnly = { vm: name };
 
       w.gauge(`${NS}_vm_info`, {
         ...labels,
-        vm_id: vm.id || '',
         method: schedule?.method || latest?.method || '',
       }, 1, 'VM identity and its current backup configuration. Always 1; join on the labels.');
 
@@ -683,7 +734,7 @@ class PrometheusMetricsService {
     for (const s of schedules) {
       const vmName = vms.find(v => v.id === s.vmId)?.name;
       if (!vmName) continue;
-      const labels = { vm: vmName, schedule: s.name || '', schedule_type: s.scheduleType || '' };
+      const labels = { vm: vmName, schedule_type: s.scheduleType || '' };
 
       w.gauge(`${NS}_schedule_enabled`, labels, s.enabled === false ? 0 : 1,
         '1 when the schedule is enabled. A schedule silently disabled after ' +
@@ -782,14 +833,6 @@ class PrometheusMetricsService {
     for (const host of hosts) {
       const labels = { backup_host: host.name || host.id };
 
-      // `agent_url`, not `url`: Telegraf's prometheus input attaches its own
-      // `url` tag (the address it scraped) to every metric it collects, and a
-      // label named `url` here would collide with it the moment the exposition
-      // is relayed through Telegraf rather than scraped directly.
-      w.gauge(`${NS}_backup_host_info`, {
-        ...labels, host_id: host.id || '', agent_url: host.url || '',
-      }, 1, 'Backup host identity. Always 1; read the labels.');
-
       w.gauge(`${NS}_backup_host_up`, labels, host.status === 'online' ? 1 : 0,
         '1 when the controller last reached this backup host. When it is 0 ' +
         'every VM behind this host stops being backed up.');
@@ -833,8 +876,6 @@ class PrometheusMetricsService {
 
       w.gauge(`${NS}_hypervisor_info`, {
         ...labels,
-        hypervisor_id: hv.id || '',
-        ip: hv.ip || '',
         backup_host: backupHost?.name || '',
       }, 1, 'Hypervisor identity and the backup host that reaches it. Always 1.');
 
@@ -861,7 +902,6 @@ class PrometheusMetricsService {
         for (const disk of metrics.disks || []) {
           const diskLabels = {
             ...labels,
-            device: disk.device || '',
             mountpoint: disk.mountPoint || disk.mountpoint || '',
           };
           w.gauge(`${NS}_hypervisor_disk_bytes_total`, diskLabels,
@@ -897,7 +937,6 @@ class PrometheusMetricsService {
       const labels = {
         backup_host: host?.name || '',
         pool: pool.name || pool.id,
-        path: pool.path || '',
       };
 
       const total = gibToBytes(pool.totalGB);
@@ -929,10 +968,6 @@ class PrometheusMetricsService {
     for (const host of offsiteHosts) {
       const labels = { offsite_host: host.name || host.id };
 
-      w.gauge(`${NS}_offsite_host_info`, {
-        ...labels, offsite_host_id: host.id || '', ip: host.ip || '',
-      }, 1, 'Offsite destination identity. Always 1; read the labels.');
-
       w.gauge(`${NS}_offsite_host_up`, labels,
         host.status === 'online' || host.status === 'connected' ? 1 : 0,
         '1 when the offsite host was reachable at the last check.');
@@ -944,7 +979,7 @@ class PrometheusMetricsService {
       // silently published no offsite capacity at all, which looks identical
       // to "this host has no pools configured".
       for (const pool of host.storagePools || host.pools || []) {
-        const poolLabels = { ...labels, pool: pool.name || pool.id, path: pool.path || '' };
+        const poolLabels = { ...labels, pool: pool.name || pool.id };
         w.gauge(`${NS}_offsite_pool_bytes_total`, poolLabels,
           gibToBytes(pool.totalGB), 'Offsite pool size in bytes.');
         w.gauge(`${NS}_offsite_pool_used_bytes`, poolLabels,

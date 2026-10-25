@@ -39,10 +39,10 @@
           "type": "prometheus",
           "uid": "${DS}"
         },
-        "definition": "label_values(bm_backup_host_info, backup_host)",
+        "definition": "label_values(bm_backup_host_up, backup_host)",
         "query": {
           "qryType": 1,
-          "query": "label_values(bm_backup_host_info, backup_host)",
+          "query": "label_values(bm_backup_host_up, backup_host)",
           "refId": "backup_host"
         },
         "includeAll": true,

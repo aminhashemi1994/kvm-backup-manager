@@ -187,6 +187,31 @@ async function validateOffsiteSelection(body, offsiteHosts) {
   };
 }
 
+/**
+ * Offsite warnings that still describe one of the schedule's current targets.
+ *
+ * A warning only clears on a later successful sync to the SAME host+pool, so
+ * one recorded against a target that was since deleted, re-added (new uuid) or
+ * swapped out on the schedule could never clear. It stayed on the schedule as
+ * "SSH connection failed" against a bare uuid while the real, current host
+ * showed connected and synced fine.
+ */
+function currentOffsiteWarnings(schedule, offsiteHosts) {
+  const warnings = Array.isArray(schedule.offsiteWarnings) ? schedule.offsiteWarnings : [];
+  if (warnings.length === 0) return warnings;
+  const targets = Array.isArray(schedule.offsiteTargets) ? schedule.offsiteTargets : [];
+  const legacyIds = Array.isArray(schedule.offsiteHostIds) ? schedule.offsiteHostIds : [];
+  const hostExists = (id) => (offsiteHosts || []).some(h => h.id === id);
+  return warnings.filter(w => {
+    if (!w || !hostExists(w.offsiteHostId)) return false;
+    if (targets.length > 0) {
+      return targets.some(t => t.offsiteHostId === w.offsiteHostId
+        && (!w.offsitePoolId || t.offsitePoolId === w.offsitePoolId));
+    }
+    return legacyIds.includes(w.offsiteHostId);
+  });
+}
+
 // GET /api/schedules - List all schedules
 router.get('/', async (req, res, next) => {
   try {
@@ -230,6 +255,7 @@ router.get('/', async (req, res, next) => {
 
       return {
         ...s,
+        offsiteWarnings: currentOffsiteWarnings(s, offsiteHosts),
         vmName: vm ? vm.name : 'Unknown',
         hypervisorId: hypervisor ? hypervisor.id : null,
         hypervisorName: hypervisor ? hypervisor.name : null,
@@ -885,6 +911,12 @@ router.put('/:id', requireUser, async (req, res, next) => {
       updatedAt: new Date().toISOString(),
     };
 
+    // Drop warnings left over from targets this schedule no longer has, so
+    // re-pointing it at a new offsite host/pool doesn't keep the old failure.
+    {
+      const { getOffsiteHosts } = require('../services/fileStorage');
+      schedules[index].offsiteWarnings = currentOffsiteWarnings(schedules[index], await getOffsiteHosts());
+    }
     await saveBackupSchedules(schedules);
 
     // Update scheduler

@@ -72,14 +72,11 @@ export const backupHostsApi = {
   update: (id: string, data: any) => api.put(`/backup-hosts/${id}`, data),
   delete: (id: string) => api.delete(`/backup-hosts/${id}`),
   healthCheck: (id: string) => api.post(`/backup-hosts/${id}/health-check`),
-  syncStoragePools: (backupHostUrl: string) => 
-    axios.post(`${backupHostUrl}/api/storage-pool-sync/sync`, {}, {
-      headers: { 'Content-Type': 'application/json' }
-    }),
-  getStoragePoolSyncStatus: (backupHostUrl: string) =>
-    axios.get(`${backupHostUrl}/api/storage-pool-sync/status`, {
-      headers: { 'Content-Type': 'application/json' }
-    }),
+  // Through the controller, like every other agent call. These used to go from
+  // the browser straight to the agent URL, which fails with "Network Error"
+  // whenever the browser can't reach the agent itself (agent only reachable
+  // from the controller, https panel -> http agent, no agent auth).
+  syncStoragePools: (backupHostId: string) => api.post(`/backup-hosts/${backupHostId}/sync-storage-pools`),
 }
 
 // Hypervisors

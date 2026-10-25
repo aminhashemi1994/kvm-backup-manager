@@ -19,7 +19,7 @@ the monitoring team.
 ```yaml
 scrape_configs:
   - job_name: backup-manager
-    scrape_interval: 30s
+    scrape_interval: 60s
     scheme: https
     authorization:
       credentials: "<METRICS_TOKEN>"
@@ -31,9 +31,9 @@ With `METRICS_TOKEN` unset the endpoint answers any request and logs a warning
 at boot. The exposition names every VM, backup host, schedule and pool in the
 fleet, so set it before exposing the controller beyond the management network.
 
-`up{job="backup-manager"} == 0` is worth an alert on its own: it is the only
-signal that reports the controller itself being down, which no metric emitted
-*by* the controller can ever tell you.
+When scraping the controller directly, `up{job="backup-manager"} == 0` is the only
+signal that reports the controller being down. Behind the Telegraf relay `up` only
+reports Telegraf; use `time() - bm_scrape_timestamp_seconds > 600` instead.
 
 ## Relaying through Telegraf
 
@@ -76,9 +76,8 @@ Two costs, both cosmetic:
   `Telegraf collected metric`. This document is the reference instead; `curl`
   the controller directly to read the real ones.
 - **Telegraf adds its own tags** — `url` (what it scraped) and `host` (the
-  Telegraf box). No metric here uses a label named `url`, which is why
-  `bm_backup_host_info` carries `agent_url`. Remove `host` with
-  `tagexclude = ["host"]` — **not** `tagdrop`, which discards whole metrics
+  Telegraf box). Both are removed with
+  `tagexclude = ["host", "url"]` — **not** `tagdrop`, which discards whole metrics
   rather than tags.
 
 Scraping the controller directly stays supported and is simpler: HELP text and
@@ -116,7 +115,7 @@ been backed up.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `bm_vm_info{vm,vm_id,hypervisor,backup_host,schedule,schedule_type,method}` | gauge | Identity row, always 1. Join on the labels. |
+| `bm_vm_info{vm,hypervisor,backup_host,schedule_type,method}` | gauge | Identity row, always 1. Join on the labels. |
 | `bm_vm_protected{vm}` | gauge | 1 when an enabled schedule exists; 0 means nothing will back this VM up. |
 | `bm_vm_backup_expected_interval_seconds{vm}` | gauge | Scheduled cadence. Use as the freshness threshold instead of a constant. |
 | `bm_vm_backup_last_success_timestamp_seconds{vm}` | gauge | Last completed backup. |
@@ -160,7 +159,7 @@ up until a restore is needed. Any panel that counts only `failed` will miss it.
 ## Schedule configuration
 
 `bm_schedule_enabled`, `bm_schedule_retention`, `bm_schedule_offsite_targets`,
-`bm_schedule_warnings` — all labelled `{vm,schedule,schedule_type}`.
+`bm_schedule_warnings` — all labelled `{vm,schedule_type}`.
 
 `bm_schedule_enabled == 0` deserves attention: a schedule disabled after
 repeated failures is a common cause of backups that quietly stop.
@@ -178,18 +177,18 @@ disks. A hypervisor's CPU and RAM belong to the virtualisation team's dashboard.
 | `bm_hypervisor_up{hypervisor}` | 1 when it answered its last connection test. |
 | `bm_hypervisor_last_health_check_timestamp_seconds{hypervisor}` | When it was last tested. |
 | `bm_hypervisor_vms_total` / `_vms_protected{hypervisor}` | The gap is unprotected capacity. |
-| `bm_hypervisor_disk_{bytes_total,used_bytes,available_bytes,usage_ratio}{hypervisor,device,mountpoint}` | Disks via the agent's SSH probe. |
+| `bm_hypervisor_disk_{bytes_total,used_bytes,available_bytes,usage_ratio}{hypervisor,mountpoint}` | Disks via the agent's SSH probe. |
 | `bm_hypervisor_metrics_updated_timestamp_seconds{hypervisor}` | Freshness of those disk figures. |
 
 ## Storage and offsite capacity
 
 | Metric | Meaning |
 |---|---|
-| `bm_storage_pool_bytes_total` / `_used_bytes` / `_available_bytes` `{backup_host,pool,path}` | Backup storage. `_available_bytes` is what ends backups when it hits zero. |
+| `bm_storage_pool_bytes_total` / `_used_bytes` / `_available_bytes` `{backup_host,pool}` | Backup storage. `_available_bytes` is what ends backups when it hits zero. |
 | `bm_storage_pool_usage_ratio{...}` | 0–1. Format the panel as a percentage; alert on the ratio. |
 | `bm_storage_pool_updated_timestamp_seconds{...}` | Stale figures mean the refresh loop or the host is down, not that usage stopped changing. |
 | `bm_offsite_host_up{offsite_host}` | Destination reachability. |
-| `bm_offsite_pool_*{offsite_host,pool,path}` | Same shape as the storage pool metrics. |
+| `bm_offsite_pool_*{offsite_host,pool}` | Same shape as the storage pool metrics. |
 
 Sizes are **bytes**, converted from the whole-GiB figures the agents report.
 
@@ -203,7 +202,12 @@ Sizes are **bytes**, converted from the whole-GiB figures the agents report.
 
 `bm_build_info`, `bm_controller_start_timestamp_seconds`,
 `bm_scrape_timestamp_seconds`, `bm_scrape_duration_seconds`,
-`bm_snapshot_age_seconds`.
+`bm_snapshot_age_seconds`, `bm_scrape_duplicate_series_dropped`.
+
+`bm_scrape_duplicate_series_dropped` should always be 0. Above 0 means two records
+in the data (typically one hypervisor registered under two backup hosts) produced
+the same label set; the exporter keeps the first, drops the rest and logs a
+warning. Fix the data with `monitoring/fix-duplicate-hypervisors.sh`.
 
 Compare `bm_scrape_timestamp_seconds` with the Prometheus server clock to detect
 drift between them — every freshness alert depends on those clocks agreeing.
@@ -234,9 +238,14 @@ every rate query built on it. For windows that must survive a restart, use
 
 ## Cardinality
 
-Labels are bounded by fleet size: `vm`, `schedule`, `backup_host`,
-`hypervisor`, `offsite_host`, `pool`, `device`, `mountpoint`, `method`,
-`result`. Never a job id, an error string, or a timestamp. When adding a metric,
+Labels are bounded by fleet size: `vm`, `backup_host`,
+`hypervisor`, `offsite_host`, `pool`, `mountpoint`, `method`,
+`result`. Never a job id, an error string, a timestamp, a date, an ID, an IP or a
+URL (LMS guideline 4-5, 4-6). Display transforms live in `displayLabelValue()`:
+`vm` loses the generated `YYYYMMDD-…-N_` prefix and `backup_host` is the short
+name in parentheses. The label set is part of the contract — changing it needs
+LMS sign-off (guideline 6). A multi-label metric multiplies: keep the product of
+its label values small, and move descriptive labels to a separate metric. When adding a metric,
 add it through `MetricWriter.emit()` in
 `controller-backend/services/prometheusMetricsService.js` and keep that rule.
 

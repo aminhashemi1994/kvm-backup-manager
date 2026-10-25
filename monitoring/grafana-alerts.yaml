@@ -20,7 +20,7 @@ groups:
     interval: "1m"
     rules:
       - uid: "bm-backup-failed"
-        title: "Backup failed"
+        title: "Backup Manager VM Backup Failed alert"
         condition: "C"
         for: "10m"
         data:
@@ -92,7 +92,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-backup-repeat-failures"
-        title: "Backup failing repeatedly"
+        title: "Backup Manager VM Backup Repeated Failures alert"
         condition: "C"
         for: "10m"
         data:
@@ -164,7 +164,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-backup-overdue"
-        title: "Backup overdue (past its own RPO)"
+        title: "Backup Manager VM Backup Overdue alert"
         condition: "C"
         for: "15m"
         data:
@@ -236,7 +236,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-backup-never"
-        title: "VM has never been backed up"
+        title: "Backup Manager VM Never Backed Up alert"
         condition: "C"
         for: "1h"
         data:
@@ -308,7 +308,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-backup-stuck"
-        title: "Backup stuck"
+        title: "Backup Manager VM Backup Stuck alert"
         condition: "C"
         for: "30m"
         data:
@@ -380,7 +380,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-offsite-incomplete"
-        title: "Offsite replication incomplete"
+        title: "Backup Manager VM Offsite Replication Incomplete alert"
         condition: "C"
         for: "1h"
         data:
@@ -452,7 +452,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-offsite-target-failed"
-        title: "Offsite destination not receiving backups"
+        title: "Backup Manager Offsite Destination Failing alert"
         condition: "C"
         for: "1h"
         data:
@@ -524,7 +524,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-backup-host-down"
-        title: "Backup host offline"
+        title: "Backup Manager Backup Host Offline alert"
         condition: "C"
         for: "10m"
         data:
@@ -596,7 +596,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-storage-critical"
-        title: "Backup storage nearly full"
+        title: "Backup Manager Storage Pool Nearly Full alert"
         condition: "C"
         for: "30m"
         data:
@@ -668,7 +668,7 @@ groups:
           service: "backup-manager"
         isPaused: false
       - uid: "bm-metrics-stale"
-        title: "Backup metrics not being collected"
+        title: "Backup Manager Metrics Stale alert"
         condition: "C"
         for: "10m"
         data:

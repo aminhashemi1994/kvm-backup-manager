@@ -219,7 +219,16 @@ class StoragePoolSyncService {
       const response = await controllerAuthService.get(controllerUrl, endpoint, { timeout: 15000 });
       
       if (response.data.success) {
-        const storagePools = response.data.data || [];
+        let storagePools = response.data.data || [];
+
+        // The controller answers an unknown backup host id with an empty list,
+        // not an error. So an identity left over from a backup host that was
+        // deleted and re-added looked like "no pools defined" forever. When the
+        // list is empty, make sure the id still exists; if not, rediscover.
+        if (storagePools.length === 0 && !this._recheckingIdentity) {
+          const healed = await this._healStaleIdentity(controllerUrl);
+          if (healed) return this.syncStoragePools();
+        }
         console.log(`[StoragePoolSync] Received ${storagePools.length} storage pools from controller`);
         
         // Log all received pools
@@ -275,6 +284,33 @@ class StoragePoolSyncService {
     } catch (error) {
       console.error('[StoragePoolSync] Sync error:', error.message);
       return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Returns true when the saved identity was stale and a new one was found.
+   */
+  async _healStaleIdentity(controllerUrl) {
+    this._recheckingIdentity = true;
+    try {
+      const response = await controllerAuthService.get(controllerUrl, '/backup-hosts', { timeout: 15000 });
+      const hosts = (response.data && response.data.data) || [];
+      if (hosts.some(h => h.id === this.backupHostId)) return false;
+
+      console.log(`[StoragePoolSync] Saved backup host id ${this.backupHostId} no longer exists on the controller - rediscovering`);
+      const oldId = this.backupHostId;
+      this.backupHostId = null;
+      const newId = await this.discoverIdentity();
+      if (!newId) {
+        this.backupHostId = oldId;
+        return false;
+      }
+      return newId !== oldId;
+    } catch (error) {
+      console.error('[StoragePoolSync] Identity re-check failed:', error.message);
+      return false;
+    } finally {
+      this._recheckingIdentity = false;
     }
   }
 

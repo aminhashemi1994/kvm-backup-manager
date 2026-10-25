@@ -70,7 +70,7 @@ export default function BackupHostCard({ backupHost }: BackupHostCardProps) {
     try {
       setIsSyncing(true)
       const { backupHostsApi } = await import('@/services/api')
-      await backupHostsApi.syncStoragePools(backupHost.url)
+      await backupHostsApi.syncStoragePools(backupHost.id)
       toast.success('Storage pools synced successfully')
     } catch (error: any) {
       console.error('Failed to sync storage pools:', error)

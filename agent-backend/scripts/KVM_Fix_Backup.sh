@@ -36,45 +36,60 @@ is_running() {
     virsh list | grep " $VM " | awk '{print $3}' | grep -qiw "running"
 }
 
-# Recreate a persistent dirty bitmap on every live block node, then delete the
-# matching libvirt checkpoint.
-create_live_dirty_bitmap() {
-    local bitmap=$1
-
-    local nodes
-    nodes=$(virsh qemu-monitor-command "$VM" --cmd '{"execute":"query-block"}' \
-        | jq | grep -i node-name | grep -v "pflash" | awk '{print $2}' | sed 's/,//g')
-
-    for node in $nodes; do
-        virsh qemu-monitor-command "$VM" \
-            --cmd '{"execute":"block-dirty-bitmap-add","arguments":{"node":'"$node"' ,"name":"'"$bitmap"'","persistent":true}}' \
-            &>/dev/null
-    done
-
-    virsh checkpoint-delete "$VM" "$bitmap" || {
-        echo "Failed to delete checkpoint $bitmap, manual override required." Error
-        exit 1
-    }
-}
-
-# Live (running VM) fix path: walk checkpoints in reverse topological order
-# and delete each. If delete fails, recreate the dirty bitmap and try again.
-fix_running_vm() {
+# Delete every libvirt checkpoint (newest first). A checkpoint whose bitmap is
+# already gone can't be deleted normally, so fall back to --metadata. Prints
+# the deleted checkpoint names so their bitmaps can be removed afterwards.
+delete_checkpoints() {
     local checkpoints
-    checkpoints=$(virsh checkpoint-list --name --topological "$VM" | grep -v '^$' | tac)
+    checkpoints=$(virsh checkpoint-list --name --topological "$VM" 2>/dev/null | grep -v '^$' | tac)
 
     for cp in $checkpoints; do
-        (virsh checkpoint-delete "$VM" "$cp" \
-            || create_live_dirty_bitmap "$cp") &>/dev/null
+        virsh checkpoint-delete "$VM" "$cp" &>/dev/null \
+            || virsh checkpoint-delete "$VM" "$cp" --metadata &>/dev/null \
+            || {
+                echo "Failed to delete checkpoint $cp from $VM" Error >&2
+                return 1
+            }
     done
 
+    echo "$checkpoints"
+}
+
+# Returns 0 if the bitmap was created by virtnbdbackup or belongs to a deleted checkpoint.
+is_backup_bitmap() {
+    local bitmap=$1 checkpoints=$2
+    [[ $bitmap == virtnbdbackup* ]] || grep -qxF "$bitmap" <<<"$checkpoints"
+}
+
+# Live (running VM) fix path: delete checkpoints, then remove leftover backup
+# bitmaps from every block node (format/protocol layers and backing chain)
+# through QMP. Works even when no checkpoints exist but bitmaps remain.
+fix_running_vm() {
+    local checkpoints failed=0
+    checkpoints=$(delete_checkpoints) || exit 1
+
+    local node_bitmaps
+    node_bitmaps=$(virsh qemu-monitor-command "$VM" --cmd '{"execute":"query-named-block-nodes","arguments":{"flat":true}}' \
+        | jq -r '.return[] | select(.["dirty-bitmaps"] != null) | .["node-name"] as $n | .["dirty-bitmaps"][] | "\($n) \(.name)"' \
+        | sort -u)
+
+    while read -r node bitmap; do
+        [[ -z $node ]] && continue
+        is_backup_bitmap "$bitmap" "$checkpoints" || continue
+        virsh qemu-monitor-command "$VM" \
+            --cmd '{"execute":"block-dirty-bitmap-remove","arguments":{"node":"'"$node"'","name":"'"$bitmap"'"}}' \
+            &>/dev/null || {
+            echo "Failed to remove bitmap $bitmap from node $node of $VM" Error
+            failed=1
+        }
+    done <<<"$node_bitmaps"
+
+    [[ $failed -eq 1 ]] && exit 1
     echo "vm backup reset successfull, Please Consider create Full backup." Success
 }
 
-# Offline (shut off) fix path:
-#   - If checkpoints are recorded: add bitmaps for each on each disk, start
-#     the VM, then delete all the checkpoints.
-#   - Otherwise: remove any orphan virtnbdbackup.N bitmaps from each disk.
+# Offline (shut off) fix path: delete checkpoints, then remove leftover backup
+# bitmaps from each qcow2 disk with qemu-img. The VM is never started.
 fix_shutoff_vm() {
     local state
     state=$(virsh dominfo "$VM" | grep -i state | awk '{print $2}')
@@ -83,39 +98,23 @@ fix_shutoff_vm() {
         exit 1
     fi
 
-    echo "****************************************************************************************************************************************************************"
-    echo "Please note, for Fixing Backup Errors, vm might start in some situations during this process, you can cancell this process using ^C in 10 Seconds From now."
-    echo "****************************************************************************************************************************************************************"
-    sleep 10
+    local checkpoints disks failed=0
+    checkpoints=$(delete_checkpoints) || exit 1
+    disks=$(virsh domblklist --inactive "$VM" | awk 'NR >2 && $2 != "-" {print $2}')
 
-    local checkpoints disks
-    checkpoints=$(virsh checkpoint-list "$VM" --name)
-    disks=$(virsh domblklist --inactive "$VM" | awk 'NR >2 {print $2}')
-
-    if [[ -n $checkpoints ]]; then
-        for disk in $disks; do
-            for cp in $checkpoints; do
-                qemu-img bitmap "$disk" "$cp" --add
-            done
-        done
-
-        virsh start "$VM" || exit 1
-
-        for cp in $checkpoints; do
-            virsh checkpoint-delete "$VM" "$cp" || {
-                echo "Failed to Delete Checkpoint $cp from $VM" Error
-                exit 1
+    for disk in $disks; do
+        [[ $(qemu-img info -U --output=json "$disk" 2>/dev/null | jq -r '.format') == qcow2 ]] || continue
+        for bitmap in $(qemu-img info -U --output=json "$disk" | jq -r '.["format-specific"].data.bitmaps[]?.name'); do
+            is_backup_bitmap "$bitmap" "$checkpoints" || continue
+            qemu-img bitmap --remove "$disk" "$bitmap" || {
+                echo "Failed to remove bitmap $bitmap from $disk" Error
+                failed=1
             }
         done
-    else
-        for disk in $disks; do
-            for i in $(seq 0 100); do
-                qemu-img bitmap "$disk" "virtnbdbackup.$i" --remove &>/dev/null
-            done
-        done
+    done
 
-        echo "Vm backup Fixed Successfully, Please Consider Taking Full Backup in the next Following Backup. or the Backups will Fail again." Success
-    fi
+    [[ $failed -eq 1 ]] && exit 1
+    echo "Vm backup Fixed Successfully, Please Consider Taking Full Backup in the next Following Backup. or the Backups will Fail again." Success
 }
 
 # ─── Main ───────────────────────────────────────────────────────────────────

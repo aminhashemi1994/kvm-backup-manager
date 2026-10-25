@@ -31,6 +31,12 @@ router.post('/sync', async (req, res, next) => {
     console.log('[StoragePoolSync] Current storage pools:', storagePoolSyncService.getStoragePools().length);
     console.log('[StoragePoolSync] ═══════════════════════════════════════════════════');
     
+    const announcedId = req.body && typeof req.body.backupHostId === 'string' ? req.body.backupHostId : null;
+    if (announcedId && announcedId !== storagePoolSyncService.getBackupHostId()) {
+      console.log(`[StoragePoolSync] Controller reports this agent is backup host ${announcedId} - updating identity`);
+      storagePoolSyncService.saveAgentIdentity(announcedId);
+    }
+
     const result = await storagePoolSyncService.syncStoragePools();
     
     if (result.success) {

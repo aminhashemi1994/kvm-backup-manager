@@ -135,7 +135,7 @@ router.post('/', async (req, res, next) => {
     console.log('[Storage Pools] Storage Pool Path:', path);
     console.log('[Storage Pools] ═══════════════════════════════════════════════════');
     
-    const notifyResult = await agentService.notifyStoragePoolSync(backupHost.url);
+    const notifyResult = await agentService.notifyStoragePoolSync(backupHost.url, backupHost.id);
     if (notifyResult.success) {
       console.log('[Storage Pools] ✓ Agent notified successfully');
     } else {
@@ -220,7 +220,7 @@ router.put('/:id', async (req, res, next) => {
     console.log('[Storage Pools] Storage Pool Path:', pool.path);
     console.log('[Storage Pools] ═══════════════════════════════════════════════════');
     
-    const notifyResult = await agentService.notifyStoragePoolSync(backupHost.url);
+    const notifyResult = await agentService.notifyStoragePoolSync(backupHost.url, backupHost.id);
     if (notifyResult.success) {
       console.log('[Storage Pools] ✓ Agent notified successfully');
     } else {
@@ -275,7 +275,7 @@ router.delete('/:id', async (req, res, next) => {
       console.log('[Storage Pools] Deleted Storage Pool Path:', pool.path);
       console.log('[Storage Pools] ═══════════════════════════════════════════════════');
       
-      const notifyResult = await agentService.notifyStoragePoolSync(backupHost.url);
+      const notifyResult = await agentService.notifyStoragePoolSync(backupHost.url, backupHost.id);
       if (notifyResult.success) {
         console.log('[Storage Pools] ✓ Agent notified successfully');
       } else {

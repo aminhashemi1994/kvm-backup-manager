@@ -450,10 +450,10 @@ class HealthCheckService {
 
           if (backupHost.status !== 'online') {
             // If backup host is offline, mark offsite as offline too
-            if (offsite.status !== 'offline') {
+            if (offsite.status !== 'error') {
               console.log(`[HealthCheck] → Offsite ${offsite.name} marked offline (backup host ${backupHost.name} is ${backupHost.status})`);
               await updateOffsiteHost(offsite.id, {
-                status: 'offline',
+                status: 'error',
                 lastHealthCheck: new Date().toISOString()
               });
             } else {
@@ -470,7 +470,10 @@ class HealthCheckService {
             username: offsite.username || 'root'
           });
           
-          const newStatus = result.success ? 'online' : 'offline';
+          // Same vocabulary as routes/offsiteHosts.js (connected/error). Writing
+          // online/offline here made every UI that checks for 'connected' show a
+          // healthy host as disconnected until someone pressed Test.
+          const newStatus = result.success ? 'connected' : 'error';
           const oldStatus = offsite.status;
 
           if (result.success) {
@@ -478,7 +481,7 @@ class HealthCheckService {
           }
 
           if (newStatus !== oldStatus) {
-            if (newStatus === 'offline') {
+            if (newStatus === 'error') {
               const count = (this.offsiteFailureCounts.get(offsite.id) || 0) + 1;
               this.offsiteFailureCounts.set(offsite.id, count);
               if (count < this.CONSECUTIVE_FAILURES_THRESHOLD) {
@@ -502,7 +505,7 @@ class HealthCheckService {
           this.offsiteFailureCounts.set(offsite.id, count);
           if (count >= this.CONSECUTIVE_FAILURES_THRESHOLD) {
             await updateOffsiteHost(offsite.id, {
-              status: 'offline',
+              status: 'error',
               lastHealthCheck: new Date().toISOString()
             });
           }

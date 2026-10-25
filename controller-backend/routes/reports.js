@@ -171,6 +171,26 @@ router.post('/:backupHostId/generate', async (req, res, next) => {
         if (error.response.status === 429) {
           return res.status(429).json(error.response.data);
         }
+        // Pass the agent's own explanation through. Rethrowing left only
+        // axios's "Request failed with status code 500", which says nothing
+        // about why this one host can't build its report.
+        const data = error.response.data || {};
+        return res.status(error.response.status).json({
+          success: false,
+          error: (typeof data.error === 'string' && data.error)
+            || data.message
+            || `Agent on ${host.name} failed to generate the report (HTTP ${error.response.status})`,
+          backupHostId: host.id,
+          backupHostName: host.name,
+        });
+      }
+      if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'ECONNABORTED') {
+        return res.status(503).json({
+          success: false,
+          error: `Cannot reach the agent on ${host.name} (${error.code})`,
+          backupHostId: host.id,
+          backupHostName: host.name,
+        });
       }
       throw error;
     }

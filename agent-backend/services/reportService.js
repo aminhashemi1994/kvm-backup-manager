@@ -222,52 +222,60 @@ class ReportService {
 
       // Handle process completion
       reportProcess.on('close', (code) => {
-        writeStream.end();
+        // Wait for the buffered stdout to reach disk before touching the file.
+        // Renaming right after end() could move a half-written report on hosts
+        // with a large report, which then failed to parse.
+        writeStream.end(() => {
+          const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+          console.log(`[Report] Process completed in ${duration}s with code: ${code}`);
 
-        const duration = ((Date.now() - startTime) / 1000).toFixed(2);
-        console.log(`[Report] Process completed in ${duration}s with code: ${code}`);
+          const fail = (error) => {
+            console.error(`[Report] ✗ Report generation failed: ${error}`);
+            try { fs.unlinkSync(tempFile); } catch (e) { /* ignore */ }
+            this.isGenerating = false;
+            resolve({ success: false, error });
+          };
 
-        if (code === 0 && !hasError) {
-          // Move temp file to final location
+          if (code !== 0) {
+            fail((errorOutput || '').trim().slice(-2000) || `Process exited with code ${code}`);
+            return;
+          }
+
+          // stderr alone is not a failure: a warning from du/find/jq on one
+          // host (permission denied, a file removed mid-scan) used to fail the
+          // whole report there. The output being valid JSON is what matters.
+          if (hasError) {
+            console.warn(`[Report] Script wrote to stderr but exited 0 - treating as warnings`);
+          }
+
+          try {
+            JSON.parse(fs.readFileSync(tempFile, 'utf8'));
+          } catch (parseErr) {
+            fail(`Report output is not valid JSON: ${parseErr.message}`
+              + (errorOutput ? ` | stderr: ${errorOutput.trim().slice(-1000)}` : ''));
+            return;
+          }
+
           try {
             fs.renameSync(tempFile, this.reportFile);
             this.lastGenerated = new Date().toISOString();
             console.log(`[Report] ✓ Report generated successfully`);
-            
-            // Get file size
+
             const stats = fs.statSync(this.reportFile);
             const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
             console.log(`[Report]   File size: ${sizeMB} MB`);
-            
+
             this.isGenerating = false;
-            resolve({ 
-              success: true, 
+            resolve({
+              success: true,
               generatedAt: this.lastGenerated,
               fileSizeBytes: stats.size,
               durationSeconds: parseFloat(duration)
             });
           } catch (error) {
-            console.error('[Report] Failed to save report:', error.message);
-            this.isGenerating = false;
-            resolve({ success: false, error: error.message });
+            fail(`Failed to save report: ${error.message}`);
           }
-        } else {
-          console.error(`[Report] ✗ Report generation failed`);
-          if (errorOutput) {
-            console.error(`[Report] Error: ${errorOutput}`);
-          }
-          // Clean up temp file
-          try {
-            fs.unlinkSync(tempFile);
-          } catch (e) {
-            // Ignore
-          }
-          this.isGenerating = false;
-          resolve({ 
-            success: false, 
-            error: errorOutput || `Process exited with code ${code}` 
-          });
-        }
+        });
       });
 
       // Handle process errors

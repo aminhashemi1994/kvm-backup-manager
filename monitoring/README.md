@@ -25,7 +25,7 @@ Backup controller  ──HTTPS + bearer token──▶  Telegraf  ──plain HT
 ```
 
 The backup controller publishes Prometheus metrics. Telegraf on the relay host
-scrapes it every 30s and re-exposes everything on **port 9274**. Prometheus
+scrapes it every 60s and re-exposes everything on **port 9274**. Prometheus
 scrapes Telegraf.
 
 **Prometheus needs no credentials.** The bearer token is only used on the
@@ -44,7 +44,7 @@ published them. The two must always match; see `telegraf-backup-manager.conf`.
 ```yaml
 scrape_configs:
   - job_name: backup-manager
-    scrape_interval: 30s
+    scrape_interval: 60s   # LMS minimum; nothing refreshes faster
     static_configs:
       - targets: ['<relay-host>:9274']
 ```
@@ -204,12 +204,12 @@ dashboard JSON; you only need these if you build extra panels.
 
 ## 9. Labels
 
-`vm`, `hypervisor`, `backup_host`, `offsite_host`, `pool`, `path`, `schedule`,
+`vm`, `hypervisor`, `backup_host`, `offsite_host`, `pool`, `mountpoint`, `schedule_type`,
 `method`, `result`.
 
-Telegraf adds `url` (the controller it scraped) to every series — include it in
-`by()` clauses or hide it in tables. The Telegraf host's own `host` tag is
-stripped.
+Telegraf's own `url` and `host` tags are stripped (`tagexclude`): the source is identified by the standard `job` and `instance` labels.
+
+Label rules follow the LMS guideline (sections 4-5, 4-6): no dates, IDs, IPs or URLs in labels; `vm` has the generated `YYYYMMDD-…-N_` prefix removed; `backup_host` is the short name in parentheses (`Backup Server Site2 (HV85)` → `HV85`).
 
 ---
 

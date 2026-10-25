@@ -276,6 +276,29 @@ router.get('/:id/concurrent-config', async (req, res, next) => {
 });
 
 // POST /api/backup-hosts/:id/health-check - Health check for backup host
+// POST /api/backup-hosts/:id/sync-storage-pools - Ask the agent to re-pull its pools
+router.post('/:id/sync-storage-pools', async (req, res, next) => {
+  try {
+    const hosts = await getBackupHosts();
+    const host = hosts.find(h => h.id === req.params.id);
+    if (!host) {
+      return res.status(404).json({ success: false, error: 'Backup host not found' });
+    }
+    const result = await agentService.notifyStoragePoolSync(host.url, host.id);
+    if (!result.success) {
+      return res.status(502).json({
+        success: false,
+        error: result.reachable
+          ? `Agent on ${host.name} failed to sync storage pools: ${result.error}`
+          : `Could not reach the agent on ${host.name} (${host.url}): ${result.error}`,
+      });
+    }
+    res.json({ success: true, data: result.data && result.data.data });
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.post('/:id/health-check', async (req, res, next) => {
   try {
     const hosts = await getBackupHosts();
