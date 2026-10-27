@@ -20,7 +20,7 @@ Send this whole `monitoring/` directory.
 
 ```
 Backup controller  ──HTTPS + bearer token──▶  Telegraf  ──plain HTTP──▶  Prometheus
- (10.0.0.10)                          (relay host)                   (yours)
+ (10.0.0.10)                            (relay host)                   (yours)
  renders /metrics                         port 9274
 ```
 

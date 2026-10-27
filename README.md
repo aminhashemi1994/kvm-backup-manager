@@ -610,46 +610,20 @@ sudo systemctl start backup-controller backup-agent
 ### Option 3: Nginx Reverse Proxy
 
 **Nginx Configuration** (`/etc/nginx/sites-available/backup-manager`):
-```nginx
-# Frontend
-server {
-    listen 80;
-    listen 443 ssl http2;
-    server_name your-domain.com;
 
-    ssl_certificate /path/to/cert.pem;
-    ssl_certificate_key /path/to/key.pem;
+Copy [`nginx.example`](nginx.example) and replace the domain, certificate
+paths and `root`. It assumes:
 
-    root /opt/backup-manager/frontend/dist;
-    index index.html;
+- `frontend/.env`: `VITE_BACKEND_URL=https://your-domain.com/api-backup`
+  (rebuild the frontend after changing it)
+- `controller-backend/.env`: `PORT=3000`, `SSL_ENABLED=false`. Nginx
+  terminates TLS and talks plain HTTP to the controller on localhost.
+  If you set `SSL_ENABLED=true`, change the two `proxy_pass` lines to
+  `https://` and uncomment `proxy_ssl_verify off;`, otherwise nginx returns 502.
 
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    # Controller Backend API
-    location /api-backup/ {
-        proxy_pass http://localhost:3000/api/;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # WebSocket
-    location /socket.io/ {
-        proxy_pass http://localhost:3000/socket.io/;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-    }
-}
+```bash
+sudo cp nginx.example /etc/nginx/sites-available/backup-manager
+sudo nano /etc/nginx/sites-available/backup-manager
 ```
 
 Enable site:
@@ -663,22 +637,35 @@ sudo systemctl reload nginx
 
 ### 🔐 First-Time Login (Create the Administrator)
 
-There are **no default credentials**. When the controller starts with no users
-in `controller-backend/data/users.json`, it generates a one-time **setup token**,
-prints it in the controller log and stores it in
-`controller-backend/data/setup-token` (mode `0600`):
+There are **no default credentials**. When the controller starts and no user
+exists in `controller-backend/data/users.json`, you create the administrator
+yourself using one of the two options below. Requirements for both:
 
-```
-[Auth] No users exist. Open the web UI to create the administrator.
-[Auth] Setup token: 3f9c...e1
-```
+- **Username:** 3–32 characters (letters, numbers, `.`, `_`, `-`)
+- **Password:** 8–72 characters
 
-The login page then shows a **First-time setup** form: paste the token and choose
-the administrator's username and password (8–72 characters). The token proves
-you have access to the server, so the first visitor can't claim the instance.
-After setup the token file is deleted and the setup endpoint returns `409`.
+#### Option A: Web interface (recommended)
 
-Via the API (while no user exists):
+1. Start the controller. It generates a one-time **setup token**, prints it in
+   the log and stores it in `controller-backend/data/setup-token` (mode `0600`):
+   ```bash
+   pm2 logs <controller-process-name> --lines 50 | grep "Setup token"
+   # or
+   cat controller-backend/data/setup-token
+   ```
+   ```
+   [Auth] No users exist. Open the web UI to create the administrator.
+   [Auth] Setup token: 3f9c...e1
+   ```
+2. Open the web UI. The login page shows a **First-time setup** form.
+3. Enter the setup token, a username, and the password (twice), then click
+   **Create Administrator Account**. You are signed in automatically.
+
+The token proves you have access to the server, so the first visitor cannot
+claim the instance. After setup the token file is deleted and the setup
+endpoint returns `409`.
+
+The same works via the API while no user exists:
 
 ```bash
 curl -X POST https://your-domain.com/api-backup/auth/setup \
@@ -686,14 +673,36 @@ curl -X POST https://your-domain.com/api-backup/auth/setup \
   -d '{"username":"admin","password":"<strong-password>","setupToken":"<token>"}'
 ```
 
-For unattended deployments, set `INITIAL_ADMIN_USERNAME` and
-`INITIAL_ADMIN_PASSWORD` in the controller environment; the admin is created on
-first start (only when no user exists) and the variables are ignored afterwards.
-Remove them from the environment once the account exists.
+#### Option B: Environment variables (automated / headless installs)
 
-The initial admin user has role **admin** (full access to everything). To
-create additional users with limited roles, see
-[Settings → Users & Access](#-rbac--access-control) once logged in.
+1. Add to `controller-backend/.env`:
+   ```bash
+   INITIAL_ADMIN_USERNAME=admin
+   INITIAL_ADMIN_PASSWORD='YourStrongPassword123'
+   ```
+2. Restart the controller; the administrator is created on startup.
+3. Sign in, then **remove both lines from `.env`** so the password is not kept
+   in plain text. They only apply while no user exists.
+
+Invalid values are rejected with `INITIAL_ADMIN_* rejected: ...` in the log
+and nothing is created.
+
+#### After setup
+
+- **Change your password:** Settings → change password.
+- **Add users** with limited roles (admin / user / viewer): see
+  [Settings → Users & Access](#-rbac--access-control).
+
+#### Resetting (forgot the only admin password)
+
+This deletes **all** user accounts and returns to first-time setup. Backups,
+hosts and schedules are not affected.
+
+```bash
+cp controller-backend/data/users.json ~/users.json.backup
+rm controller-backend/data/users.json
+# restart the controller, then follow Option A or B again
+```
 
 ### Initial Setup
 
