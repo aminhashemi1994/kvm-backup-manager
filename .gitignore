@@ -99,3 +99,8 @@ improvement.txt
 IMPROVEMENT_PROGRESS.md
 *.draft.md
 .scratch/
+
+# Everything in the data directory is runtime state (users, hosts, jobs, SSH keys,
+# notification webhooks, ...). Only the placeholder is kept.
+controller-backend/data/*
+!controller-backend/data/.gitkeep

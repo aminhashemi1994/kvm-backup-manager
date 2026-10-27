@@ -288,6 +288,11 @@ git clone https://github.com/aminhashemi1994/kvm-backup-manager.git
 cd kvm-backup-manager
 ```
 
+> **npm registry:** each package ships an `.npmrc` pinning
+> `registry=https://registry.npmjs.org/`, and the lockfiles resolve from the
+> public registry. No private mirror is needed. If your network requires a
+> mirror, see [npm install fails / registry unreachable](#npm-install-fails--registry-unreachable).
+
 ### Step 2: Generate JWT Secrets
 
 **IMPORTANT**: Generate secure secrets before deployment!
@@ -310,7 +315,7 @@ This script generates three secrets:
 cd controller-backend
 
 # Install dependencies
-npm install
+npm ci   # exact versions from package-lock.json
 
 # Copy environment template
 cp .env.example .env
@@ -383,7 +388,7 @@ MAX_CONCURRENT_BACKUPS=2
 cd ../frontend
 
 # Install dependencies
-npm install
+npm ci   # exact versions from package-lock.json
 
 # Copy environment template
 cp .env.example .env
@@ -830,6 +835,32 @@ curl -X GET https://your-domain.com/api-backup/backups/jobs \
 - `GET /api/metrics/offsite/all` - Get offsite host metrics
 
 ## 🔧 Troubleshooting
+
+### npm install fails / registry unreachable
+
+Symptoms: `ETIMEDOUT`, `ENOTFOUND` or `E404` for a host other than
+`registry.npmjs.org`, or `npm ci` complaining the lockfile is out of sync.
+
+```bash
+# 1. Check which registry npm resolves (inside the package directory)
+cd controller-backend && npm config get registry   # expect https://registry.npmjs.org/
+
+# 2. Remove any old registry override from your user/global config
+npm config delete registry
+npm config delete registry --location=global
+
+# 3. Discard locally edited lockfiles and pull the fixed ones
+git checkout -- controller-backend/package-lock.json frontend/package-lock.json
+git pull
+
+# 4. Clean install
+rm -rf node_modules && npm cache verify && npm ci
+```
+
+To use a mirror instead, override per command without editing any file:
+`npm ci --registry=https://your-mirror/` (the lockfile URLs are rewritten to
+the configured registry automatically for the default public host).
+
 
 ### Common Issues
 
