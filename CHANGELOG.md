@@ -5,12 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] - 2026-10-27
 
 ### Security
 - **No default credentials**: the controller no longer creates `admin` / `admin123`. On first start with no users it prints a one-time setup token (also stored in `controller-backend/data/setup-token`, mode 0600); the login page shows a First-time setup form that requires the token. Unattended installs can set `INITIAL_ADMIN_USERNAME` / `INITIAL_ADMIN_PASSWORD`. Existing users are not changed.
 
+### Changed
+- **virtnbdbackup installer rewritten** (`agent-backend/scripts/Init_Host.sh`): installs virtnbdbackup 2.53 from the official upstream `.deb` (bundled and SHA-256 verified, downloaded from GitHub releases if missing) with dependencies resolved by apt, replacing the bundled 2.47 source tarball and `setup.py`/pip installation. Removes legacy `/usr/local` installs, installs missing tools used by the scripts (`jq`, `virsh`), writes AppArmor rules idempotently and reloads AppArmor, supports Debian 11+ and Ubuntu 22.04+, and is safe to re-run.
+- **Nginx examples**: `nginx.example` (domain) and `nginx-ip.example` (IP with self-signed certificate) now proxy plain HTTP to the controller, matching the default `SSL_ENABLED=false`.
+
 ### Fixed
+- **SSH keep-alive settings** were silently skipped when `/etc/ssh/ssh_config` had no `Host *` block; sshd is no longer restarted when its config test fails.
 - **Installation from the public npm registry**: lockfiles now resolve every package from the public npm registry (no private mirror needed), added an `.npmrc` per package pinning `https://registry.npmjs.org/`, and regenerated the out-of-sync `controller-backend/package-lock.json` so `npm ci` works on a clean machine.
 
 ## [1.2.0] - 2026-06-29
