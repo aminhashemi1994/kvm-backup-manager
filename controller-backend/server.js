@@ -113,8 +113,8 @@ app.set('io', io);
 // Initialize data files
 initializeDataFiles();
 
-// Initialize auth service (create default user if needed)
-authService.ensureUsersFile().then(() => {
+// Initialize auth service (prints a setup token if no user exists yet)
+authService.prepareInitialSetup().then(() => {
   console.log('✓ Auth service initialized');
 }).catch(err => {
   console.error('Failed to initialize auth service:', err);

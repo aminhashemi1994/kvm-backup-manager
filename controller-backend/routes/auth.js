@@ -46,6 +46,73 @@ router.post('/login', async (req, res, next) => {
   }
 });
 
+// Simple per-IP limit for the setup endpoint (guards the setup token)
+const SETUP_WINDOW_MS = 15 * 60 * 1000;
+const SETUP_MAX_ATTEMPTS = 10;
+const setupAttempts = new Map();
+
+function isSetupRateLimited(ip) {
+  const now = Date.now();
+  const entry = setupAttempts.get(ip);
+  if (!entry || now - entry.start > SETUP_WINDOW_MS) {
+    setupAttempts.set(ip, { start: now, count: 1 });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > SETUP_MAX_ATTEMPTS;
+}
+
+/**
+ * GET /api/auth/setup-status
+ * Whether the initial admin account still has to be created
+ */
+router.get('/setup-status', async (req, res, next) => {
+  try {
+    res.json({ success: true, needsSetup: await authService.needsSetup() });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/auth/setup
+ * Create the initial admin account (only allowed while no users exist)
+ */
+router.post('/setup', async (req, res, next) => {
+  try {
+    if (isSetupRateLimited(req.ip)) {
+      return res.status(429).json({ success: false, error: 'Too many setup attempts. Try again later.' });
+    }
+
+    const { username, password, setupToken } = req.body;
+    const result = await authService.setupInitialAdmin(username, password, setupToken);
+
+    if (!result.success) {
+      if (result.code === 'BAD_TOKEN') {
+        await auditService.log('auth.initial_setup_failed', {
+          actor: typeof username === 'string' ? username : null,
+          details: { reason: result.error },
+          ip: req.ip,
+        });
+      }
+      const status = { SETUP_DONE: 409, BAD_TOKEN: 403 }[result.code] || 400;
+      return res.status(status).json(result);
+    }
+
+    await auditService.log('auth.initial_setup', {
+      actor: result.user.username,
+      actorId: result.user.id,
+      actorRole: result.user.role,
+      ip: req.ip,
+    });
+
+    res.json(result);
+  } catch (error) {
+    console.error('[Auth] Initial setup error:', error);
+    next(error);
+  }
+});
+
 /**
  * POST /api/auth/change-password
  * Change user password (requires authentication)

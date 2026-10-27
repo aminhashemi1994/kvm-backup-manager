@@ -656,38 +656,46 @@ sudo systemctl reload nginx
 
 ## 📖 Usage
 
-### 🔐 First-Time Login (Default Credentials)
+### 🔐 First-Time Login (Create the Administrator)
 
-When the controller starts for the first time, it auto-creates a default admin
-user. Use these credentials to log in:
+There are **no default credentials**. When the controller starts with no users
+in `controller-backend/data/users.json`, it generates a one-time **setup token**,
+prints it in the controller log and stores it in
+`controller-backend/data/setup-token` (mode `0600`):
 
-| Field    | Value      |
-|----------|------------|
-| Username | `admin`    |
-| Password | `admin123` |
+```
+[Auth] No users exist. Open the web UI to create the administrator.
+[Auth] Setup token: 3f9c...e1
+```
 
-> **⚠️ SECURITY: Change the password immediately after your first login.**
-> Go to **Settings → Users & Access**, click **Edit** on the admin user, set a
-> new strong password, and save. The default credentials are publicly known
-> and must not be left active in any environment that's reachable from the
-> internet or any untrusted network.
+The login page then shows a **First-time setup** form: paste the token and choose
+the administrator's username and password (8–72 characters). The token proves
+you have access to the server, so the first visitor can't claim the instance.
+After setup the token file is deleted and the setup endpoint returns `409`.
 
-The default admin user has:
-- Role: **admin** (full access to everything)
-- Access grants: implicit all-hosts (admins always have full access)
-- Status: active
+Via the API (while no user exists):
 
-After the first password change, the credentials are persisted in
-`controller-backend/data/users.json` (bcrypt-hashed). To create additional
-users with limited roles, see [Settings → Users & Access](#-rbac--access-control)
-once logged in.
+```bash
+curl -X POST https://your-domain.com/api-backup/auth/setup \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"<strong-password>","setupToken":"<token>"}'
+```
+
+For unattended deployments, set `INITIAL_ADMIN_USERNAME` and
+`INITIAL_ADMIN_PASSWORD` in the controller environment; the admin is created on
+first start (only when no user exists) and the variables are ignored afterwards.
+Remove them from the environment once the account exists.
+
+The initial admin user has role **admin** (full access to everything). To
+create additional users with limited roles, see
+[Settings → Users & Access](#-rbac--access-control) once logged in.
 
 ### Initial Setup
 
 1. **Access Web UI**: Navigate to `https://your-domain.com`
 
-2. **Login**: Use the default credentials above (`admin` / `admin123`).
-   **Change the password before doing anything else.**
+2. **Create the administrator**: On first visit, fill in the setup form on the
+   login page using the setup token from the controller log (see above), then sign in with those credentials.
 
 3. **Add Backup Host**:
    - Go to **Infrastructure → Backup Hosts** → **Add Backup Host**
@@ -773,7 +781,7 @@ All API requests require authentication:
 # Login
 curl -X POST https://your-domain.com/api-backup/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin123"}'
+  -d '{"username":"admin","password":"<your-password>"}'
 
 # Response
 {

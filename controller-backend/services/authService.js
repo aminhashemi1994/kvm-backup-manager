@@ -2,9 +2,14 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const fs = require('fs').promises;
 const path = require('path');
-const { writeJSON } = require('./fileStorage');
+const crypto = require('crypto');
+const { writeJSON, mutateJSON } = require('./fileStorage');
 
 const USERS_FILE = path.join(__dirname, '../data/users.json');
+// One-time token that must be presented to create the initial admin, so the
+// first person to reach the login page can't claim the instance. It is printed
+// to the controller log and stored (mode 0600) next to users.json.
+const SETUP_TOKEN_FILE = path.join(__dirname, '../data/setup-token');
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 // User session tokens use a short, sliding expiry. Each authenticated request
 // mints a fresh token (see middleware/auth.js), so an active session keeps
@@ -14,7 +19,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-producti
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30m';
 
 /**
- * Ensure users file exists and has default admin user
+ * Ensure users file exists (no default user is created)
  */
 async function ensureUsersFile() {
   try {
@@ -50,48 +55,18 @@ async function ensureUsersFile() {
       }
     }
     
-    // If no users exist, create default admin
-    if (!usersData.users || usersData.users.length === 0) {
-      console.log('[Auth] No users found, creating default admin user...');
-      const defaultPassword = await bcrypt.hash('admin123', 10);
-      usersData.users = [
-        {
-          id: '1',
-          username: 'admin',
-          password: defaultPassword,
-          role: 'admin',
-          email: null,
-          fullName: 'Administrator',
-          disabled: false,
-          accessGrants: { backupHostIds: [] }, // admin has implicit full access
-          createdAt: new Date().toISOString()
-        }
-      ];
+    // No users yet: leave the list empty. The first admin is created through
+    // the setup flow on the login page (see setupInitialAdmin).
+    if (!usersData.users) {
+      usersData.users = [];
       await writeJSON(USERS_FILE, usersData);
-      console.log('[Auth] Default admin user created (username: admin, password: admin123)');
     }
   } catch (error) {
-    // File doesn't exist, create it with default admin user
-    console.log('[Auth] Users file not found, creating with default admin user...');
-    const defaultPassword = await bcrypt.hash('admin123', 10);
-    const defaultUsers = {
-      users: [
-        {
-          id: '1',
-          username: 'admin',
-          password: defaultPassword,
-          role: 'admin',
-          email: null,
-          fullName: 'Administrator',
-          disabled: false,
-          accessGrants: { backupHostIds: [] },
-          createdAt: new Date().toISOString()
-        }
-      ]
-    };
-    
-    await writeJSON(USERS_FILE, defaultUsers);
-    console.log('[Auth] Default admin user created (username: admin, password: admin123)');
+    // Never reset an existing (e.g. corrupted) file: that would reopen setup
+    if (error.code !== 'ENOENT') throw error;
+    // File doesn't exist: create it empty and wait for initial setup
+    console.log('[Auth] Users file not found, waiting for initial admin setup...');
+    await writeJSON(USERS_FILE, { users: [] });
   }
 }
 
@@ -155,6 +130,129 @@ async function login(username, password) {
       accessGrants: user.accessGrants || { backupHostIds: [] },
     }
   };
+}
+
+/**
+ * True when no user exists yet and the initial admin must be created
+ */
+async function needsSetup() {
+  const usersData = await readUsers();
+  return usersData.users.length === 0;
+}
+
+function validateAdminCredentials(username, password) {
+  if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
+    return 'Username and password are required';
+  }
+  if (!/^[a-zA-Z0-9._-]{3,32}$/.test(username)) {
+    return 'Username must be 3-32 characters (letters, numbers, . _ -)';
+  }
+  if (password.length < 8) {
+    return 'Password must be at least 8 characters';
+  }
+  // bcrypt silently ignores everything past 72 bytes
+  if (Buffer.byteLength(password, 'utf8') > 72) {
+    return 'Password must be at most 72 bytes';
+  }
+  return null;
+}
+
+/**
+ * Atomically create the first admin. Returns false if a user already exists.
+ */
+async function createInitialAdmin(username, password) {
+  const hashed = await bcrypt.hash(password, 10);
+  const { written } = await mutateJSON(USERS_FILE, (data) => {
+    if (!Array.isArray(data.users)) data.users = [];
+    if (data.users.length > 0) return false;
+    data.users.push({
+      id: '1',
+      username,
+      password: hashed,
+      role: 'admin',
+      email: null,
+      fullName: 'Administrator',
+      disabled: false,
+      accessGrants: { backupHostIds: [] }, // admin has implicit full access
+      createdAt: new Date().toISOString()
+    });
+  });
+  if (written) {
+    await fs.rm(SETUP_TOKEN_FILE, { force: true });
+    console.log(`[Auth] Initial admin user "${username}" created`);
+  }
+  return written;
+}
+
+/**
+ * Called at startup. If no user exists, either bootstrap the admin from
+ * INITIAL_ADMIN_USERNAME / INITIAL_ADMIN_PASSWORD, or make sure a setup token
+ * exists and print it so the operator can finish setup in the web UI.
+ */
+async function prepareInitialSetup() {
+  await ensureUsersFile();
+  if (!(await needsSetup())) {
+    await fs.rm(SETUP_TOKEN_FILE, { force: true });
+    return;
+  }
+
+  const envUser = process.env.INITIAL_ADMIN_USERNAME;
+  const envPass = process.env.INITIAL_ADMIN_PASSWORD;
+  if (envUser && envPass) {
+    const invalid = validateAdminCredentials(envUser, envPass);
+    if (invalid) throw new Error(`[Auth] INITIAL_ADMIN_* rejected: ${invalid}`);
+    await createInitialAdmin(envUser, envPass);
+    return;
+  }
+
+  let token;
+  try {
+    token = (await fs.readFile(SETUP_TOKEN_FILE, 'utf8')).trim();
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  if (!token) {
+    token = crypto.randomBytes(24).toString('hex');
+    await fs.writeFile(SETUP_TOKEN_FILE, token + '\n', { mode: 0o600 });
+  }
+  console.log('='.repeat(72));
+  console.log('[Auth] No users exist. Open the web UI to create the administrator.');
+  console.log(`[Auth] Setup token: ${token}`);
+  console.log(`[Auth] (also stored in ${SETUP_TOKEN_FILE})`);
+  console.log('='.repeat(72));
+}
+
+async function checkSetupToken(provided) {
+  let expected;
+  try {
+    expected = (await fs.readFile(SETUP_TOKEN_FILE, 'utf8')).trim();
+  } catch (error) {
+    return false;
+  }
+  if (!expected || typeof provided !== 'string') return false;
+  const a = crypto.createHash('sha256').update(provided.trim()).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Create the first admin account from the web UI. Only allowed while no users
+ * exist and with the setup token printed at startup.
+ */
+async function setupInitialAdmin(username, password, setupToken) {
+  if (!(await needsSetup())) {
+    return { success: false, error: 'Initial setup has already been completed', code: 'SETUP_DONE' };
+  }
+  if (!(await checkSetupToken(setupToken))) {
+    return { success: false, error: 'Invalid setup token', code: 'BAD_TOKEN' };
+  }
+  const invalid = validateAdminCredentials(username, password);
+  if (invalid) return { success: false, error: invalid };
+
+  if (!(await createInitialAdmin(username, password))) {
+    return { success: false, error: 'Initial setup has already been completed', code: 'SETUP_DONE' };
+  }
+  return login(username, password);
 }
 
 /**
@@ -363,6 +461,9 @@ module.exports = {
   verifyToken,
   generateAgentToken,
   ensureUsersFile,
+  needsSetup,
+  prepareInitialSetup,
+  setupInitialAdmin,
   createUser,
   updateUser,
   deleteUser,

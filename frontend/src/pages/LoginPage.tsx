@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import axios from 'axios'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '@/contexts/AuthContext'
 import { Button } from '@/components/ui/button'
@@ -6,17 +7,61 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import { Database, Loader2, AlertCircle } from 'lucide-react'
+import { Database, Loader2, AlertCircle, ShieldCheck } from 'lucide-react'
 import { toast } from '@/lib/utils'
 import { getErrorMessage } from '@/lib/errors'
+
+const apiEndpointBase = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3000/api'
 
 export default function LoginPage() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [setupToken, setSetupToken] = useState('')
+  // null = still checking whether the initial admin must be created
+  const [needsSetup, setNeedsSetup] = useState<boolean | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const { login } = useAuth()
   const navigate = useNavigate()
+
+  useEffect(() => {
+    axios
+      .get(`${apiEndpointBase}/auth/setup-status`)
+      .then((res) => setNeedsSetup(!!res.data?.needsSetup))
+      .catch(() => setNeedsSetup(false))
+  }, [])
+
+  const handleSetup = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError(null)
+
+    if (password !== confirmPassword) {
+      setError('Passwords do not match.')
+      return
+    }
+
+    setIsLoading(true)
+    try {
+      await axios.post(`${apiEndpointBase}/auth/setup`, { username, password, setupToken })
+      toast.success('Administrator account created', { duration: 3000 })
+      if (await login(username, password)) {
+        navigate('/dashboard')
+      } else {
+        setNeedsSetup(false)
+      }
+    } catch (error: any) {
+      if (error?.response?.status === 409) {
+        // Someone else finished setup first: fall back to normal sign-in
+        setNeedsSetup(false)
+        setPassword('')
+        setConfirmPassword('')
+      }
+      setError(getErrorMessage(error, 'Failed to create the administrator account.'))
+    } finally {
+      setIsLoading(false)
+    }
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -63,11 +108,52 @@ export default function LoginPage() {
             </div>
             <CardTitle className="text-2xl text-center">KVM Backup Manager</CardTitle>
             <CardDescription className="text-center">
-              Sign in to manage your backup infrastructure
+              {needsSetup
+                ? 'Welcome! Create the administrator account to get started'
+                : 'Sign in to manage your backup infrastructure'}
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <form onSubmit={handleSubmit} className="space-y-4">
+            {needsSetup === null ? (
+              <div className="flex justify-center py-8">
+                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+              </div>
+            ) : (
+            <form onSubmit={needsSetup ? handleSetup : handleSubmit} className="space-y-4">
+              {needsSetup && (
+                <Alert>
+                  <ShieldCheck className="h-4 w-4" />
+                  <AlertDescription>
+                    <span className="font-medium">First-time setup.</span> No user account exists yet and
+                    there is no default password. Choose the username and password for the administrator
+                    account; you will use them to sign in from now on.
+                  </AlertDescription>
+                </Alert>
+              )}
+              {needsSetup && (
+                <div className="space-y-2">
+                  <Label htmlFor="setupToken">Setup Token</Label>
+                  <Input
+                    id="setupToken"
+                    type="text"
+                    placeholder="Paste the token from the controller log"
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={setupToken}
+                    onChange={(e) => {
+                      setSetupToken(e.target.value)
+                      setError(null)
+                    }}
+                    required
+                    disabled={isLoading}
+                    className={`font-mono ${error ? 'border-red-500 focus:border-red-500' : ''}`}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Proves you operate this server. It is printed in the controller log at startup and
+                    stored in <code className="font-mono">controller-backend/data/setup-token</code>.
+                  </p>
+                </div>
+              )}
               {error && (
                 <Alert variant="destructive">
                   <AlertCircle className="h-4 w-4" />
@@ -80,7 +166,9 @@ export default function LoginPage() {
                 <Input
                   id="username"
                   type="text"
-                  placeholder="admin"
+                  placeholder={needsSetup ? 'e.g. admin' : 'Username'}
+                  autoComplete="username"
+                  autoFocus
                   value={username}
                   onChange={(e) => {
                     setUsername(e.target.value)
@@ -96,7 +184,9 @@ export default function LoginPage() {
                 <Input
                   id="password"
                   type="password"
-                  placeholder="••••••••"
+                  placeholder={needsSetup ? 'At least 8 characters' : '••••••••'}
+                  autoComplete={needsSetup ? 'new-password' : 'current-password'}
+                  minLength={needsSetup ? 8 : undefined}
                   value={password}
                   onChange={(e) => {
                     setPassword(e.target.value)
@@ -107,11 +197,33 @@ export default function LoginPage() {
                   className={error ? 'border-red-500 focus:border-red-500' : ''}
                 />
               </div>
+              {needsSetup && (
+                <div className="space-y-2">
+                  <Label htmlFor="confirmPassword">Confirm Password</Label>
+                  <Input
+                    id="confirmPassword"
+                    type="password"
+                    placeholder="Repeat the password"
+                    autoComplete="new-password"
+                    value={confirmPassword}
+                    onChange={(e) => {
+                      setConfirmPassword(e.target.value)
+                      setError(null)
+                    }}
+                    required
+                    disabled={isLoading}
+                    className={error ? 'border-red-500 focus:border-red-500' : ''}
+                  />
+                </div>
+              )}
               <Button type="submit" className="w-full" disabled={isLoading}>
                 {isLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                {isLoading ? 'Signing In...' : 'Sign In'}
+                {needsSetup
+                  ? (isLoading ? 'Creating Account...' : 'Create Administrator Account')
+                  : (isLoading ? 'Signing In...' : 'Sign In')}
               </Button>
             </form>
+            )}
           </CardContent>
         </Card>
         
