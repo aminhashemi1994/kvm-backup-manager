@@ -104,3 +104,21 @@ IMPROVEMENT_PROGRESS.md
 # notification webhooks, ...). Only the placeholder is kept.
 controller-backend/data/*
 !controller-backend/data/.gitkeep
+
+# Editor and AI-assistant tool files (never commit)
+.kiro/
+.cursor/
+.cursorrules
+.aider*
+.continue/
+.windsurf/
+.codeium/
+.copilot/
+.gemini/
+AGENTS.md
+GEMINI.md
+.github/copilot-instructions.md
+graphify-out/
+*.code-workspace
+.fleet/
+.zed/
