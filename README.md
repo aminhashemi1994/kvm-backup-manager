@@ -393,40 +393,43 @@ VITE_BACKEND_URL=https://your-domain.com/api-backup
 
 This project uses **[virtnbdbackup](https://github.com/abbbi/virtnbdbackup)** - an open-source backup utility for KVM/QEMU virtual machines developed by [@abbbi](https://github.com/abbbi). The virtnbdbackup tool provides efficient incremental backups using the NBD protocol and libvirt's backup API.
 
-**Installation Methods**:
+**Install with the initialization script (recommended)** on each backup host
+(Debian 11+ or Ubuntu 22.04+, as root):
 
-**Option 1: From Package (Recommended)**
 ```bash
-# Debian/Ubuntu
-sudo apt-get install virtnbdbackup python3-libnbd nbdkit
-
-# Or using pip
-pip3 install virtnbdbackup
-```
-
-**Option 2: From Local Archive**
-If you have a local virtnbdbackup.tar file:
-```bash
-# Copy your virtnbdbackup.tar to agent-backend/
-cp /path/to/virtnbdbackup.tar agent-backend/
-
-# Run initialization script
 cd agent-backend/scripts
 sudo bash Init_Host.sh
 ```
 
-The initialization script will:
-- Install required system packages (python3-libnbd, nbdkit, tmux, rsync, jq)
-- Install virtnbdbackup from local tar file or package manager
-- Configure AppArmor permissions for libvirt
-- Set up backup directories
-- Verify installation
+The script:
+- Installs the tools the backup scripts use (`jq`, `virsh`/libvirt-clients, `rsync`, `tmux`, `bc`, `nfs-common`, ...)
+- Installs **virtnbdbackup 2.53** from the official upstream `.deb`
+  ([releases](https://github.com/abbbi/virtnbdbackup/releases)); `apt` pulls in its
+  dependencies (`python3-libnbd`, `python3-libvirt`, `nbdkit`, `qemu-utils`, ...)
+- Uses the copy bundled at `agent-backend/virtnbdbackup/virtnbdbackup_2.53-1_all.deb`,
+  so GitHub access is not required; it is verified by SHA-256 before installing
+- Removes an older pip/`setup.py` installation in `/usr/local` if present
+- Adds the AppArmor rules virtnbdbackup needs (idempotent) and reloads AppArmor
+- Is safe to re-run: it skips virtnbdbackup if 2.53 or newer is already installed
+
+To install a different build, point the script at it:
+`sudo VIRTNBD_DEB=/path/to/virtnbdbackup_X.Y-1_all.deb bash Init_Host.sh`
+
+**Manual installation** (equivalent to what the script does):
+```bash
+sudo apt-get install -y ./agent-backend/virtnbdbackup/virtnbdbackup_2.53-1_all.deb
+```
+Do not `pip install nbd`: that PyPI package is not the libnbd bindings.
 
 **Verify Installation**:
 ```bash
-virtnbdbackup --version
-virtnbdrestore --version
+virtnbdbackup -V
+virtnbdrestore -V
 ```
+
+**Debian 11 only:** libvirt there predates 7.6, so each VM needs the
+`incremental-backup` qemu capability enabled; see the
+[virtnbdbackup README](https://github.com/abbbi/virtnbdbackup#prerequisites).
 
 **Learn More**: Visit the [virtnbdbackup GitHub repository](https://github.com/abbbi/virtnbdbackup) for detailed documentation, features, and community support.
 

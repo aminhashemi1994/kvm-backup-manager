@@ -17,125 +17,154 @@ CROSS="✖"
 WARNING="⚠"
 INFO="ℹ"
 
+# virtnbdbackup is installed from the upstream release .deb
+# (https://github.com/abbbi/virtnbdbackup/releases). apt resolves its
+# dependencies (python3-libnbd, python3-libvirt, nbdkit, qemu-utils, ...)
+# from the distribution repositories. A copy of the .deb ships next to this
+# script for hosts that cannot reach GitHub; VIRTNBD_DEB=/path/to/file.deb
+# overrides it.
+VIRTNBD_VERSION="2.53"
+VIRTNBD_DEB_NAME="virtnbdbackup_${VIRTNBD_VERSION}-1_all.deb"
+VIRTNBD_DEB_SHA256="33bfcf8a832605f716c87e6eb8502820cd7467873917a32fcedb47dafc60f2d7"
+VIRTNBD_DEB_URL="https://github.com/abbbi/virtnbdbackup/releases/download/v${VIRTNBD_VERSION}/${VIRTNBD_DEB_NAME}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export DEBIAN_FRONTEND=noninteractive
+
+fail() {
+	echo -e "${Red}${CROSS} $*${NC}" >&2
+	exit 1
+}
+
 apt_update_repo_check() {
 	if [[ $already_checked != "true" ]]; then
-		echo -e "${Green}Updating Reposiroty ...${NC}"
-		if ! apt update &>/dev/null; then
-			echo -e "${Red}${CROSS}Error in Repo, cannot apt update.${NC}"
-			exit 1
+		echo -e "${Green}Updating Repository ...${NC}"
+		if ! apt-get update &>/dev/null; then
+			fail "Error in Repo, cannot apt update."
 		fi
 		already_checked="true"
 	fi
 }
 
-function install_virtnbdbackup {
-	current_dir=$(pwd)
-	SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-	VIRTNBD_DIR="${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup/virtnbdbackup"
+check_os() {
+	[[ $EUID -eq 0 ]] || fail "This script must be run as root."
+	[[ -f /etc/os-release ]] || fail "Cannot detect the OS (/etc/os-release missing)."
+	source /etc/os-release
+	os_major=${VERSION_ID%%.*}
+	case "$ID" in
+	debian)
+		# libvirt/qemu in Debian 10 lack incremental backup support
+		[[ $os_major -ge 11 ]] || fail "Debian ${VERSION_ID} is not supported (Debian 11+ required)."
+		[[ $os_major -eq 11 ]] && echo -e "${Yellow}${WARNING} Debian 11: VMs need the 'incremental-backup' qemu capability enabled (see virtnbdbackup README).${NC}"
+		;;
+	ubuntu)
+		[[ $os_major -ge 22 ]] || fail "Ubuntu ${VERSION_ID} is not supported (Ubuntu 22.04+ required)."
+		;;
+	*)
+		fail "Unsupported distribution '${ID}'. Only Debian and Ubuntu are supported."
+		;;
+	esac
+}
 
-	virtnbdbackup -V >/dev/null 2>&1
-	if [[ $? -ne 0 ]]; then
-		source /etc/os-release
-		echo "virtnbdbackup package status : Not Installed"
+# Prints the installed virtnbdbackup version, or nothing if not installed
+installed_virtnbd_version() {
+	command -v virtnbdbackup >/dev/null 2>&1 || return 0
+	virtnbdbackup -V 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1
+}
 
-		# Extract bundled virtnbdbackup sources (resolved relative to this script, not a fixed install path)
-		VIRTNBD_TAR="${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup.tar"
-		if [[ ! -d "${VIRTNBD_DIR}" ]]; then
-			if [[ ! -f "${VIRTNBD_TAR}" ]]; then
-				echo -e "${Red}${CROSS}virtnbdbackup archive not found at ${VIRTNBD_TAR}${NC}"
-				exit 1
-			fi
-			mkdir -p "${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup"
-			if ! tar -xf "${VIRTNBD_TAR}" -C "${SCRIPT_DIR}/../virtnbdbackup/virtnbdbackup"; then
-				echo -e "${Red}${CROSS}Failed to extract ${VIRTNBD_TAR}${NC}"
-				exit 1
-			fi
-		fi
-		if [[ ! -d "${VIRTNBD_DIR}" ]]; then
-			echo -e "${Red}${CROSS}virtnbdbackup directory not found at ${VIRTNBD_DIR}${NC}"
-			exit 1
-		fi
-		# Check Debian version compatibility
-		[[ $VERSION_ID -eq "10" ]] && echo "Debian Version is 10 (Buster) Does not support Virtnbd Backup Feature" && exit 1
+# Older versions of this script installed virtnbdbackup with pip/setup.py into
+# /usr/local, which would shadow the packaged binaries in /usr/bin.
+remove_legacy_virtnbd_install() {
+	local bin
+	bin=$(command -v virtnbdbackup 2>/dev/null || true)
+	[[ $bin == /usr/local/* ]] || return 0
+	echo -e "${Yellow}${WARNING} Removing legacy pip installation of virtnbdbackup (${bin})${NC}"
+	pip3 uninstall -y --break-system-packages virtnbdbackup &>/dev/null ||
+		pip3 uninstall -y virtnbdbackup &>/dev/null || true
+	rm -f /usr/local/bin/virtnbdbackup /usr/local/bin/virtnbdrestore \
+		/usr/local/bin/virtnbdmap /usr/local/bin/virtnbd-nbdkit-plugin
+	hash -r
+}
 
-		# Create necessary directories
-		[[ ! -d /tmp/vm_inc/ ]] && mkdir -p /tmp/vm_inc/
-
-		echo -e "\n${Green}${CHECK}virtnbdbackup directory found at ${VIRTNBD_DIR}${NC}"
-		echo -e "\nPlease Wait ...⏳"
-
-		# Determine pip packages based on Debian version
-		# Debian 12+ marks the system python as externally managed (PEP 668)
-		[[ ${VERSION_ID%%.*} -ge 12 ]] && force_install="--break-system-packages"
-		if [[ ${VERSION_ID%%.*} -ge 12 ]]; then
-			pip_list=$(cat ${VIRTNBD_DIR}/pip_files/deb12_packages.txt)
-		else
-			pip_list=$(cat ${VIRTNBD_DIR}/pip_files/package_list.txt)
-		fi
-
-		# Install pip packages
-		for list in ${pip_list[@]}; do
-			echo -e "${Green}Installing $list, Please Wait ...⏳"
-			if ! pip3 install $force_install --no-index ${VIRTNBD_DIR}/pip_files/$list; then
-				echo -e "${Red}${CROSS}Failed to install $list${NC}"
-				cd $current_dir
-				exit 1
-			fi
-			echo -e "${Green}$list [OK]${CHECK}${NC}"
-		done
-
-		# Install virtnbdbackup
-
-		cd ${VIRTNBD_DIR}/
-		if ! python3 setup.py install &>/dev/null && ! pip3 install $force_install --no-index --no-build-isolation . &>/dev/null; then
-			echo -e "${Red}${CROSS}Failed to install virtnbdbackup ${NC}"
-			cd $current_dir
-			exit 1
-		fi
-
-		# Configure AppArmor permissions
-		[[ ! -f /etc/apparmor.d/local/abstractions/libvirt-qemu ]] && mkdir -p /etc/apparmor.d/local/abstractions/
-		[[ ! -f /etc/apparmor.d/local/usr.sbin.libvirtd ]] && mkdir -p /etc/apparmor.d/local/
-		[[ ! -f /etc/apparmor.d/local/usr.lib.libvirt.virt-aa-helper ]] && mkdir -p /etc/apparmor.d/local/
-
-		permission_files=("/etc/apparmor.d/local/abstractions/libvirt-qemu" "/etc/apparmor.d/local/usr.sbin.libvirtd" "/etc/apparmor.d/local/usr.lib.libvirt.virt-aa-helper")
-		for set_permission in ${permission_files[@]}; do
-			echo "/var/tmp/virtnbdbackup.* rw,
-            /var/tmp/backup.* rw," >>$set_permission
-		done
-
-		cd $current_dir
-		echo -e "\n${Green}${CHECK}virtnbdbackup installed successfully ${NC}"
+# Prints the path of a verified .deb (bundled, VIRTNBD_DEB, or downloaded)
+fetch_virtnbd_deb() {
+	local deb="${VIRTNBD_DEB:-${SCRIPT_DIR}/../virtnbdbackup/${VIRTNBD_DEB_NAME}}"
+	if [[ ! -f $deb ]]; then
+		deb="$(mktemp -d)/${VIRTNBD_DEB_NAME}"
+		echo -e "${Green}Downloading ${VIRTNBD_DEB_URL} ...${NC}" >&2
+		curl -fsSL --retry 3 --connect-timeout 20 -o "$deb" "$VIRTNBD_DEB_URL" ||
+			fail "Download failed. Copy ${VIRTNBD_DEB_NAME} to $(realpath -m "${SCRIPT_DIR}/../virtnbdbackup")/ or set VIRTNBD_DEB=/path/to/file.deb"
 	fi
+	# Only verify the pinned checksum for the pinned release file
+	if [[ $(basename "$deb") == "$VIRTNBD_DEB_NAME" ]]; then
+		echo "${VIRTNBD_DEB_SHA256}  ${deb}" | sha256sum -c --status ||
+			fail "Checksum mismatch for ${deb}"
+	fi
+	echo "$deb"
+}
+
+configure_apparmor() {
+	command -v apparmor_parser >/dev/null 2>&1 || return 0
+	local rules=("/var/tmp/virtnbdbackup.* rw," "/var/tmp/backup.* rw,")
+	local files=(
+		/etc/apparmor.d/abstractions/libvirt-qemu.d/virtnbdbackup
+		/etc/apparmor.d/local/abstractions/libvirt-qemu
+	)
+	local f rule
+	for f in "${files[@]}"; do
+		mkdir -p "$(dirname "$f")"
+		touch "$f"
+		for rule in "${rules[@]}"; do
+			grep -qxF "$rule" "$f" || echo "$rule" >>"$f"
+		done
+	done
+	if systemctl is-active --quiet apparmor; then
+		systemctl reload apparmor || echo -e "${Yellow}${WARNING} apparmor reload failed${NC}"
+	fi
+	echo -e "${Green}AppArmor rules for virtnbdbackup [OK]${CHECK}${NC}"
+}
+
+function install_virtnbdbackup {
+	local current deb
+	remove_legacy_virtnbd_install
+	current=$(installed_virtnbd_version)
+
+	if [[ -n $current ]] && dpkg --compare-versions "$current" ge "$VIRTNBD_VERSION"; then
+		echo -e "${Green}virtnbdbackup ${current} already installed${CHECK}${NC}"
+	else
+		echo "virtnbdbackup package status : ${current:-Not Installed} (target ${VIRTNBD_VERSION})"
+		deb=$(fetch_virtnbd_deb) || exit 1
+		echo -e "\nInstalling virtnbdbackup ${VIRTNBD_VERSION} and its dependencies, Please Wait ...⏳"
+		# apt installs a local .deb only when given a path containing a slash
+		if ! apt-get install -y "$(realpath "$deb")"; then
+			fail "Failed to install virtnbdbackup from ${deb}"
+		fi
+		current=$(installed_virtnbd_version)
+		[[ -n $current ]] || fail "virtnbdbackup installed but 'virtnbdbackup -V' does not run"
+		echo -e "\n${Green}${CHECK}virtnbdbackup ${current} installed successfully ${NC}"
+	fi
+
+	# Working directory used by the backup scripts
+	mkdir -p /tmp/vm_inc/
+	configure_apparmor
 
 	echo "package_name                    status"
 	echo "------------------------------------------"
-	echo "virtnbdbackup                  Installed"
+	echo "virtnbdbackup                  Installed (${current})"
 }
 function main() {
+	check_os
 	apt_update_repo_check
-	source /etc/os-release
-	# libncurses5 was dropped in Debian 13 (trixie); libtinfo6/libncurses6 replace it
-	if [[ ${VERSION_ID%%.*} -ge 13 ]]; then
-		ncurses_pkgs=(libtinfo6 libncurses6)
-	else
-		ncurses_pkgs=(libncurses5)
+	# Tools used by the backup/restore/offsite scripts (virtnbdbackup's own
+	# dependencies are pulled in by its .deb)
+	packages=(curl ca-certificates bc jq libvirt-clients nfs-common rsync tmux python3-paramiko)
+	echo -e "${Green}Installing ${packages[*]}${NC}"
+	echo -e "Please Wait... ⏳ (This can take a while)"
+	if ! apt-get install -y "${packages[@]}" &>/dev/null; then
+		echo "There's a problem installing: ${packages[*]}" >&2
+		exit 2
 	fi
-	packages=(python3-paramiko bc "${ncurses_pkgs[@]}" nfs-common rsync python3-pip python3-all python3-stdeb dh-python python3-libnbd python3-tqdm python3-lz4 python3-lxml nbdkit libnbd-bin tmux)
-	for package in "${packages[@]}"; do
-		if [[ "$package" == "openvswitch-switch" ]] && dpkg -s "$package" &>/dev/null; then
-			echo -e "${Green}$package [Installed - Skipping Upgrade]${CHECK}${NC}"
-			continue
-		fi
-		echo -e "${Green}Checking $package package${NC}"
-		echo -e "Please Wait... ⏳ (This can take a while)"
-		if ! sudo apt install "$package" -y &>/dev/null; then
-			echo "There's a problem installing or upgrading $package." >&2
-			exit 2
-		else
-			echo -e "${Green}$package [Installed/Updated]${CHECK}${NC}"
-		fi
-	done
+	echo -e "${Green}Base packages [Installed/Updated]${CHECK}${NC}"
 
 	install_virtnbdbackup
 
@@ -179,8 +208,8 @@ function main() {
             next
         }
         {print}
-        END {}
-        ' "$SSH_FILE" >/tmp/ssh_config.tmp && mv /tmp/ssh_config.tmp "$SSH_FILE"
+        END { if (!done) { print "Host *"; print "    " k " " v } }
+        ' "$SSH_FILE" >/tmp/ssh_config.tmp && cat /tmp/ssh_config.tmp >"$SSH_FILE" && rm -f /tmp/ssh_config.tmp
 
 			echo "➕ ssh: added $key"
 		fi
@@ -193,7 +222,10 @@ function main() {
 	# =========================
 	# validate + restart safely
 	# =========================
-	sshd -t
+	if ! sshd -t; then
+		echo "❌ sshd configuration test failed, not restarting ssh" >&2
+		exit 1
+	fi
 
 	if systemctl list-unit-files | grep -q "^ssh\.service"; then
 		systemctl restart ssh
