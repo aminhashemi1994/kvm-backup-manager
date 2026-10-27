@@ -14,7 +14,6 @@ A comprehensive, open-source backup management system designed for KVM virtualiz
 ## 📋 Table of Contents
 
 - [Features](#-features)
-- [Screenshots](#-screenshots)
 - [Architecture](#-architecture)
 - [Recommended Architecture](#-recommended-architecture)
 - [Prerequisites](#-prerequisites)
