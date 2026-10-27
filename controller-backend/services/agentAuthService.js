@@ -1,7 +1,7 @@
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 
-const AGENT_JWT_SECRET = process.env.AGENT_JWT_SECRET || 'agent-secret-key-change-in-production';
+const AGENT_JWT_SECRET = process.env.AGENT_JWT_SECRET; // validated at startup (utils/requireSecrets.js)
 
 /**
  * Generate JWT token for agent communication

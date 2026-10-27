@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-10-27
+
+### Security
+- **Agent API now requires authentication on every route** (except `/api/health`). Previously only one route checked the controller-signed token, so anyone who could reach the agent port could start backups/restores, delete backup directories or run host initialization. Agent Socket.IO connections are authenticated too, and browser CORS access to the agent is disabled (the panel already goes through the controller).
+- **No more hardcoded fallback secrets**: the controller and agent refuse to start when `JWT_SECRET` / `AGENT_JWT_SECRET` are missing, shorter than 32 characters, or still the `.env.example` placeholder. Previously the controller fell back to a publicly known secret, which allowed forging admin and agent tokens.
+- **Login rate limiting**: 10 failed logins per IP per 15 minutes (reset on success). The controller now trusts the first proxy hop (nginx) so limits and audit logs use real client IPs.
+- Static agent token compared in constant time; the backup-cycle archive call to the agent now sends the agent token.
+
+### Upgrade notes
+- Run `./generate-jwt-secrets.sh` if your `.env` files still use example values, then set the same `AGENT_JWT_SECRET` on the controller and **every** agent before restarting. Agents without it will not start; agents with a different value will reject controller requests (401/403).
+
 ## [1.3.0] - 2026-10-27
 
 ### Security

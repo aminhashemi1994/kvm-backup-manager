@@ -2,14 +2,15 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { io: ioClient } = require('socket.io-client');
-const cors = require('cors');
 const morgan = require('morgan');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
+require('./utils/requireSecrets').requireSecrets(['AGENT_JWT_SECRET'], ['AGENT_JWT_TOKEN']);
 
 const config = require('./config/config');
 const errorHandler = require('./middleware/errorHandler');
+const authMiddleware = require('./middleware/auth');
 
 // Import routes
 const healthRoutes = require('./routes/health');
@@ -52,11 +53,12 @@ const controllerAuthService = require('./services/controllerAuthService');
 const app = express();
 const server = http.createServer(app);
 
-const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+// Only the controller talks to the agent (server to server), so no browser
+// origin is allowed and every socket must present a controller-signed token.
+const io = new Server(server, { cors: { origin: false } });
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization;
+  authMiddleware.verifyAgentToken(token) ? next() : next(new Error('Authentication required'));
 });
 
 // Ensure logs directory exists
@@ -65,7 +67,6 @@ if (!fs.existsSync(config.logDir)) {
 }
 
 // Middleware
-app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // High-frequency polling/health endpoints flood the logs and bury real
@@ -163,6 +164,8 @@ cleanupService.initialize({ config, backupExecutor });
 
 // Routes
 app.use('/api/health', healthRoutes);
+// Everything below requires a controller-signed agent token
+app.use('/api', authMiddleware);
 app.use('/api/hypervisors', hypervisorsRoutes);
 app.use('/api/backup', backupRoutes);
 app.use('/api/directories', directoriesRoutes);

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const agentService = require('../services/agentService');
+const { generateAgentToken } = require('../services/agentAuthService');
 const { getBackupHosts } = require('../services/fileStorage');
 
 // POST /api/init/host - Initialize a backup host
@@ -36,6 +37,7 @@ router.post('/host', async (req, res, next) => {
     const agentSocket = ioClient(agentUrl, {
       transports: ['websocket', 'polling'],
       reconnection: false,
+      auth: { token: `Bearer ${generateAgentToken('controller', 'Controller')}` },
     });
 
     agentSocket.on('connect', () => {

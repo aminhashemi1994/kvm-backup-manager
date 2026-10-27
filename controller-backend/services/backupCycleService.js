@@ -1,4 +1,5 @@
 const axios = require('axios');
+const { generateAgentToken } = require('./agentAuthService');
 const { getVirtualMachines, saveVirtualMachines } = require('./fileStorage');
 
 class BackupCycleService {
@@ -122,8 +123,10 @@ class BackupCycleService {
         const maxArchivedBackups = vm.maxArchivedBackups || 2;
         const hostUrl = agentUrl.startsWith('http') ? agentUrl : `http://${agentUrl}`;
         
-        await axios.post(`${hostUrl}/api/retention/${vm.name}/archive`, {
+        await axios.post(`${hostUrl}/api/retention/${encodeURIComponent(vm.name)}/archive`, {
           maxArchivedBackups
+        }, {
+          headers: { Authorization: `Bearer ${generateAgentToken('controller', 'Controller')}` }
         });
         
         console.log(`Archived successfully, keeping ${maxArchivedBackups} archived backups`);

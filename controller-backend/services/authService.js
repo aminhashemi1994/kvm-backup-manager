@@ -10,7 +10,7 @@ const USERS_FILE = path.join(__dirname, '../data/users.json');
 // first person to reach the login page can't claim the instance. It is printed
 // to the controller log and stored (mode 0600) next to users.json.
 const SETUP_TOKEN_FILE = path.join(__dirname, '../data/setup-token');
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const JWT_SECRET = process.env.JWT_SECRET; // validated at startup (utils/requireSecrets.js)
 // User session tokens use a short, sliding expiry. Each authenticated request
 // mints a fresh token (see middleware/auth.js), so an active session keeps
 // extending. After ~30 minutes of inactivity the token expires and the
@@ -300,7 +300,7 @@ function verifyToken(token) {
  * Generate agent JWT token (for controller -> agent communication)
  */
 function generateAgentToken(agentId, agentName) {
-  const agentSecret = process.env.AGENT_JWT_SECRET || 'agent-secret-key-change-in-production';
+  const agentSecret = process.env.AGENT_JWT_SECRET;
   
   return jwt.sign(
     { 

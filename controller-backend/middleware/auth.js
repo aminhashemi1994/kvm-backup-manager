@@ -1,9 +1,17 @@
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 /**
  * Middleware to verify JWT token for user authentication (frontend -> controller)
  * Also accepts static token for agent-to-controller calls
  */
+// Constant-time string comparison (avoids leaking the token via timing)
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
 const authenticateUser = (req, res, next) => {
   try {
     const authHeader = req.headers['authorization'];
@@ -21,14 +29,14 @@ const authenticateUser = (req, res, next) => {
 
     // Check if it's the static agent token
     const agentStaticToken = process.env.AGENT_STATIC_TOKEN;
-    if (agentStaticToken && token === agentStaticToken) {
+    if (agentStaticToken && safeEqual(token, agentStaticToken)) {
       req.user = { type: 'agent', agentId: 'static-agent' };
       req.tokenType = 'agent-static';
       return next();
     }
 
     // Otherwise verify as JWT token (user or agent JWT)
-    const userSecret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+    const userSecret = process.env.JWT_SECRET;
     const agentSecret = process.env.AGENT_JWT_SECRET;
     
     let decoded = null;
@@ -131,7 +139,7 @@ const optionalAuth = (req, res, next) => {
         ? authHeader.substring(7) 
         : authHeader;
 
-      const jwtSecret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+      const jwtSecret = process.env.JWT_SECRET;
       const decoded = jwt.verify(token, jwtSecret);
       req.user = decoded;
     }

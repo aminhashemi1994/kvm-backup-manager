@@ -296,6 +296,12 @@ This script generates three secrets:
 
 **Save these secrets** - you'll need them in the next steps!
 
+> **Required.** The controller and agent refuse to start if `JWT_SECRET` or
+> `AGENT_JWT_SECRET` is missing, shorter than 32 characters, or still the
+> example placeholder from `.env.example`. `AGENT_JWT_SECRET` must be identical
+> on the controller and on every agent, and the controller's
+> `AGENT_STATIC_TOKEN` must equal the agent's `AGENT_JWT_TOKEN`.
+
 ### Step 3: Install Controller Backend
 
 ```bash

@@ -1,19 +1,28 @@
-const config = require('../config/config');
+const jwt = require('jsonwebtoken');
 
 /**
- * JWT authentication middleware for agent (controller -> agent communication)
+ * Verify a controller-signed agent token ("Bearer <jwt>" or bare JWT).
+ * Returns the decoded payload, or null when missing/invalid.
+ */
+function verifyAgentToken(header) {
+  if (!header || typeof header !== 'string') return null;
+  const token = header.startsWith('Bearer ') ? header.substring(7) : header;
+  try {
+    const decoded = jwt.verify(token, process.env.AGENT_JWT_SECRET);
+    return decoded.type === 'agent' ? decoded : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
+ * JWT authentication middleware for agent (controller -> agent communication).
+ * AGENT_JWT_SECRET is required at startup (utils/requireSecrets.js), so there
+ * is no unauthenticated mode.
  */
 const authMiddleware = (req, res, next) => {
-  // If no JWT secret is configured, skip authentication
-  const jwtSecret = process.env.AGENT_JWT_SECRET;
-  
-  if (!jwtSecret) {
-    console.warn('[Auth] AGENT_JWT_SECRET not configured - authentication disabled');
-    return next();
-  }
-
   const authHeader = req.headers['authorization'] || req.headers['x-agent-token'];
-  
+
   if (!authHeader) {
     return res.status(401).json({
       success: false,
@@ -21,37 +30,17 @@ const authMiddleware = (req, res, next) => {
     });
   }
 
-  const token = authHeader.startsWith('Bearer ') 
-    ? authHeader.substring(7) 
-    : authHeader;
-  
-  try {
-    const jwt = require('jsonwebtoken');
-    const decoded = jwt.verify(token, jwtSecret);
-    
-    // Verify this is an agent token
-    if (decoded.type !== 'agent') {
-      return res.status(403).json({
-        success: false,
-        error: 'Invalid token type',
-      });
-    }
-    
-    req.agent = decoded;
-    next();
-  } catch (error) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({
-        success: false,
-        error: 'Token expired',
-      });
-    }
-    
+  const decoded = verifyAgentToken(authHeader);
+  if (!decoded) {
     return res.status(403).json({
       success: false,
       error: 'Invalid authentication token',
     });
   }
+
+  req.agent = decoded;
+  next();
 };
 
 module.exports = authMiddleware;
+module.exports.verifyAgentToken = verifyAgentToken;

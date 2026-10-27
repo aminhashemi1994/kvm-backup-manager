@@ -6,6 +6,7 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 const morgan = require('morgan');
 require('dotenv').config();
+require('./utils/requireSecrets').requireSecrets(['JWT_SECRET', 'AGENT_JWT_SECRET'], ['AGENT_STATIC_TOKEN']);
 
 const config = require('./config/config');
 const errorHandler = require('./middleware/errorHandler');
@@ -109,6 +110,9 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('dev'));
 
 app.set('io', io);
+// Behind nginx: take the client IP from X-Forwarded-For (first proxy hop only)
+// so login/setup rate limits and audit logs see real client addresses.
+app.set('trust proxy', 1);
 
 // Initialize data files
 initializeDataFiles();

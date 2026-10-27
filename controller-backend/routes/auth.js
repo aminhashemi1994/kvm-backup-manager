@@ -4,12 +4,53 @@ const authService = require('../services/authService');
 const auditService = require('../services/auditService');
 const { authenticateUser } = require('../middleware/auth');
 
+// Simple per-IP attempt counters. req.ip is the real client IP because the
+// app trusts the nginx proxy (see server.js).
+const WINDOW_MS = 15 * 60 * 1000;
+
+function createLimiter(maxAttempts) {
+  const attempts = new Map();
+  return {
+    // True once the IP has used up its attempts in the current window
+    isLimited(ip) {
+      const entry = attempts.get(ip);
+      return !!entry && Date.now() - entry.start <= WINDOW_MS && entry.count >= maxAttempts;
+    },
+    record(ip) {
+      const now = Date.now();
+      const entry = attempts.get(ip);
+      if (!entry || now - entry.start > WINDOW_MS) {
+        attempts.set(ip, { start: now, count: 1 });
+      } else {
+        entry.count += 1;
+      }
+      // Drop expired entries so the map can't grow without bound
+      if (attempts.size > 10000) {
+        for (const [key, e] of attempts) if (now - e.start > WINDOW_MS) attempts.delete(key);
+      }
+    },
+    reset(ip) {
+      attempts.delete(ip);
+    },
+  };
+}
+
+const loginLimiter = createLimiter(10); // failed logins per IP
+const setupLimiter = createLimiter(10); // setup attempts per IP (guards the setup token)
+
 /**
  * POST /api/auth/login
  * User login
  */
 router.post('/login', async (req, res, next) => {
   try {
+    if (loginLimiter.isLimited(req.ip)) {
+      return res.status(429).json({
+        success: false,
+        error: 'Too many failed login attempts. Try again in 15 minutes.'
+      });
+    }
+
     const { username, password } = req.body;
     
     if (!username || !password) {
@@ -22,6 +63,7 @@ router.post('/login', async (req, res, next) => {
     const result = await authService.login(username, password);
     
     if (!result.success) {
+      loginLimiter.record(req.ip);
       // Audit failed login
       await auditService.log('auth.login_failed', {
         actor: username,
@@ -31,6 +73,8 @@ router.post('/login', async (req, res, next) => {
       return res.status(401).json(result);
     }
     
+    loginLimiter.reset(req.ip);
+
     // Audit successful login
     await auditService.log('auth.login', {
       actor: result.user.username,
@@ -45,22 +89,6 @@ router.post('/login', async (req, res, next) => {
     next(error);
   }
 });
-
-// Simple per-IP limit for the setup endpoint (guards the setup token)
-const SETUP_WINDOW_MS = 15 * 60 * 1000;
-const SETUP_MAX_ATTEMPTS = 10;
-const setupAttempts = new Map();
-
-function isSetupRateLimited(ip) {
-  const now = Date.now();
-  const entry = setupAttempts.get(ip);
-  if (!entry || now - entry.start > SETUP_WINDOW_MS) {
-    setupAttempts.set(ip, { start: now, count: 1 });
-    return false;
-  }
-  entry.count += 1;
-  return entry.count > SETUP_MAX_ATTEMPTS;
-}
 
 /**
  * GET /api/auth/setup-status
@@ -80,10 +108,11 @@ router.get('/setup-status', async (req, res, next) => {
  */
 router.post('/setup', async (req, res, next) => {
   try {
-    if (isSetupRateLimited(req.ip)) {
+    if (setupLimiter.isLimited(req.ip)) {
       return res.status(429).json({ success: false, error: 'Too many setup attempts. Try again later.' });
     }
 
+    setupLimiter.record(req.ip);
     const { username, password, setupToken } = req.body;
     const result = await authService.setupInitialAdmin(username, password, setupToken);
 
